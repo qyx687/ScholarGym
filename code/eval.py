@@ -14,6 +14,13 @@ import config
 from deeprag import DeepResearchWorkflow
 from simplerag import SimpleWorkflow
 from utils import extract_ground_truth_arxiv_ids, CheckpointManager, calculate_retrieval_metrics, AgentTraceRecorder
+from per_subquery_graph import (
+    DEFAULT_RERANK_MODE as DEFAULT_PER_SUBQUERY_GRAPH_RERANK_MODE,
+    PerSubqueryGraphAugmenter,
+    S2Client,
+    build_paper_db_by_arxiv_id_from_metadata,
+    load_paper_db_by_arxiv_id,
+)
 
 logger = get_logger(__name__, log_file='./log/eval.log')
 
@@ -37,10 +44,89 @@ def load_config_from_path(config_path: str):
     logger.info(f"[📝] Loaded config from: {config_path}")
     return config_module
 
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in {"true", "1", "yes", "y", "on"}:
+        return True
+    if value in {"false", "0", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
+def safe_output_token(value, max_len: int = 64) -> str:
+    token = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "-"
+        for ch in str(value or "").strip()
+    ).strip("-_.")
+    return (token or "none")[:max_len]
+
+
+def float_output_token(value) -> str:
+    return safe_output_token(str(value).replace(".", "p"))
+
+
+def per_subquery_graph_output_suffix(
+    enabled: bool,
+    method: str,
+    expansion_limit: int,
+    rerank_mode: str,
+    rerank_alpha: float,
+    cache_dir: str,
+    offline_cache_only: bool,
+    rate_limit_rps: float,
+    fail_fast: bool,
+) -> str:
+    if not enabled:
+        return ""
+    return (
+        "_per_subquery_graph"
+        f"_method-{safe_output_token(method)}"
+        f"_limit-{safe_output_token(expansion_limit)}"
+        f"_rerank-{safe_output_token(rerank_mode)}"
+        f"_alpha-{float_output_token(rerank_alpha)}"
+        f"_cache-{safe_output_token(cache_dir)}"
+        f"_offline-{int(bool(offline_cache_only))}"
+        f"_rps-{float_output_token(rate_limit_rps)}"
+        f"_failfast-{int(bool(fail_fast))}"
+    )
+
+
+def selector_input_source_summary(per_subquery_graph: Dict) -> Dict:
+    summary = {}
+    for sq_id, trace in (per_subquery_graph or {}).items():
+        sources = trace.get("selector_input_sources", []) if isinstance(trace, dict) else []
+        seed_ids = []
+        expanded_ids = []
+        for item in sources:
+            if not isinstance(item, dict):
+                continue
+            arxiv_id = item.get("arxiv_id")
+            if not arxiv_id:
+                continue
+            if item.get("source_type") == "seed":
+                seed_ids.append(arxiv_id)
+            elif item.get("source_type") == "expanded":
+                expanded_ids.append(arxiv_id)
+        summary[sq_id] = {
+            "seed_selector_input_arxiv_ids": seed_ids,
+            "expanded_selector_input_arxiv_ids": expanded_ids,
+            "seed_selector_input_count": len(seed_ids),
+            "expanded_selector_input_count": len(expanded_ids),
+            "selector_input_count": len(seed_ids) + len(expanded_ids),
+        }
+    return summary
+
+
 class CitationEvaluator:
     def __init__(self, rag_system: CitationRAGSystem, llm_model: str = config.LLM_MODEL_NAME, 
                  is_local: bool = config.IS_LOCAL_LLM, prompt_type: str = config.EVAL_PROMPT_TYPE, 
-                 search_method: str = config.EVAL_SEARCH_METHOD, trace_recorder=None):
+                 search_method: str = config.EVAL_SEARCH_METHOD, trace_recorder=None,
+                 per_subquery_graph_augmenter=None):
         self.rag_system = rag_system
         self.llm_model = llm_model
         self.is_local = is_local
@@ -48,6 +134,7 @@ class CitationEvaluator:
         self.search_method = search_method
         self.gen_params = config.LLM_GEN_PARAMS
         self.trace_recorder = trace_recorder
+        self.per_subquery_graph_augmenter = per_subquery_graph_augmenter
         
         # Validate search method
         available_methods = self.rag_system.get_available_search_methods()
@@ -68,7 +155,8 @@ class CitationEvaluator:
             llm_model=self.llm_model,
             gen_params=self.gen_params,
             is_local=self.is_local,
-            trace_recorder=trace_recorder
+            trace_recorder=trace_recorder,
+            per_subquery_graph_augmenter=per_subquery_graph_augmenter,
         )
 
     def load_benchmark_data(self, benchmark_jsonl_path: str) -> List[Dict]:
@@ -129,6 +217,8 @@ class CitationEvaluator:
         for step in select_steps:
             iter_idx = step.get('iter_idx')
             retrieved_in_iter = step.get('retrieved_papers') or {}
+            raw_retriever_in_iter = step.get('raw_retriever_papers') or {}
+            per_subquery_graph_in_iter = step.get('per_subquery_graph') or {}
             selected_in_iter = step.get('selected_papers') or {}
             gt_rank = step.get('gt_rank') or []
             browsing_arxiv_ids = step.get('browsing_arxiv_ids') or []
@@ -138,6 +228,10 @@ class CitationEvaluator:
             
             if not isinstance(retrieved_in_iter, dict):
                 retrieved_in_iter = {}
+            if not isinstance(raw_retriever_in_iter, dict):
+                raw_retriever_in_iter = {}
+            if not isinstance(per_subquery_graph_in_iter, dict):
+                per_subquery_graph_in_iter = {}
             if not isinstance(selected_in_iter, dict):
                 selected_in_iter = {}
 
@@ -152,6 +246,12 @@ class CitationEvaluator:
                 for papers in selected_in_iter.values()
                 for p in papers if p.get('arxiv_id')
             }
+            current_iter_raw_retriever = {
+                p.get('arxiv_id')
+                for papers in raw_retriever_in_iter.values()
+                for p in papers if p.get('arxiv_id')
+            }
+            current_iter_selector_source_summary = selector_input_source_summary(per_subquery_graph_in_iter)
 
             # Update cumulative sets
             all_retrieved_arxiv_ids.update(current_iter_retrieved)
@@ -201,9 +301,13 @@ class CitationEvaluator:
                 "browser_during": step.get('browser_during', -1),
                 "overhead_during": step.get('overhead_during', -1),
                 "total_during": step.get('total_during', -1),
-                "current_iter_retrieved": list(current_iter_retrieved),
-                "current_iter_selected": list(current_iter_selected),
+                "current_iter_retrieved": sorted(current_iter_retrieved),
+                "current_iter_selected": sorted(current_iter_selected),
+                "current_iter_raw_retriever": sorted(current_iter_raw_retriever),
                 "current_iter_browsing": browsing_arxiv_ids,
+                "raw_retriever_papers": raw_retriever_in_iter,
+                "per_subquery_graph": per_subquery_graph_in_iter,
+                "selector_input_source_summary": current_iter_selector_source_summary,
             })
             
             # Log cumulative metrics
@@ -340,7 +444,7 @@ class CitationEvaluator:
                         # 耗时统计
                         # Note: evaluation_summary.jsonl only records aggregated `avg_*` metrics.
                         # So we must accumulate all *_during fields we care about here.
-                        for phase in ['planner', 'retrieval', 'selector', 'browser', 'overhead', 'total']:
+                        for phase in ['planner', 'retrieval', 'graph_augment', 'selector', 'browser', 'overhead', 'total']:
                             phase_key = f'{phase}_during'
                             if phase_key not in results:
                                 results[phase_key] = []
@@ -508,6 +612,15 @@ class CitationEvaluator:
             "GT_RANK_CUTOFF": config.GT_RANK_CUTOFF,
             "BROWSER_MODE": config.BROWSER_MODE,
             "PLANNER_ABLATION": config.PLANNER_ABLATION,
+            "ENABLE_PER_SUBQUERY_GRAPH_RERANK": results.get('per_subquery_graph_rerank_enabled', False),
+            "PER_SUBQUERY_GRAPH_METHOD": results.get('per_subquery_graph_method'),
+            "PER_SUBQUERY_GRAPH_EXPANSION_LIMIT": results.get('per_subquery_graph_expansion_limit'),
+            "PER_SUBQUERY_GRAPH_CACHE_DIR": results.get('per_subquery_graph_cache_dir'),
+            "PER_SUBQUERY_GRAPH_OFFLINE_CACHE_ONLY": results.get('per_subquery_graph_offline_cache_only'),
+            "PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS": results.get('per_subquery_graph_rate_limit_rps'),
+            "PER_SUBQUERY_GRAPH_RERANK_MODE": results.get('per_subquery_graph_rerank_mode'),
+            "PER_SUBQUERY_GRAPH_RERANK_ALPHA": results.get('per_subquery_graph_rerank_alpha'),
+            "PER_SUBQUERY_GRAPH_FAIL_FAST": results.get('per_subquery_graph_fail_fast'),
         }
         
         # Flatten the avg_recalls dictionary and clean up the keys
@@ -565,6 +678,24 @@ def main():
     parser.add_argument('--max_iterations', type=int, default=None, help='Maximum number of iterations for deep research workflow')
     parser.add_argument('--results_per_query', type=int, default=None, help='Results per query for deep research workflow')
     parser.add_argument('--browser_mode', type=str, default=None, choices=['PRE_ENRICH', 'REFRESH', 'INCREMENTAL', 'NONE'], help='Browser mode for deep research workflow')
+    parser.add_argument('--enable_per_subquery_graph_rerank', type=str2bool, nargs='?', const=True, default=None, help='Enable per-subquery graph expansion and local rerank before selector')
+    parser.add_argument('--per_subquery_graph_method', type=str, default=None, choices=['citations', 'references', 'citations_references'], help='S2 graph expansion method for per-subquery rerank')
+    parser.add_argument('--per_subquery_graph_expansion_limit', type=int, default=None, help='S2 items per seed per edge type for per-subquery graph rerank')
+    parser.add_argument('--per_subquery_graph_cache_dir', type=str, default=None, help='S2 cache directory for per-subquery graph rerank')
+    parser.add_argument('--per_subquery_graph_offline_cache_only', type=str2bool, nargs='?', const=True, default=None, help='Use only existing S2 cache for per-subquery graph rerank')
+    parser.add_argument('--per_subquery_graph_rate_limit_rps', type=float, default=None, help='Global S2 API request rate limit for per-subquery graph rerank')
+    parser.add_argument('--per_subquery_graph_rerank_mode', type=str, default=None, choices=[
+        'original_current_subquery_weighted',
+        'original_plus_current_subquery_weighted',
+        'original_current_subquery_max',
+        'original_query',
+        'original_query_only',
+        'current_subquery',
+        'current_subquery_only',
+        'seed_order',
+    ], help='Local BM25 rerank mode for per-subquery graph rerank')
+    parser.add_argument('--per_subquery_graph_rerank_alpha', type=float, default=None, help='Weight for original query in weighted per-subquery rerank')
+    parser.add_argument('--per_subquery_graph_fail_fast', type=str2bool, nargs='?', const=True, default=None, help='Raise per-subquery graph failures instead of falling back to seeds')
 
     args = parser.parse_args()
     
@@ -592,13 +723,98 @@ def main():
     max_iterations = args.max_iterations or cfg.EVAL_MAX_ITERATIONS
     results_per_query = args.results_per_query or cfg.MAX_RESULTS_PER_QUERY
     browser_mode = args.browser_mode or cfg.BROWSER_MODE
+    enable_per_subquery_graph_rerank = (
+        args.enable_per_subquery_graph_rerank
+        if args.enable_per_subquery_graph_rerank is not None
+        else getattr(cfg, 'ENABLE_PER_SUBQUERY_GRAPH_RERANK', False)
+    )
+    per_subquery_graph_method = args.per_subquery_graph_method or getattr(cfg, 'PER_SUBQUERY_GRAPH_METHOD', 'citations_references')
+    per_subquery_graph_expansion_limit = (
+        args.per_subquery_graph_expansion_limit
+        if args.per_subquery_graph_expansion_limit is not None
+        else getattr(cfg, 'PER_SUBQUERY_GRAPH_EXPANSION_LIMIT', 100)
+    )
+    per_subquery_graph_cache_dir = args.per_subquery_graph_cache_dir or getattr(cfg, 'PER_SUBQUERY_GRAPH_CACHE_DIR', './cache/s2_graph_oracle')
+    per_subquery_graph_offline_cache_only = (
+        args.per_subquery_graph_offline_cache_only
+        if args.per_subquery_graph_offline_cache_only is not None
+        else getattr(cfg, 'PER_SUBQUERY_GRAPH_OFFLINE_CACHE_ONLY', False)
+    )
+    per_subquery_graph_rate_limit_rps = (
+        args.per_subquery_graph_rate_limit_rps
+        if args.per_subquery_graph_rate_limit_rps is not None
+        else getattr(cfg, 'PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS', 1.0)
+    )
+    per_subquery_graph_rerank_mode = args.per_subquery_graph_rerank_mode or getattr(
+        cfg,
+        'PER_SUBQUERY_GRAPH_RERANK_MODE',
+        DEFAULT_PER_SUBQUERY_GRAPH_RERANK_MODE,
+    )
+    per_subquery_graph_rerank_alpha = (
+        args.per_subquery_graph_rerank_alpha
+        if args.per_subquery_graph_rerank_alpha is not None
+        else getattr(cfg, 'PER_SUBQUERY_GRAPH_RERANK_ALPHA', 0.5)
+    )
+    per_subquery_graph_fail_fast = (
+        args.per_subquery_graph_fail_fast
+        if args.per_subquery_graph_fail_fast is not None
+        else getattr(cfg, 'PER_SUBQUERY_GRAPH_FAIL_FAST', False)
+    )
+
+    for config_name in [
+        'ENABLE_REASONING',
+        'ENABLE_STRUCTURED_OUTPUT',
+        'SAVE_AGENT_TRACES',
+        'PLANNER_ABLATION',
+        'LLM_GEN_PARAMS',
+        'SUMMARY_LLM_MODEL_NAME',
+        'SUMMARY_LLM_GEN_PARAMS',
+        'SUMMARY_LLM_IS_LOCAL',
+        'SUMMARY_CACHE_PATH',
+        'SUMMARY_ABSTRACT_CHAR_THRESHOLD',
+        'ENABLE_SUMMARIZATION',
+        'CONTEXT_MAX_LENGTH_CHARS',
+        'GT_RANK_CUTOFF',
+    ]:
+        if hasattr(cfg, config_name):
+            setattr(config, config_name, getattr(cfg, config_name))
+
+    # Keep the original code paths that read the global config module consistent
+    # with the resolved CLI/custom-config values for this run.
+    config.EVAL_TOP_K_VALUES = top_k
+    config.EVAL_PROMPT_TYPE = prompt_type
+    config.EVAL_SEARCH_METHOD = search_method
+    config.EVAL_WORKFLOW = workflow
+    config.EVAL_MAX_ITERATIONS = max_iterations
+    config.MAX_RESULTS_PER_QUERY = results_per_query
+    config.BROWSER_MODE = browser_mode
+    config.ENABLE_PER_SUBQUERY_GRAPH_RERANK = enable_per_subquery_graph_rerank
+    config.PER_SUBQUERY_GRAPH_METHOD = per_subquery_graph_method
+    config.PER_SUBQUERY_GRAPH_EXPANSION_LIMIT = per_subquery_graph_expansion_limit
+    config.PER_SUBQUERY_GRAPH_CACHE_DIR = per_subquery_graph_cache_dir
+    config.PER_SUBQUERY_GRAPH_OFFLINE_CACHE_ONLY = per_subquery_graph_offline_cache_only
+    config.PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS = per_subquery_graph_rate_limit_rps
+    config.PER_SUBQUERY_GRAPH_RERANK_MODE = per_subquery_graph_rerank_mode
+    config.PER_SUBQUERY_GRAPH_RERANK_ALPHA = per_subquery_graph_rerank_alpha
+    config.PER_SUBQUERY_GRAPH_FAIL_FAST = per_subquery_graph_fail_fast
 
     # Use loaded config (cfg) for flags, not global config
     reasoning_flag = 'reasoning' if cfg.ENABLE_REASONING else 'instruct'
     structured_flag = 'structured' if cfg.ENABLE_STRUCTURED_OUTPUT else 'non-structured'
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
+    per_subquery_graph_flag = per_subquery_graph_output_suffix(
+        enabled=enable_per_subquery_graph_rerank,
+        method=per_subquery_graph_method,
+        expansion_limit=per_subquery_graph_expansion_limit,
+        rerank_mode=per_subquery_graph_rerank_mode,
+        rerank_alpha=per_subquery_graph_rerank_alpha,
+        cache_dir=per_subquery_graph_cache_dir,
+        offline_cache_only=per_subquery_graph_offline_cache_only,
+        rate_limit_rps=per_subquery_graph_rate_limit_rps,
+        fail_fast=per_subquery_graph_fail_fast,
+    )
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}")
+    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{per_subquery_graph_flag}")
     os.makedirs(current_output_dir, exist_ok=True)
 
     # Save config file for reproduction
@@ -627,6 +843,39 @@ def main():
         bm25_path=bm25_path,
         rebuild=args.rebuild_index
     )
+
+    per_subquery_graph_augmenter = None
+    if enable_per_subquery_graph_rerank:
+        if workflow != 'deep_research':
+            logger.warning("[⚠️] Per-subquery graph rerank only applies to deep_research workflow; disabling it for this run.")
+        else:
+            paper_db_by_arxiv_id = build_paper_db_by_arxiv_id_from_metadata(getattr(rag_system, "paper_metadata", {}))
+            if not paper_db_by_arxiv_id:
+                logger.warning(
+                    "[⚠️] RAG metadata is empty; loading full paper DB for per-subquery graph rerank. "
+                    "This can be slow for the full ScholarGym corpus."
+                )
+                paper_db_by_arxiv_id = load_paper_db_by_arxiv_id(paper_db)
+            per_subquery_s2_client = S2Client(
+                cache_dir=per_subquery_graph_cache_dir,
+                rate_limit_rps=per_subquery_graph_rate_limit_rps,
+                offline_cache_only=per_subquery_graph_offline_cache_only,
+            )
+            per_subquery_graph_augmenter = PerSubqueryGraphAugmenter(
+                s2_client=per_subquery_s2_client,
+                paper_db_by_arxiv_id=paper_db_by_arxiv_id,
+                method=per_subquery_graph_method,
+                expansion_limit=per_subquery_graph_expansion_limit,
+                rerank_mode=per_subquery_graph_rerank_mode,
+                rerank_alpha=per_subquery_graph_rerank_alpha,
+                fail_fast=per_subquery_graph_fail_fast,
+            )
+            logger.info(
+                "[🔗] Per-subquery graph rerank enabled: "
+                f"method={per_subquery_graph_method}, limit={per_subquery_graph_expansion_limit}, "
+                f"rerank_mode={per_subquery_graph_rerank_mode}, alpha={per_subquery_graph_rerank_alpha}, "
+                f"cache={per_subquery_graph_cache_dir}, offline_cache_only={per_subquery_graph_offline_cache_only}"
+            )
     
     # Initialize trace recorder if enabled
     trace_recorder = None
@@ -650,7 +899,8 @@ def main():
         is_local=is_local,
         prompt_type=prompt_type,
         search_method=search_method,
-        trace_recorder=trace_recorder
+        trace_recorder=trace_recorder,
+        per_subquery_graph_augmenter=per_subquery_graph_augmenter,
     )
     
     # Load and process benchmark data
@@ -669,6 +919,17 @@ def main():
         detailed_results_file=detailed_results_file,
         enable_resume=True
     )
+
+    results['per_subquery_graph_rerank_enabled'] = bool(per_subquery_graph_augmenter)
+    if per_subquery_graph_augmenter:
+        results['per_subquery_graph_method'] = per_subquery_graph_method
+        results['per_subquery_graph_expansion_limit'] = per_subquery_graph_expansion_limit
+        results['per_subquery_graph_cache_dir'] = per_subquery_graph_cache_dir
+        results['per_subquery_graph_rate_limit_rps'] = per_subquery_graph_rate_limit_rps
+        results['per_subquery_graph_rerank_mode'] = per_subquery_graph_rerank_mode
+        results['per_subquery_graph_rerank_alpha'] = per_subquery_graph_rerank_alpha
+        results['per_subquery_graph_offline_cache_only'] = per_subquery_graph_offline_cache_only
+        results['per_subquery_graph_fail_fast'] = per_subquery_graph_fail_fast
 
     evaluator.print_summary(results)
     

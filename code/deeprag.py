@@ -8,6 +8,7 @@ Deep Research Workflow (Refactored): Two-agent system with explicit Memory.
 """
 import asyncio
 import time
+from functools import partial
 from typing import List, Dict, Set, Optional, Any
 
 from logger import get_logger
@@ -17,6 +18,7 @@ from structures import Paper, SubQuery, SubQueryState, ResearchMemory
 from mcp.retrieval_mcp import search_papers
 from agent import Planner, Selector, PaperSummarizer, Browser
 from metrics import Timer, MetricsCalculator
+from per_subquery_graph import PerSubqueryGraphAugmenter
 
 
 logger = get_logger(__name__, log_file='./log/deeprag.log')
@@ -25,7 +27,15 @@ class DeepResearchWorkflow:
     """
     Orchestrates a multi-agent workflow for deep, iterative citation research.
     """
-    def __init__(self, rag_system: CitationRAGSystem, llm_model: str, gen_params: Dict, is_local: bool, trace_recorder=None):
+    def __init__(
+        self,
+        rag_system: CitationRAGSystem,
+        llm_model: str,
+        gen_params: Dict,
+        is_local: bool,
+        trace_recorder=None,
+        per_subquery_graph_augmenter: Optional[PerSubqueryGraphAugmenter] = None,
+    ):
         self.planner = Planner(llm_model, gen_params, is_local, trace_recorder=trace_recorder)
         self.selector = Selector(llm_model, gen_params, is_local, trace_recorder=trace_recorder)
         self.browser = Browser(
@@ -43,6 +53,7 @@ class DeepResearchWorkflow:
         )
         self.rag_system = rag_system
         self.trace_recorder = trace_recorder
+        self.per_subquery_graph_augmenter = per_subquery_graph_augmenter
 
     def _mcp_results_to_papers(self, results: List[Dict]) -> List[Paper]:
         papers: List[Paper] = []
@@ -130,6 +141,7 @@ class DeepResearchWorkflow:
         memory = ResearchMemory()
         memory.root_subquery_id = 0
         memory.root_text = query.get('query')
+        query_text = query.get('query', '')
         
         # Cross-iteration tracking for ranking and paper selection
         selected_min_rank_tracker: Dict[str, int] = {}  # Track minimum rank for selected papers across iterations
@@ -143,6 +155,7 @@ class DeepResearchWorkflow:
             timings: Dict[str, float] = {
                 "planner": 0.0,
                 "retrieval": 0.0,
+                "graph_augment": 0.0,
                 "selector": 0.0,
                 "browser": 0.0,
             }
@@ -214,6 +227,8 @@ class DeepResearchWorkflow:
                 
             papers_for_selection: Dict[int, List[Paper]] = {}
             rank_dicts: Dict[int, dict] = {}
+            raw_retriever_papers_for_selection: Dict[int, List[Paper]] = {}
+            per_subquery_graph_traces: Dict[int, Dict[str, Any]] = {}
 
             for sq_id, (new_papers, rank_dict) in retrieval_map.items():
                 sq_obj = subqueries.get(sq_id, None)
@@ -223,7 +238,46 @@ class DeepResearchWorkflow:
                 else:
                     subquery_states[sq_id].append(new_state)
                 papers_for_selection[sq_id] = new_state.retrieved_papers
+                raw_retriever_papers_for_selection[sq_id] = list(new_state.retrieved_papers)
                 rank_dicts[sq_id] = rank_dict
+
+            if self.per_subquery_graph_augmenter:
+                async def augment_for_subqueries():
+                    loop = asyncio.get_running_loop()
+                    tasks = []
+                    for sq_id, seed_papers in raw_retriever_papers_for_selection.items():
+                        sq_obj = subqueries.get(sq_id)
+                        if sq_obj is None:
+                            continue
+                        augment_call = partial(
+                            self.per_subquery_graph_augmenter.augment,
+                            original_query=query_text,
+                            subquery=sq_obj,
+                            seed_papers=seed_papers,
+                            iter_idx=iter_idx,
+                            idx=idx,
+                            qid=query.get("qid", ""),
+                            source=query.get("source", ""),
+                            gt_arxiv_ids=gt_arxiv_ids or set(),
+                            exclude_arxiv_ids=selected_paper_ids_tracker,
+                        )
+                        tasks.append((sq_id, loop.run_in_executor(None, augment_call)))
+                    results = []
+                    for sq_id, task in tasks:
+                        results.append((sq_id, await task))
+                    return results
+
+                with Timer() as graph_timer:
+                    graph_results = asyncio.run(augment_for_subqueries())
+                timings["graph_augment"] += graph_timer.elapsed
+                for sq_id, graph_result in graph_results:
+                    if sq_id not in subquery_states or not subquery_states[sq_id]:
+                        continue
+                    subquery_states[sq_id][-1].retrieved_papers = graph_result.papers
+                    subquery_states[sq_id][-1].total_requested = len(graph_result.papers)
+                    papers_for_selection[sq_id] = graph_result.papers
+                    rank_dicts[sq_id] = graph_result.rank_dict
+                    per_subquery_graph_traces[sq_id] = graph_result.trace
 
             original_papers_for_selection = {
                 sq_id: list(papers) for sq_id, papers in papers_for_selection.items()
@@ -452,10 +506,11 @@ class DeepResearchWorkflow:
 
             planner_time = round(timings["planner"], 3)
             retrieval_time = round(timings["retrieval"], 3)
+            graph_augment_time = round(timings["graph_augment"], 3)
             selector_time = round(timings["selector"], 3)
             browser_time = round(timings["browser"], 3)
 
-            overhead_time = round(total_time - (planner_time + retrieval_time + selector_time + browser_time), 3)
+            overhead_time = round(total_time - (planner_time + retrieval_time + graph_augment_time + selector_time + browser_time), 3)
 
             if browser_time > 0:
                 logger.info(f"[🌐 Iteration {iter_idx}] Browser time: {browser_time:.3f}s")
@@ -467,6 +522,11 @@ class DeepResearchWorkflow:
                     sq_id: [{"title": p.title, "arxiv_id": p.arxiv_id, "id": p.id} for p in papers]
                     for sq_id, papers in papers_for_selection.items()
                 },
+                'raw_retriever_papers': {
+                    sq_id: [{"title": p.title, "arxiv_id": p.arxiv_id, "id": p.id} for p in papers]
+                    for sq_id, papers in raw_retriever_papers_for_selection.items()
+                },
+                'per_subquery_graph': per_subquery_graph_traces,
                 'selected_papers': {
                     sq_id: [{"title": p.title, "arxiv_id": p.arxiv_id, "id": p.id} for p in kept]
                     for sq_id, kept in cur_iter_selected_papers.items()
@@ -474,6 +534,7 @@ class DeepResearchWorkflow:
                 
                 'planner_during': planner_time,
                 'retrieval_during': retrieval_time,
+                'graph_augment_during': graph_augment_time,
                 'selector_during': selector_time,
                 'browser_during': browser_time,
                 'overhead_during': overhead_time,
