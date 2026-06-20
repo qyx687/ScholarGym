@@ -2,6 +2,7 @@
 import os
 import json
 import shutil
+import hashlib
 import importlib.util
 from typing import List, Dict
 from tqdm import tqdm
@@ -68,6 +69,15 @@ def safe_output_token(value, max_len: int = 64) -> str:
 
 def float_output_token(value) -> str:
     return safe_output_token(str(value).replace(".", "p"))
+
+
+def safe_output_component(value: str, max_len: int = 240) -> str:
+    """Keep one path component under common filesystem filename limits."""
+    if len(value) <= max_len:
+        return value
+    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
+    suffix = f"_h-{digest}"
+    return value[: max_len - len(suffix)] + suffix
 
 
 def per_subquery_graph_output_suffix(
@@ -814,7 +824,14 @@ def main():
         fail_fast=per_subquery_graph_fail_fast,
     )
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{per_subquery_graph_flag}")
+    raw_output_name = f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{per_subquery_graph_flag}"
+    output_name = safe_output_component(raw_output_name)
+    if output_name != raw_output_name:
+        logger.warning(
+            "[⚠️] Output directory name was shortened to avoid filesystem filename length limits. "
+            f"Original length={len(raw_output_name)}, shortened length={len(output_name)}"
+        )
+    current_output_dir = os.path.join(output_dir, output_name)
     os.makedirs(current_output_dir, exist_ok=True)
 
     # Save config file for reproduction
