@@ -6,7 +6,7 @@ success/error counts, latency, 429s, and rate-related response headers.
 
 Example:
 
-    S2_API_KEY=... python code/s2_rate_probe.py --rps 1 2 4 --requests-per-step 20
+    S2_API_KEY=... python code/s2_rate_probe.py --rps 1 2 4 --requests-per-step 20 --concurrency 4
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import os
 import statistics
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -39,6 +40,8 @@ RATE_HEADER_PREFIXES = (
 class RequestRecord:
     step_rps: float
     request_index: int
+    started_offset_s: float
+    completed_offset_s: float
     status_code: int
     latency_s: float
     ok: bool
@@ -64,13 +67,13 @@ def percentile(values: List[float], pct: float) -> float:
     return values[idx]
 
 
-def summarize(records: Iterable[RequestRecord]) -> Dict[str, object]:
+def summarize(records: Iterable[RequestRecord], include_step_timing: bool = False) -> Dict[str, object]:
     rows = list(records)
     latencies = [r.latency_s for r in rows if r.latency_s >= 0]
     by_status: Dict[int, int] = {}
     for row in rows:
         by_status[row.status_code] = by_status.get(row.status_code, 0) + 1
-    return {
+    summary = {
         "requests": len(rows),
         "ok": sum(1 for r in rows if r.ok),
         "status_counts": dict(sorted(by_status.items())),
@@ -81,14 +84,20 @@ def summarize(records: Iterable[RequestRecord]) -> Dict[str, object]:
         "latency_p95_s": round(percentile(latencies, 95), 4),
         "latency_max_s": round(max(latencies), 4) if latencies else 0.0,
     }
+    if include_step_timing:
+        elapsed_s = max((r.completed_offset_s for r in rows), default=0.0)
+        summary["elapsed_s"] = round(elapsed_s, 4)
+        summary["achieved_rps"] = round(len(rows) / elapsed_s, 4) if elapsed_s > 0 else 0.0
+    return summary
 
 
 def print_summary(step_rps: float, records: List[RequestRecord]) -> None:
-    summary = summarize(records)
+    summary = summarize(records, include_step_timing=True)
     status_counts = ",".join(f"{k}:{v}" for k, v in summary["status_counts"].items())
     retry_after_values = sorted({r.retry_after for r in records if r.retry_after})
     print(
         f"rps={step_rps:g} requests={summary['requests']} ok={summary['ok']} "
+        f"achieved_rps={summary['achieved_rps']} elapsed={summary['elapsed_s']}s "
         f"429={summary['429_count']} errors={summary['error_count']} "
         f"status={status_counts or '-'} "
         f"latency_mean={summary['latency_mean_s']}s p95={summary['latency_p95_s']}s "
@@ -115,52 +124,103 @@ def build_params(endpoint: str, fields: str, limit: int) -> Dict[str, object]:
     return {"fields": relation_fields, "offset": 0, "limit": limit}
 
 
+def send_request(
+    *,
+    headers: Dict[str, str],
+    url: str,
+    params: Dict[str, object],
+    step_rps: float,
+    request_index: int,
+    timeout: float,
+    step_start: float,
+) -> RequestRecord:
+    start = time.monotonic()
+    status_code = 0
+    retry_after = ""
+    response_rate_headers: Dict[str, str] = {}
+    error = ""
+    ok = False
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=timeout)
+        status_code = response.status_code
+        retry_after = response.headers.get("Retry-After", "")
+        response_rate_headers = rate_headers(response.headers)
+        ok = response.ok
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    completed = time.monotonic()
+    latency = completed - start
+    return RequestRecord(
+        step_rps=step_rps,
+        request_index=request_index,
+        started_offset_s=round(start - step_start, 4),
+        completed_offset_s=round(completed - step_start, 4),
+        status_code=status_code,
+        latency_s=round(latency, 4),
+        ok=ok,
+        retry_after=retry_after,
+        rate_headers=response_rate_headers,
+        error=error,
+    )
+
+
+def collect_done(futures, rows: List[RequestRecord], stop_on_429: bool) -> bool:
+    stop = False
+    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+    for future in done:
+        futures.remove(future)
+        row = future.result()
+        rows.append(row)
+        if stop_on_429 and row.status_code == 429:
+            stop = True
+    return stop
+
+
 def probe_step(
     *,
-    session: requests.Session,
+    headers: Dict[str, str],
     url: str,
     params: Dict[str, object],
     step_rps: float,
     requests_per_step: int,
     timeout: float,
     stop_on_429: bool,
+    concurrency: int,
 ) -> List[RequestRecord]:
     rows: List[RequestRecord] = []
+    futures = []
     interval = 1.0 / step_rps if step_rps > 0 else 0.0
     next_at = time.monotonic()
-    for idx in range(1, requests_per_step + 1):
-        now = time.monotonic()
-        if now < next_at:
-            time.sleep(next_at - now)
-        start = time.monotonic()
-        status_code = 0
-        retry_after = ""
-        headers: Dict[str, str] = {}
-        error = ""
-        ok = False
-        try:
-            response = session.get(url, params=params, timeout=timeout)
-            status_code = response.status_code
-            retry_after = response.headers.get("Retry-After", "")
-            headers = rate_headers(response.headers)
-            ok = response.ok
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        latency = time.monotonic() - start
-        row = RequestRecord(
-            step_rps=step_rps,
-            request_index=idx,
-            status_code=status_code,
-            latency_s=round(latency, 4),
-            ok=ok,
-            retry_after=retry_after,
-            rate_headers=headers,
-            error=error,
-        )
-        rows.append(row)
-        next_at = max(next_at + interval, time.monotonic())
-        if stop_on_429 and status_code == 429:
-            break
+    step_start = next_at
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        for idx in range(1, requests_per_step + 1):
+            while len(futures) >= max(1, concurrency):
+                if collect_done(futures, rows, stop_on_429):
+                    break
+            if stop_on_429 and any(row.status_code == 429 for row in rows):
+                break
+            now = time.monotonic()
+            if now < next_at:
+                time.sleep(next_at - now)
+            futures.append(
+                executor.submit(
+                    send_request,
+                    headers=headers,
+                    url=url,
+                    params=params,
+                    step_rps=step_rps,
+                    request_index=idx,
+                    timeout=timeout,
+                    step_start=step_start,
+                )
+            )
+            next_at += interval
+        while futures:
+            collect_done(futures, rows, stop_on_429=False)
+            if stop_on_429 and any(row.status_code == 429 for row in rows):
+                # In-flight requests are still collected, but no more are scheduled.
+                continue
+    rows.sort(key=lambda row: row.request_index)
     return rows
 
 
@@ -173,6 +233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relation-limit", type=int, default=1, help="Limit for citations/references endpoint")
     parser.add_argument("--rps", type=float, nargs="+", default=[0.5, 1.0, 2.0, 4.0], help="Target RPS values to test")
     parser.add_argument("--requests-per-step", type=int, default=12)
+    parser.add_argument("--concurrency", type=int, default=1, help="Maximum in-flight requests for each RPS step")
     parser.add_argument("--timeout", type=float, default=20.0)
     parser.add_argument("--cooldown", type=float, default=5.0, help="Seconds to sleep between RPS steps")
     parser.add_argument("--stop-on-429", action="store_true", help="Stop a step as soon as a 429 appears")
@@ -192,11 +253,13 @@ def main() -> int:
     if any(rps <= 0 for rps in args.rps):
         print("--rps values must be positive", file=sys.stderr)
         return 2
+    if args.concurrency <= 0:
+        print("--concurrency must be positive", file=sys.stderr)
+        return 2
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "ScholarGym-S2RateProbe/0.1"})
+    headers = {"User-Agent": "ScholarGym-S2RateProbe/0.1"}
     if args.api_key and not args.no_key:
-        session.headers.update({"x-api-key": args.api_key})
+        headers["x-api-key"] = args.api_key
 
     url = build_url(args.endpoint, args.paper_id)
     params = build_params(args.endpoint, args.fields, args.relation_limit)
@@ -207,18 +270,20 @@ def main() -> int:
 
     print(
         f"endpoint={args.endpoint} paper_id={args.paper_id} "
-        f"requests_per_step={args.requests_per_step} keyed={bool(args.api_key and not args.no_key)}"
+        f"requests_per_step={args.requests_per_step} concurrency={args.concurrency} "
+        f"keyed={bool(args.api_key and not args.no_key)}"
     )
     all_records: List[RequestRecord] = []
     for step_num, step_rps in enumerate(args.rps, start=1):
         records = probe_step(
-            session=session,
+            headers=headers,
             url=url,
             params=params,
             step_rps=step_rps,
             requests_per_step=args.requests_per_step,
             timeout=args.timeout,
             stop_on_429=args.stop_on_429,
+            concurrency=args.concurrency,
         )
         all_records.extend(records)
         print_summary(step_rps, records)
