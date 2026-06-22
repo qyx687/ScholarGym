@@ -40,8 +40,20 @@ except Exception:  # pragma: no cover - keeps this module testable in minimal en
 
 logger = get_logger(__name__, log_file="./log/per_subquery_graph.log")
 
-DEFAULT_RERANK_MODE = "original_current_subquery_weighted"
+DEFAULT_RERANK_MODE = "query_subquery_intent_path_weighted"
+DEFAULT_FEATURE_WEIGHTS = {
+    "bm25_query_norm": 0.20,
+    "bm25_subquery_norm": 0.30,
+    "intent_score": 0.10,
+    "path_count_norm": 0.40,
+}
+INTENT_WEIGHTS = {
+    "methodology": 1.0,
+    "result": 0.75,
+    "background": 0.35,
+}
 SUPPORTED_RERANK_MODES = {
+    "query_subquery_intent_path_weighted",
     "original_current_subquery_weighted",
     "original_plus_current_subquery_weighted",
     "original_current_subquery_max",
@@ -365,6 +377,36 @@ def normalized_bm25_scores(index: LocalBM25Index, query: str) -> Dict[str, float
     return {arxiv_id: float(score) / (max_raw + EPSILON) for arxiv_id, score in raw.items()}
 
 
+def minmax_normalize_scores(
+    raw_scores: Mapping[str, Any],
+    candidate_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, float]:
+    ids = [
+        normalize_arxiv_id(arxiv_id)
+        for arxiv_id in (candidate_ids if candidate_ids is not None else raw_scores.keys())
+        if normalize_arxiv_id(arxiv_id)
+    ]
+    if not ids:
+        return {}
+    values: List[float] = []
+    for arxiv_id in ids:
+        value = raw_scores.get(arxiv_id, 0.0)
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            score = 0.0
+        values.append(score if math.isfinite(score) else 0.0)
+    lo = min(values)
+    hi = max(values)
+    if hi - lo <= EPSILON:
+        return {arxiv_id: 0.0 for arxiv_id in ids}
+    return {arxiv_id: (value - lo) / (hi - lo) for arxiv_id, value in zip(ids, values)}
+
+
+def minmax_normalized_bm25_scores(index: LocalBM25Index, query: str) -> Dict[str, float]:
+    return minmax_normalize_scores(index.score(query), index.arxiv_ids)
+
+
 def max_score_maps(score_maps: Sequence[Dict[str, float]], candidate_ids: Iterable[str]) -> Dict[str, float]:
     out = {arxiv_id: 0.0 for arxiv_id in candidate_ids}
     for scores in score_maps:
@@ -379,22 +421,25 @@ def rank_candidates(
     scores: Mapping[str, float],
     seed_rank: Mapping[str, int],
     paper_metadata: Mapping[str, Mapping[str, Any]],
+    feature_details: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     seed_ids = set(seed_rank)
     rows: List[Dict[str, Any]] = []
     for arxiv_id in sorted({normalize_arxiv_id(x) for x in candidate_ids if normalize_arxiv_id(x)}):
         metadata = paper_metadata.get(arxiv_id, {})
-        rows.append(
-            {
-                "arxiv_id": arxiv_id,
-                "score": float(scores.get(arxiv_id, 0.0)),
-                "is_seed": arxiv_id in seed_ids,
-                "seed_rank": seed_rank.get(arxiv_id),
-                "title": metadata.get("title", ""),
-                "abstract": metadata.get("abstract", ""),
-                "date": metadata.get("date", ""),
-            }
-        )
+        row = {
+            "arxiv_id": arxiv_id,
+            "score": float(scores.get(arxiv_id, 0.0)),
+            "is_seed": arxiv_id in seed_ids,
+            "seed_rank": seed_rank.get(arxiv_id),
+            "title": metadata.get("title", ""),
+            "abstract": metadata.get("abstract", ""),
+            "date": metadata.get("date", ""),
+        }
+        details = dict((feature_details or {}).get(arxiv_id, {}) or {})
+        if details:
+            row["rerank_features"] = details
+        rows.append(row)
 
     def sort_key(row: Dict[str, Any]) -> Tuple[float, int, int, str]:
         rank = row.get("seed_rank")
@@ -425,6 +470,7 @@ class PerSubqueryGraphAugmenter:
         expansion_limit: int = 100,
         rerank_mode: str = DEFAULT_RERANK_MODE,
         rerank_alpha: float = 0.5,
+        rerank_feature_weights: Optional[Mapping[str, float]] = None,
         fail_fast: bool = False,
     ) -> None:
         if method not in SUPPORTED_METHODS:
@@ -442,7 +488,20 @@ class PerSubqueryGraphAugmenter:
         self.expansion_limit = max(0, int(expansion_limit or 0))
         self.rerank_mode = rerank_mode
         self.rerank_alpha = float(rerank_alpha)
+        self.rerank_feature_weights = self._resolve_feature_weights(rerank_feature_weights)
         self.fail_fast = fail_fast
+
+    @staticmethod
+    def _resolve_feature_weights(weights: Optional[Mapping[str, float]]) -> Dict[str, float]:
+        resolved = dict(DEFAULT_FEATURE_WEIGHTS)
+        for key, value in (weights or {}).items():
+            if key not in resolved:
+                continue
+            try:
+                resolved[key] = float(value)
+            except (TypeError, ValueError):
+                logger.warning("[per_subquery_graph] ignoring invalid rerank feature weight %s=%r", key, value)
+        return resolved
 
     def augment(
         self,
@@ -482,7 +541,14 @@ class PerSubqueryGraphAugmenter:
                 before_date=subquery.before_date,
                 exclude_arxiv_ids=exclude_ids,
             )
-            ranked, rerank_info, rerank_warnings = self._rerank(candidate_ids, metadata_by_arxiv_id, original_query, subquery.text, seed_rank)
+            ranked, rerank_info, rerank_warnings = self._rerank(
+                candidate_ids,
+                metadata_by_arxiv_id,
+                original_query,
+                subquery.text,
+                seed_rank,
+                expansion_provenance,
+            )
             warnings.extend(rerank_warnings)
             selector_input = ranked[:top_k]
             if not selector_input:
@@ -496,6 +562,7 @@ class PerSubqueryGraphAugmenter:
                 "expansion_limit": self.expansion_limit,
                 "rerank_mode": self.rerank_mode,
                 "rerank_alpha": self.rerank_alpha,
+                "rerank_feature_weights": dict(self.rerank_feature_weights),
                 "seed_count": len(seed_ids),
                 "requested_selector_top_k": top_k,
                 "selector_input_count": len(papers),
@@ -707,6 +774,7 @@ class PerSubqueryGraphAugmenter:
         original_query: str,
         subquery_text: str,
         seed_rank: Mapping[str, int],
+        expansion_provenance: Optional[Mapping[str, List[Mapping[str, Any]]]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
         warnings: List[str] = []
         index = LocalBM25Index()
@@ -717,7 +785,23 @@ class PerSubqueryGraphAugmenter:
         mode = self.rerank_mode
         indexed_ids = list(index.arxiv_ids)
         query_strings: List[str] = []
-        if mode in {"original_current_subquery_weighted", "original_plus_current_subquery_weighted"}:
+        feature_details: Dict[str, Dict[str, Any]] = {}
+        rerank_info: Dict[str, Any] = {
+            "local_rerank_document_count": 0,
+            "rerank_query_strings": [],
+        }
+        if mode == "query_subquery_intent_path_weighted":
+            scores, feature_details, feature_info = self._feature_weighted_scores(
+                index=index,
+                indexed_ids=indexed_ids,
+                original_query=original_query,
+                subquery_text=subquery_text,
+                seed_rank=seed_rank,
+                expansion_provenance=expansion_provenance,
+            )
+            query_strings = [original_query, subquery_text]
+            rerank_info.update(feature_info)
+        elif mode in {"original_current_subquery_weighted", "original_plus_current_subquery_weighted"}:
             original_scores = normalized_bm25_scores(index, original_query)
             subquery_scores = normalized_bm25_scores(index, subquery_text)
             scores = {
@@ -739,8 +823,133 @@ class PerSubqueryGraphAugmenter:
             scores = {arxiv_id: 0.0 for arxiv_id in indexed_ids}
         else:
             raise ValueError(f"Unsupported rerank mode: {mode}")
-        ranked = rank_candidates(indexed_ids, scores, seed_rank, index.paper_metadata)
-        return ranked, {"local_rerank_document_count": len(ranked), "rerank_query_strings": query_strings}, warnings
+        ranked = rank_candidates(indexed_ids, scores, seed_rank, index.paper_metadata, feature_details)
+        rerank_info.update(
+            {
+                "local_rerank_document_count": len(ranked),
+                "rerank_query_strings": query_strings,
+            }
+        )
+        return ranked, rerank_info, warnings
+
+    def _feature_weighted_scores(
+        self,
+        *,
+        index: LocalBM25Index,
+        indexed_ids: Sequence[str],
+        original_query: str,
+        subquery_text: str,
+        seed_rank: Mapping[str, int],
+        expansion_provenance: Optional[Mapping[str, List[Mapping[str, Any]]]],
+    ) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+        weights = self.rerank_feature_weights
+        bm25_query_norm = minmax_normalized_bm25_scores(index, original_query)
+        bm25_subquery_norm = minmax_normalized_bm25_scores(index, subquery_text)
+        path_counts, neighbor_ids, unique_edge_count = self._local_graph_path_counts(
+            indexed_ids,
+            seed_rank,
+            expansion_provenance,
+        )
+        path_count_norm = minmax_normalize_scores(path_counts, indexed_ids)
+        intent_scores, intent_labels = self._intent_scores(indexed_ids, seed_rank, expansion_provenance)
+
+        scores: Dict[str, float] = {}
+        feature_details: Dict[str, Dict[str, Any]] = {}
+        for arxiv_id in indexed_ids:
+            score = (
+                weights["bm25_query_norm"] * bm25_query_norm.get(arxiv_id, 0.0)
+                + weights["bm25_subquery_norm"] * bm25_subquery_norm.get(arxiv_id, 0.0)
+                + weights["intent_score"] * intent_scores.get(arxiv_id, 0.0)
+                + weights["path_count_norm"] * path_count_norm.get(arxiv_id, 0.0)
+            )
+            scores[arxiv_id] = float(score)
+            feature_details[arxiv_id] = {
+                "bm25_query_norm": bm25_query_norm.get(arxiv_id, 0.0),
+                "bm25_subquery_norm": bm25_subquery_norm.get(arxiv_id, 0.0),
+                "intent_score": intent_scores.get(arxiv_id, 0.0),
+                "intent_labels": intent_labels.get(arxiv_id, []),
+                "path_count": path_counts.get(arxiv_id, 0),
+                "path_count_norm": path_count_norm.get(arxiv_id, 0.0),
+                "unique_neighbor_ids": neighbor_ids.get(arxiv_id, []),
+            }
+
+        return scores, feature_details, {
+            "rerank_feature_weights": dict(weights),
+            "rerank_feature_formula": (
+                "0.20*bm25_query_norm + 0.30*bm25_subquery_norm + "
+                "0.10*intent_score + 0.40*path_count_norm"
+            ),
+            "rerank_graph_unique_edge_count": unique_edge_count,
+            "rerank_path_count_max": max(path_counts.values()) if path_counts else 0,
+        }
+
+    @staticmethod
+    def _local_graph_path_counts(
+        indexed_ids: Sequence[str],
+        seed_rank: Mapping[str, int],
+        expansion_provenance: Optional[Mapping[str, List[Mapping[str, Any]]]],
+    ) -> Tuple[Dict[str, int], Dict[str, List[str]], int]:
+        candidate_set = {normalize_arxiv_id(arxiv_id) for arxiv_id in indexed_ids if normalize_arxiv_id(arxiv_id)}
+        seed_ids = {normalize_arxiv_id(arxiv_id) for arxiv_id in seed_rank if normalize_arxiv_id(arxiv_id)}
+        neighbors: Dict[str, Set[str]] = {arxiv_id: set() for arxiv_id in candidate_set}
+        unique_edges: Set[Tuple[str, str, str]] = set()
+
+        for candidate_id_raw, rows in (expansion_provenance or {}).items():
+            candidate_id = normalize_arxiv_id(candidate_id_raw)
+            if candidate_id not in candidate_set:
+                continue
+            for row in rows or []:
+                if not isinstance(row, Mapping):
+                    continue
+                source_seed = normalize_arxiv_id(row.get("source_seed_arxiv_id"))
+                if source_seed not in seed_ids or source_seed not in candidate_set or source_seed == candidate_id:
+                    continue
+                edge_type = str(row.get("edge_type") or "")
+                edge_key = (source_seed, candidate_id, edge_type)
+                if edge_key in unique_edges:
+                    continue
+                unique_edges.add(edge_key)
+                neighbors[source_seed].add(candidate_id)
+                neighbors[candidate_id].add(source_seed)
+
+        path_counts = {arxiv_id: len(neighbor_set) for arxiv_id, neighbor_set in neighbors.items()}
+        neighbor_ids = {arxiv_id: sorted(neighbor_set) for arxiv_id, neighbor_set in neighbors.items()}
+        return path_counts, neighbor_ids, len(unique_edges)
+
+    @staticmethod
+    def _intent_scores(
+        indexed_ids: Sequence[str],
+        seed_rank: Mapping[str, int],
+        expansion_provenance: Optional[Mapping[str, List[Mapping[str, Any]]]],
+    ) -> Tuple[Dict[str, float], Dict[str, List[str]]]:
+        seed_ids = {normalize_arxiv_id(arxiv_id) for arxiv_id in seed_rank if normalize_arxiv_id(arxiv_id)}
+        intent_scores: Dict[str, float] = {}
+        intent_labels: Dict[str, List[str]] = {}
+        for arxiv_id in indexed_ids:
+            normalized_id = normalize_arxiv_id(arxiv_id)
+            if not normalized_id or normalized_id in seed_ids:
+                intent_scores[normalized_id] = 0.0
+                intent_labels[normalized_id] = []
+                continue
+            best = 0.0
+            labels: Set[str] = set()
+            for row in (expansion_provenance or {}).get(normalized_id, []) or []:
+                if not isinstance(row, Mapping):
+                    continue
+                intents = row.get("intents", [])
+                if isinstance(intents, str):
+                    intents = [intents]
+                elif not isinstance(intents, (list, tuple, set)):
+                    intents = []
+                for intent in intents:
+                    label = str(intent or "").strip().lower()
+                    if not label:
+                        continue
+                    labels.add(label)
+                    best = max(best, INTENT_WEIGHTS.get(label, 0.0))
+            intent_scores[normalized_id] = best
+            intent_labels[normalized_id] = sorted(labels)
+        return intent_scores, intent_labels
 
     @staticmethod
     def _fallback_rank_candidates(
@@ -835,6 +1044,7 @@ class PerSubqueryGraphAugmenter:
             candidate_info_by_arxiv[arxiv_id] = {
                 "rerank_rank": row.get("rank"),
                 "rerank_score": row.get("score"),
+                "rerank_features": row.get("rerank_features", {}),
                 "source_type": source_type,
                 "is_seed": is_seed,
                 "seed_rank": row.get("seed_rank"),

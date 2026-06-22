@@ -74,8 +74,14 @@ PER_SUBQUERY_GRAPH_EXPANSION_LIMIT = 100
 PER_SUBQUERY_GRAPH_CACHE_DIR = './cache/s2_graph_oracle'
 PER_SUBQUERY_GRAPH_OFFLINE_CACHE_ONLY = False
 PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS = 1.0
-PER_SUBQUERY_GRAPH_RERANK_MODE = 'original_current_subquery_weighted'
+PER_SUBQUERY_GRAPH_RERANK_MODE = 'query_subquery_intent_path_weighted'
 PER_SUBQUERY_GRAPH_RERANK_ALPHA = 0.5
+PER_SUBQUERY_GRAPH_RERANK_FEATURE_WEIGHTS = {
+    'bm25_query_norm': 0.20,
+    'bm25_subquery_norm': 0.30,
+    'intent_score': 0.10,
+    'path_count_norm': 0.40,
+}
 PER_SUBQUERY_GRAPH_FAIL_FAST = False
 
 # --- Summarization Model ---

@@ -15,6 +15,7 @@ from deeprag import DeepResearchWorkflow
 from simplerag import SimpleWorkflow
 from utils import extract_ground_truth_arxiv_ids, CheckpointManager, calculate_retrieval_metrics, AgentTraceRecorder
 from per_subquery_graph import (
+    DEFAULT_FEATURE_WEIGHTS as DEFAULT_PER_SUBQUERY_GRAPH_FEATURE_WEIGHTS,
     DEFAULT_RERANK_MODE as DEFAULT_PER_SUBQUERY_GRAPH_RERANK_MODE,
     PerSubqueryGraphAugmenter,
     S2Client,
@@ -104,11 +105,13 @@ def per_subquery_graph_output_suffix(
             "citations_references": "cr",
         },
     )
-    return (
+    suffix = (
         f"_s2{method_alias}-limit{safe_output_token(expansion_limit)}"
         f"_rerank-{safe_output_token(rerank_mode, max_len=96)}"
-        f"_a{float_output_token(rerank_alpha)}"
     )
+    if rerank_mode in {"original_current_subquery_weighted", "original_plus_current_subquery_weighted"}:
+        suffix += f"_a{float_output_token(rerank_alpha)}"
+    return suffix
 
 
 def selector_input_source_summary(per_subquery_graph: Dict) -> Dict:
@@ -637,6 +640,7 @@ class CitationEvaluator:
             "PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS": results.get('per_subquery_graph_rate_limit_rps'),
             "PER_SUBQUERY_GRAPH_RERANK_MODE": results.get('per_subquery_graph_rerank_mode'),
             "PER_SUBQUERY_GRAPH_RERANK_ALPHA": results.get('per_subquery_graph_rerank_alpha'),
+            "PER_SUBQUERY_GRAPH_RERANK_FEATURE_WEIGHTS": results.get('per_subquery_graph_rerank_feature_weights'),
             "PER_SUBQUERY_GRAPH_FAIL_FAST": results.get('per_subquery_graph_fail_fast'),
         }
         
@@ -703,6 +707,7 @@ def main():
     parser.add_argument('--per_subquery_graph_offline_cache_only', type=str2bool, nargs='?', const=True, default=None, help='Use only existing S2 cache for per-subquery graph rerank')
     parser.add_argument('--per_subquery_graph_rate_limit_rps', type=float, default=None, help='Global S2 API request rate limit for per-subquery graph rerank')
     parser.add_argument('--per_subquery_graph_rerank_mode', type=str, default=None, choices=[
+        'query_subquery_intent_path_weighted',
         'original_current_subquery_weighted',
         'original_plus_current_subquery_weighted',
         'original_current_subquery_max',
@@ -774,6 +779,11 @@ def main():
         if args.per_subquery_graph_rerank_alpha is not None
         else getattr(cfg, 'PER_SUBQUERY_GRAPH_RERANK_ALPHA', 0.5)
     )
+    per_subquery_graph_rerank_feature_weights = dict(getattr(
+        cfg,
+        'PER_SUBQUERY_GRAPH_RERANK_FEATURE_WEIGHTS',
+        DEFAULT_PER_SUBQUERY_GRAPH_FEATURE_WEIGHTS,
+    ))
     per_subquery_graph_fail_fast = (
         args.per_subquery_graph_fail_fast
         if args.per_subquery_graph_fail_fast is not None
@@ -815,6 +825,7 @@ def main():
     config.PER_SUBQUERY_GRAPH_RATE_LIMIT_RPS = per_subquery_graph_rate_limit_rps
     config.PER_SUBQUERY_GRAPH_RERANK_MODE = per_subquery_graph_rerank_mode
     config.PER_SUBQUERY_GRAPH_RERANK_ALPHA = per_subquery_graph_rerank_alpha
+    config.PER_SUBQUERY_GRAPH_RERANK_FEATURE_WEIGHTS = per_subquery_graph_rerank_feature_weights
     config.PER_SUBQUERY_GRAPH_FAIL_FAST = per_subquery_graph_fail_fast
 
     # Use loaded config (cfg) for flags, not global config
@@ -904,12 +915,14 @@ def main():
                 expansion_limit=per_subquery_graph_expansion_limit,
                 rerank_mode=per_subquery_graph_rerank_mode,
                 rerank_alpha=per_subquery_graph_rerank_alpha,
+                rerank_feature_weights=per_subquery_graph_rerank_feature_weights,
                 fail_fast=per_subquery_graph_fail_fast,
             )
             logger.info(
                 "[🔗] Per-subquery graph rerank enabled: "
                 f"method={per_subquery_graph_method}, limit={per_subquery_graph_expansion_limit}, "
                 f"rerank_mode={per_subquery_graph_rerank_mode}, alpha={per_subquery_graph_rerank_alpha}, "
+                f"feature_weights={per_subquery_graph_rerank_feature_weights}, "
                 f"cache={per_subquery_graph_cache_dir}, offline_cache_only={per_subquery_graph_offline_cache_only}"
             )
     
@@ -966,6 +979,7 @@ def main():
         results['per_subquery_graph_rate_limit_rps'] = per_subquery_graph_rate_limit_rps
         results['per_subquery_graph_rerank_mode'] = per_subquery_graph_rerank_mode
         results['per_subquery_graph_rerank_alpha'] = per_subquery_graph_rerank_alpha
+        results['per_subquery_graph_rerank_feature_weights'] = per_subquery_graph_rerank_feature_weights
         results['per_subquery_graph_offline_cache_only'] = per_subquery_graph_offline_cache_only
         results['per_subquery_graph_fail_fast'] = per_subquery_graph_fail_fast
 
