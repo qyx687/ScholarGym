@@ -2,7 +2,6 @@
 import os
 import json
 import shutil
-import hashlib
 import importlib.util
 from typing import List, Dict
 from tqdm import tqdm
@@ -71,13 +70,17 @@ def float_output_token(value) -> str:
     return safe_output_token(str(value).replace(".", "p"))
 
 
-def safe_output_component(value: str, max_len: int = 240) -> str:
-    """Keep one path component under common filesystem filename limits."""
-    if len(value) <= max_len:
-        return value
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
-    suffix = f"_h-{digest}"
-    return value[: max_len - len(suffix)] + suffix
+def output_alias(value, aliases: Dict[str, str], max_len: int = 32) -> str:
+    key = str(value or "")
+    return aliases.get(key, safe_output_token(key, max_len=max_len))
+
+
+def model_output_alias(model_name: str) -> str:
+    short_name = model_name.split('/')[-1] if '/' in model_name else model_name
+    model_lower = short_name.lower()
+    if "qwen" in model_lower and "30b" in model_lower and "a3b" in model_lower:
+        return "qwen30ba3b"
+    return safe_output_token(short_name, max_len=32)
 
 
 def per_subquery_graph_output_suffix(
@@ -93,16 +96,18 @@ def per_subquery_graph_output_suffix(
 ) -> str:
     if not enabled:
         return ""
+    method_alias = output_alias(
+        method,
+        {
+            "citations": "c",
+            "references": "r",
+            "citations_references": "cr",
+        },
+    )
     return (
-        "_per_subquery_graph"
-        f"_method-{safe_output_token(method)}"
-        f"_limit-{safe_output_token(expansion_limit)}"
-        f"_rerank-{safe_output_token(rerank_mode)}"
-        f"_alpha-{float_output_token(rerank_alpha)}"
-        f"_cache-{safe_output_token(cache_dir)}"
-        f"_offline-{int(bool(offline_cache_only))}"
-        f"_rps-{float_output_token(rate_limit_rps)}"
-        f"_failfast-{int(bool(fail_fast))}"
+        f"_s2{method_alias}-limit{safe_output_token(expansion_limit)}"
+        f"_rerank-{safe_output_token(rerank_mode, max_len=96)}"
+        f"_a{float_output_token(rerank_alpha)}"
     )
 
 
@@ -615,6 +620,8 @@ class CitationEvaluator:
             "workflow": results.get('workflow'),
             "enable_reasoning": config.ENABLE_REASONING,
             "enable_structured_output": config.ENABLE_STRUCTURED_OUTPUT,
+            "RUN_LABEL": results.get('run_label'),
+            "BENCHMARK_JSONL": results.get('benchmark_jsonl'),
             "EVAL_TOP_K_VALUES": config.EVAL_TOP_K_VALUES,
             "MAX_RESULTS_PER_QUERY": config.MAX_RESULTS_PER_QUERY,
             "EVAL_MAX_ITERATIONS": config.EVAL_MAX_ITERATIONS,
@@ -678,6 +685,7 @@ def main():
     parser.add_argument('--faiss_path', type=str, default=None, help='Path prefix for FAISS index files')
     parser.add_argument('--bm25_path', type=str, default=None, help='Path for BM25 index file')
     parser.add_argument('--output_dir', type=str, default=None, help='Base directory to save evaluation results')
+    parser.add_argument('--run_label', type=str, default=None, help='Short label to include in the output directory name, e.g. testfast_first40')
     parser.add_argument('--rebuild_index', action='store_true', help='Force rebuild of indices')
     parser.add_argument('--top_k', type=int, nargs='+', default=None, help='Top-k values for evaluation')
     parser.add_argument('--device', type=str, default=None, help='Device for embedding model')
@@ -724,6 +732,7 @@ def main():
     faiss_path = args.faiss_path or cfg.FAISS_PATH_PREFIX
     bm25_path = args.bm25_path or cfg.BM25_PATH
     output_dir = args.output_dir or cfg.EVAL_BASE_DIR
+    run_label = args.run_label or getattr(cfg, 'RUN_LABEL', '')
     top_k = args.top_k or cfg.EVAL_TOP_K_VALUES
     device = args.device or cfg.DEVICE
     is_local = args.is_local if args.is_local is not None else cfg.IS_LOCAL_LLM  # bool needs explicit None check
@@ -809,8 +818,17 @@ def main():
     config.PER_SUBQUERY_GRAPH_FAIL_FAST = per_subquery_graph_fail_fast
 
     # Use loaded config (cfg) for flags, not global config
-    reasoning_flag = 'reasoning' if cfg.ENABLE_REASONING else 'instruct'
-    structured_flag = 'structured' if cfg.ENABLE_STRUCTURED_OUTPUT else 'non-structured'
+    reasoning_flag = 'reason' if cfg.ENABLE_REASONING else 'inst'
+    structured_flag = 'struct' if cfg.ENABLE_STRUCTURED_OUTPUT else 'nostruct'
+    browser_flag = output_alias(
+        browser_mode,
+        {
+            "NONE": "none",
+            "PRE_ENRICH": "pre",
+            "REFRESH": "refresh",
+            "INCREMENTAL": "incr",
+        },
+    )
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     per_subquery_graph_flag = per_subquery_graph_output_suffix(
         enabled=enable_per_subquery_graph_rerank,
@@ -823,14 +841,15 @@ def main():
         rate_limit_rps=per_subquery_graph_rate_limit_rps,
         fail_fast=per_subquery_graph_fail_fast,
     )
-    model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    raw_output_name = f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{per_subquery_graph_flag}"
-    output_name = safe_output_component(raw_output_name)
-    if output_name != raw_output_name:
-        logger.warning(
-            "[⚠️] Output directory name was shortened to avoid filesystem filename length limits. "
-            f"Original length={len(raw_output_name)}, shortened length={len(output_name)}"
-        )
+    model_name = model_output_alias(llm_model)
+    topk_flag = f"_topk-{top_k}" if workflow != "deep_research" else ""
+    run_label_flag = f"{safe_output_token(run_label, max_len=48)}_" if run_label else ""
+    run_time_flag = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_name = (
+        f"{run_label_flag}{model_name}_{prompt_type}_{search_method}"
+        f"{topk_flag}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_flag}"
+        f"{ablation_flag}{per_subquery_graph_flag}_{run_time_flag}"
+    )
     current_output_dir = os.path.join(output_dir, output_name)
     os.makedirs(current_output_dir, exist_ok=True)
 
@@ -938,6 +957,8 @@ def main():
     )
 
     results['per_subquery_graph_rerank_enabled'] = bool(per_subquery_graph_augmenter)
+    results['run_label'] = run_label
+    results['benchmark_jsonl'] = benchmark_jsonl
     if per_subquery_graph_augmenter:
         results['per_subquery_graph_method'] = per_subquery_graph_method
         results['per_subquery_graph_expansion_limit'] = per_subquery_graph_expansion_limit
