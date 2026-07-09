@@ -383,11 +383,19 @@ SELECTOR_RECIPE = (
     " Down-rank survey-only results unless the subquery asks for surveys."
 )
 
+SELECTOR_GRAPH_CONTEXT_NOTE = (
+    " Candidates may include graph_context. source=seed means the paper is a direct retriever hit; "
+    "source=expanded means it was found through citation/reference edges from seed papers; "
+    "source=seed_and_expanded means both. Use graph relations and S2 intents as supporting retrieval evidence, "
+    "but select papers based on relevance to the original query, subquery, checklist, title, and abstract."
+)
+
 SELECTOR_SYSTEM_PROMPT = (
     "You are the Selector Agent. Given a subquery, the Planner checklist, the selector recipe, "
     "and candidate papers with retriever scores, decide which papers to maintain. "
-    "Be strict; maintain only high-quality, directly relevant papers. Output decisions in JSON."
+    "Be strict; maintain only high-quality, directly relevant papers. Output decisions in JSON. "
     "Additionally, provide a structured overview of the retrieval and selection results to help the Planner adjust future subqueries."
+    + SELECTOR_GRAPH_CONTEXT_NOTE
 )
 
 SELECTOR_DECISION_PROMPT = """
@@ -428,6 +436,7 @@ SELECTOR_SYSTEM_INCREMENTAL_PROMPT = (
     "If information is insufficient, delegate to the Browser; **if 'old_overview' exists, use it to maintain and update context.** "
     "Be strict on selection; be precise on browsing goals. Output decisions in JSON. "
     "Additionally, provide a structured overview to help the Planner adjust future subqueries."
+    + SELECTOR_GRAPH_CONTEXT_NOTE
 )
 
 SELECTOR_DECISION_INCREMENTAL_PROMPT = """
@@ -497,6 +506,7 @@ SELECTOR_SYSTEM_REFRESH_PROMPT = (
     "If information is insufficient, delegate to the Browser. "
     "Be strict on selection; be precise on browsing goals. Output decisions in JSON. "
     "Additionally, provide a structured overview to help the Planner adjust future subqueries."
+    + SELECTOR_GRAPH_CONTEXT_NOTE
 )
 
 SELECTOR_DECISION_REFRESH_PROMPT = """
@@ -561,6 +571,7 @@ SELECTOR_SYSTEM_PRE_ENRICH_PROMPT = (
     "All necessary browsing has been completed. "
     "Be strict on selection. Output decisions in JSON. "
     "Additionally, provide a structured overview to help the Planner adjust future subqueries."
+    + SELECTOR_GRAPH_CONTEXT_NOTE
 )
 
 SELECTOR_DECISION_PRE_ENRICH_PROMPT = """
