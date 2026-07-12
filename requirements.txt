@@ -10,7 +10,8 @@ pandas
 openai
 
 # Vector Search & Embeddings
-faiss-gpu
+faiss-gpu; platform_system != "Darwin"
+faiss-cpu; platform_system == "Darwin"
 sentence-transformers
 transformers
 torch
@@ -35,3 +36,5 @@ jsonlines
 
 # Utilities
 python-dotenv
+requests
+pytest
