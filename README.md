@@ -1,3 +1,8 @@
+# Packaged online per-subquery graph rerank
+
+See [README_PACKAGE.md](README_PACKAGE.md) for the live trajectory-changing
+method, commands, parameters, and full output schema.
+
 # ScholarGym: Benchmarking Large Language Model Capabilities in the Information-Gathering Stage of Deep Research
 
 <p align="center">

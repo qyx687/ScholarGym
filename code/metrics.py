@@ -4,7 +4,7 @@ Metrics and Performance Utilities for Deep Research Workflow.
 Contains Timer for performance tracking and MetricsCalculator for evaluation.
 """
 import time
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 from structures import SubQuery
 import config
 
@@ -276,6 +276,48 @@ class MetricsCalculator:
             "cur_iter_distances": cur_iter_distances,
             "avg_distance": avg_distance,
             "updated_selected_min_rank_tracker": updated_selected_min_rank_tracker
+        }
+
+    @staticmethod
+    def calculate_rank_views(
+        subqueries: Dict[int, SubQuery],
+        global_rank_dicts: Dict[int, Dict[str, Dict]],
+        local_rank_dicts: Optional[Dict[int, Dict[str, Dict]]],
+        gt_arxiv_ids: Set[str],
+        selected_paper_ids_tracker: Set[str],
+        global_selected_min_rank_tracker: Dict[str, int],
+        local_selected_min_rank_tracker: Dict[str, int],
+        gt_rank_cutoff: int,
+    ) -> Dict:
+        """Calculate independent baseline-retriever and local-rerank views."""
+        global_result = MetricsCalculator.calculate_gt_rank_and_distance(
+            subqueries=subqueries,
+            rank_dicts=global_rank_dicts,
+            gt_arxiv_ids=gt_arxiv_ids,
+            selected_paper_ids_tracker=selected_paper_ids_tracker,
+            selected_min_rank_tracker=global_selected_min_rank_tracker,
+            gt_rank_cutoff=gt_rank_cutoff,
+        )
+        local_result = None
+        if local_rank_dicts is not None:
+            local_result = MetricsCalculator.calculate_gt_rank_and_distance(
+                subqueries=subqueries,
+                rank_dicts=local_rank_dicts,
+                gt_arxiv_ids=gt_arxiv_ids,
+                selected_paper_ids_tracker=selected_paper_ids_tracker,
+                selected_min_rank_tracker=local_selected_min_rank_tracker,
+                gt_rank_cutoff=gt_rank_cutoff,
+            )
+        return {
+            "gt_rank": global_result["gt_rank"],
+            "avg_distance": global_result["avg_distance"],
+            "updated_global_selected_min_rank_tracker": global_result["updated_selected_min_rank_tracker"],
+            "local_gt_rank": local_result["gt_rank"] if local_result is not None else [],
+            "local_avg_distance": local_result["avg_distance"] if local_result is not None else -1,
+            "updated_local_selected_min_rank_tracker": (
+                local_result["updated_selected_min_rank_tracker"]
+                if local_result is not None else local_selected_min_rank_tracker.copy()
+            ),
         }
     
     @staticmethod
