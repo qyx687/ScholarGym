@@ -21,11 +21,46 @@ from metrics import Timer, MetricsCalculator
 
 logger = get_logger(__name__, log_file='./log/deeprag.log')
 
+
+def _planner_input_snapshot(memory, subquery_states, retrieval_exclusion_ids):
+    """Structured Planner/retrieval state; deliberately excludes raw prompts."""
+    state_rows = []
+    for subquery_id, states in subquery_states.items():
+        for page_index, state in enumerate(states, start=1):
+            sq = state.subquery
+            state_rows.append({
+                'subquery_id': subquery_id,
+                'subquery': sq.text,
+                'subquery_target_k': sq.target_k,
+                'subquery_link_type': sq.link_type,
+                'parent_subquery_id': sq.source_subquery_id,
+                'subquery_iteration_idx': sq.iter_index,
+                'state_page_idx': page_index,
+                'total_requested': state.total_requested,
+                'retrieved_arxiv_ids': [p.arxiv_id or p.id for p in state.retrieved_papers if p.arxiv_id or p.id],
+                'selected_arxiv_ids': [p.arxiv_id or p.id for p in state.selected_papers if p.arxiv_id or p.id],
+                'checklist': state.checklist,
+                'selector_overview': state.selector_overview,
+            })
+    return {
+        'research_memory': {
+            'last_experience_replay': memory.last_experience_replay,
+            'last_checklist': memory.last_checklist,
+            'selector_recipe': memory.selector_recipe,
+            'subqueries_dag': list(memory.subqueries_dag),
+            'subqueries_meta': dict(memory.subqueries_meta),
+            'root_subquery_id': memory.root_subquery_id,
+            'root_text': memory.root_text,
+        },
+        'subquery_states': state_rows,
+        'retrieval_exclusion_arxiv_ids': sorted(retrieval_exclusion_ids),
+    }
+
 class DeepResearchWorkflow:
     """
     Orchestrates a multi-agent workflow for deep, iterative citation research.
     """
-    def __init__(self, rag_system: CitationRAGSystem, llm_model: str, gen_params: Dict, is_local: bool, trace_recorder=None):
+    def __init__(self, rag_system: CitationRAGSystem, llm_model: str, gen_params: Dict, is_local: bool, trace_recorder=None, onepass_postprocessor=None):
         self.planner = Planner(llm_model, gen_params, is_local, trace_recorder=trace_recorder)
         self.selector = Selector(llm_model, gen_params, is_local, trace_recorder=trace_recorder)
         self.browser = Browser(
@@ -43,6 +78,9 @@ class DeepResearchWorkflow:
         )
         self.rag_system = rag_system
         self.trace_recorder = trace_recorder
+        self.onepass_postprocessor = onepass_postprocessor
+        if self.onepass_postprocessor is not None:
+            self.onepass_postprocessor.selector = self.selector
 
     def _mcp_results_to_papers(self, results: List[Dict]) -> List[Paper]:
         papers: List[Paper] = []
@@ -125,6 +163,9 @@ class DeepResearchWorkflow:
         executed_queries: Set[str] = set()
         subquery_states: Dict[int, List[SubQueryState]] = {}
         history: List[Dict] = []
+        retrieval_events: List[Dict[str, Any]] = []
+        planner_events: List[Dict[str, Any]] = []
+        query_id = query.get('qid') or query.get('query_id') or f"idx-{idx}"
 
         # Memory across the entire workflow
         memory = ResearchMemory()
@@ -147,6 +188,7 @@ class DeepResearchWorkflow:
                 "browser": 0.0,
             }
             # 1) Planner iteration
+            planner_input_state = _planner_input_snapshot(memory, subquery_states, selected_paper_ids_tracker)
             with Timer() as planner_timer:
                 subqueries, experience, checklist, is_complete = self.planner.plan_iteration(
                     user_query=query, memory=memory, subquery_states=subquery_states, iteration_index=iter_idx, idx=idx
@@ -159,6 +201,31 @@ class DeepResearchWorkflow:
                 'sub_queries': [{"id": sq.id, "text": sq.text, "target_k": sq.target_k, "link_type": sq.link_type, "source_id": sq.source_subquery_id} for sq in subqueries.values()],
                 'experience_replay': experience,
                 'checklist': checklist,
+            })
+            planner_events.append({
+                'schema_version': '1.0',
+                'query_id': query_id,
+                'benchmark_idx': idx,
+                'query': query.get('query', ''),
+                'query_source': query.get('source', ''),
+                'query_date': query.get('date', ''),
+                'iteration_idx': iter_idx,
+                'planner_event_id': f'{query_id}:planner:i{iter_idx}',
+                'planner_input_state': planner_input_state,
+                'subqueries': [
+                    {
+                        'subquery_id': sq.id,
+                        'subquery': sq.text,
+                        'target_k': sq.target_k,
+                        'link_type': sq.link_type,
+                        'parent_subquery_id': sq.source_subquery_id,
+                        'subquery_before_date': sq.before_date,
+                    }
+                    for sq in subqueries.values()
+                ],
+                'planner_checklist': checklist,
+                'experience_replay': experience,
+                'is_complete': is_complete,
             })
 
             # TODO[fix]: Handle completion scenarios, early stop
@@ -185,7 +252,7 @@ class DeepResearchWorkflow:
                 
                 to_fetch = desired_total
                 if to_fetch == 0:
-                    return sq.id, []
+                    return sq.id, [], {}
                 per_call_k = min(to_fetch if to_fetch > 0 else results_per_query, config.MAX_RESULTS_PER_QUERY)
                 results, rank_dict = await asyncio.get_running_loop().run_in_executor(
                     None,
@@ -214,6 +281,7 @@ class DeepResearchWorkflow:
                 
             papers_for_selection: Dict[int, List[Paper]] = {}
             rank_dicts: Dict[int, dict] = {}
+            iteration_events: Dict[int, Dict[str, Any]] = {}
 
             for sq_id, (new_papers, rank_dict) in retrieval_map.items():
                 sq_obj = subqueries.get(sq_id, None)
@@ -224,6 +292,40 @@ class DeepResearchWorkflow:
                     subquery_states[sq_id].append(new_state)
                 papers_for_selection[sq_id] = new_state.retrieved_papers
                 rank_dicts[sq_id] = rank_dict
+                existing_pages = len(subquery_states.get(sq_id, []))
+                offset = max(0, sum(len(state.retrieved_papers) for state in subquery_states.get(sq_id, [])[:-1]))
+                iteration_events[sq_id] = {
+                    'schema_version': '1.0',
+                    'query_id': query_id,
+                    'benchmark_idx': idx,
+                    'query': query.get('query', ''),
+                    'query_source': query.get('source', ''),
+                    'query_date': query.get('date', ''),
+                    'iteration_idx': iter_idx,
+                    'subquery_id': sq_id,
+                    'subquery': sq_obj.text if sq_obj else '',
+                    'subquery_target_k': sq_obj.target_k if sq_obj else len(new_papers),
+                    'subquery_link_type': sq_obj.link_type if sq_obj else None,
+                    'parent_subquery_id': sq_obj.source_subquery_id if sq_obj else None,
+                    'subquery_before_date': sq_obj.before_date if sq_obj else query.get('date', ''),
+                    'retrieval_page_idx': existing_pages,
+                    'retrieval_event_id': f'{query_id}:retrieval:i{iter_idx}:s{sq_id}:p{existing_pages}',
+                    'retrieval_offset': offset,
+                    'raw_retrieval_page_count': len(new_papers),
+                    'results_per_query': results_per_query or config.MAX_RESULTS_PER_QUERY,
+                    'selector_top_k': len(new_papers),
+                    'planner_checklist': checklist,
+                    'retrieval_backend': 'embedding' if getattr(self.rag_system, 'search_method', '') == 'vector' else getattr(self.rag_system, 'search_method', 'bm25'),
+                    'seed_papers': [
+                        {
+                            'paper_arxiv_id': paper.arxiv_id or paper.id,
+                            'observed_retrieval_score': paper.score,
+                            'observed_retrieval_rank': rank,
+                        }
+                        for rank, paper in enumerate(new_papers, start=1)
+                        if paper.arxiv_id or paper.id
+                    ],
+                }
 
             original_papers_for_selection = {
                 sq_id: list(papers) for sq_id, papers in papers_for_selection.items()
@@ -357,6 +459,18 @@ class DeepResearchWorkflow:
                     self._process_selector_results(selection_results,cur_iter_selected_papers,subquery_states,checklist,papers_for_browsing)
             
             papers_for_selection = original_papers_for_selection
+
+            for sq_id, event in iteration_events.items():
+                event['baseline_selected_arxiv_ids'] = sorted(
+                    {
+                        paper.arxiv_id or paper.id
+                        for paper in cur_iter_selected_papers.get(sq_id, [])
+                        if paper.arxiv_id or paper.id
+                    }
+                )
+                states = subquery_states.get(sq_id, [])
+                event['baseline_selector_overview'] = states[-1].selector_overview if states else ''
+                retrieval_events.append(event)
 
             # Update selected_paper_ids_tracker with all papers selected in this iteration
             for kept in cur_iter_selected_papers.values():
@@ -494,10 +608,20 @@ class DeepResearchWorkflow:
         if self.trace_recorder and config.SAVE_AGENT_TRACES:
             self.trace_recorder.save_sample(idx)
         
+        postprocess_results = {}
+        if self.onepass_postprocessor is not None:
+            postprocess_results = self.onepass_postprocessor.process_query(
+                query=query,
+                planner_events=planner_events,
+                retrieval_events=retrieval_events,
+                gt_ids=set(gt_arxiv_ids or set()),
+            )
+
         return {
             "idx": idx,
             "final_report": '',
             "selected_papers": final_selected_papers_list,
             "history": history,
-            "executed_queries": sorted(list(executed_queries))
+            "executed_queries": sorted(list(executed_queries)),
+            "postprocess_results": postprocess_results,
         }

@@ -1,3 +1,8 @@
+# Packaged graph-rerank workflow
+
+See [README_PACKAGE.md](README_PACKAGE.md) for the one-pass baseline plus two
+independent shadow postprocessors, commands, parameters, and output schemas.
+
 # ScholarGym: Benchmarking Large Language Model Capabilities in the Information-Gathering Stage of Deep Research
 
 <p align="center">

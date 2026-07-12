@@ -129,6 +129,8 @@ def _call_llm(
         "top_p": gen_params.get("top_p", 1),
         "stream": False,
     }
+    if not is_local and model.lower().startswith("qwen3"):
+        kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
 
     # Structured output via response_format
     if return_structured and response_format is not None:
@@ -197,6 +199,8 @@ async def _call_llm_async(
         "top_p": gen_params.get("top_p", 1),
         "stream": False,
     }
+    if not is_local and model.lower().startswith("qwen3"):
+        kwargs["extra_body"] = {"enable_thinking": bool(enable_thinking)}
 
     # Structured output
     if return_structured and response_format is not None:
