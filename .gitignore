@@ -5,4 +5,3 @@ secret.py
 __pycache__/
 eval*/
 scholargym_paper_db.json
-scripts/

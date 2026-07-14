@@ -25,13 +25,8 @@ import numpy as np
 import requests
 from rank_bm25 import BM25Okapi
 
+import config
 from structures import Paper, SubQuery
-
-try:
-    from langchain_core.embeddings import Embeddings as LangChainEmbeddings
-except Exception:  # Keep sparse-only installs importable.
-    class LangChainEmbeddings:  # type: ignore
-        pass
 
 
 EPSILON = 1e-12
@@ -42,6 +37,32 @@ DEFAULT_FEATURE_WEIGHTS = {
     "path_count_normalized": 0.15,
 }
 INTENT_WEIGHTS = {"methodology": 1.0, "result": 0.75, "background": 0.35}
+
+
+class BoundedEmbeddingProvider:
+    """Limit concurrent local embedding calls without changing their backend.
+
+    Baseline Qdrant retrieval keeps its original provider.  This wrapper is
+    used only by postprocessing candidate-pool scorers, where many independent
+    events may otherwise submit large Ollama batches at the same time.
+    """
+
+    def __init__(self, provider: Any, max_concurrency: int = 1) -> None:
+        if provider is None:
+            raise ValueError("provider is required")
+        if int(max_concurrency) < 1:
+            raise ValueError("max_concurrency must be >= 1")
+        self.provider = provider
+        self.max_concurrency = int(max_concurrency)
+        self._semaphore = threading.BoundedSemaphore(self.max_concurrency)
+
+    def embed_documents(self, texts: Sequence[str]) -> List[List[float]]:
+        with self._semaphore:
+            return self.provider.embed_documents(list(texts))
+
+    def embed_query(self, text: str) -> List[float]:
+        with self._semaphore:
+            return self.provider.embed_query(text)
 
 
 def normalize_arxiv_id(value: Any) -> str:
@@ -249,96 +270,44 @@ class ArtifactWriter:
         os.replace(tmp, path)
 
 
-class EmbeddingProvider(LangChainEmbeddings):
-    """Ollama or OpenAI-compatible embedding client with an in-process cache."""
+def _normalized_embeddings(provider: Any, texts: Sequence[str]) -> np.ndarray:
+    """Embed text with ScholarGym's LangChain/Ollama client and return cosine-ready rows.
 
-    def __init__(
-        self,
-        backend: str,
-        model: str,
-        *,
-        base_url: str,
-        api_key: str = "",
-        batch_size: int = 64,
-        timeout: int = 120,
-    ) -> None:
-        if backend not in {"ollama", "api"}:
-            raise ValueError("embedding backend must be ollama or api")
-        self.backend = backend
-        self.model = model
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.batch_size = max(1, int(batch_size))
-        self.timeout = timeout
-        self._cache: Dict[str, np.ndarray] = {}
-        self._lock = threading.Lock()
+    ``OllamaEmbeddings`` intentionally has no custom API/cache wrapper.  Supporting
+    ``embed`` as a fallback keeps the local scorers easy to unit test without
+    changing the production dense path.
+    """
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
+    batch_size = max(1, int(getattr(config, "LOCAL_RERANK_EMBEDDING_BATCH_SIZE", 64)))
+    batches: List[np.ndarray] = []
+    for start in range(0, len(texts), batch_size):
+        batch = list(texts[start : start + batch_size])
+        if hasattr(provider, "embed_documents"):
+            vectors = provider.embed_documents(batch)
+        elif hasattr(provider, "embed"):
+            vectors = provider.embed(batch)
+        else:
+            raise TypeError("embedding provider must implement embed_documents or embed")
+        batch_matrix = np.asarray(vectors, dtype=np.float32)
+        if batch_matrix.ndim != 2 or batch_matrix.shape[0] != len(batch):
+            raise RuntimeError("embedding provider returned an unexpected matrix shape")
+        batches.append(batch_matrix)
+    matrix = np.concatenate(batches, axis=0)
+    if matrix.ndim != 2 or matrix.shape[0] != len(texts):
+        raise RuntimeError("embedding provider returned an unexpected matrix shape")
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / np.maximum(norms, EPSILON)
 
-    def _key(self, text: str) -> str:
-        payload = f"{self.backend}\0{self.model}\0{text}".encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
 
-    def embed(self, texts: Sequence[str]) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, 0), dtype=np.float32)
-        keys = [self._key(text) for text in texts]
-        missing_texts: List[str] = []
-        missing_keys: List[str] = []
-        with self._lock:
-            for key, text in zip(keys, texts):
-                if key not in self._cache:
-                    missing_keys.append(key)
-                    missing_texts.append(text)
-        for start in range(0, len(missing_texts), self.batch_size):
-            batch = missing_texts[start : start + self.batch_size]
-            vectors = None
-            for attempt in range(3):
-                try:
-                    vectors = self._request(batch)
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(2 ** attempt)
-            if len(vectors) != len(batch):
-                raise RuntimeError("embedding API returned an unexpected vector count")
-            with self._lock:
-                for key, vector in zip(missing_keys[start : start + self.batch_size], vectors):
-                    self._cache[key] = np.asarray(vector, dtype=np.float32)
-        with self._lock:
-            matrix = np.stack([self._cache[key] for key in keys]).astype(np.float32)
-        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-        return matrix / np.maximum(norms, EPSILON)
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        return self.embed(texts).tolist()
-
-    def embed_query(self, text: str) -> List[float]:
-        return self.embed([text])[0].tolist()
-
-    def _request(self, texts: Sequence[str]) -> List[List[float]]:
-        if self.backend == "ollama":
-            url = self.base_url
-            if not url.endswith("/api/embed"):
-                url += "/api/embed"
-            response = requests.post(url, json={"model": self.model, "input": list(texts)}, timeout=self.timeout)
-            response.raise_for_status()
-            data = response.json()
-            return data.get("embeddings") or []
-        url = self.base_url
-        if not url.endswith("/embeddings"):
-            url += "/embeddings"
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        response = requests.post(
-            url,
-            headers=headers,
-            json={"model": self.model, "input": list(texts), "encoding_format": "float"},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        items = sorted(response.json().get("data") or [], key=lambda item: int(item.get("index", 0)))
-        return [item["embedding"] for item in items]
+def _normalized_query_embedding(provider: Any, text: str) -> np.ndarray:
+    if hasattr(provider, "embed_query"):
+        vector = np.asarray(provider.embed_query(text), dtype=np.float32)
+        if vector.ndim != 1:
+            raise RuntimeError("embedding provider returned an unexpected query shape")
+        norm = float(np.linalg.norm(vector))
+        return vector / max(norm, EPSILON)
+    return _normalized_embeddings(provider, [text])[0]
 
 
 class CandidateIndex:
@@ -349,24 +318,33 @@ class CandidateIndex:
         candidate_ids: Sequence[str],
         metadata: Mapping[str, Mapping[str, Any]],
         backend: str,
-        embedding_provider: Optional[EmbeddingProvider] = None,
+        embedding_provider: Optional[Any] = None,
     ) -> None:
+        self.backend = backend
         self.ids: List[str] = []
         self.texts: List[str] = []
         for paper_id in sorted(set(candidate_ids)):
             item = metadata.get(paper_id) or {}
-            text = f"{item.get('title') or ''} {item.get('abstract') or ''}".strip()
+            title = item.get("title") or ""
+            abstract = item.get("abstract") or ""
+            if backend == "embedding":
+                # Match the paper serialization in ScholarGym's baseline Qdrant
+                # builder so retrieval and closed-pool reranking encode papers
+                # through the same model input format.
+                text = f"title: {title}\n abstract: {abstract}" if title or abstract else ""
+            else:
+                # Preserve the established graph-method BM25 local corpus.
+                text = f"{title} {abstract}".strip()
             if text:
                 self.ids.append(paper_id)
                 self.texts.append(text)
-        self.backend = backend
         self.embedding_provider = embedding_provider
         self._bm25 = BM25Okapi([tokenize(text) for text in self.texts]) if backend == "bm25" and self.texts else None
         self._document_vectors = None
         if backend == "embedding" and self.texts:
             if embedding_provider is None:
                 raise ValueError("embedding_provider is required for embedding rerank")
-            self._document_vectors = embedding_provider.embed(self.texts)
+            self._document_vectors = _normalized_embeddings(embedding_provider, self.texts)
 
     def score(self, query: str) -> Tuple[Dict[str, float], Dict[str, float], Dict[str, int]]:
         if not self.ids:
@@ -374,7 +352,11 @@ class CandidateIndex:
         if self.backend == "bm25":
             values = self._bm25.get_scores(tokenize(query or "")) if self._bm25 is not None else np.zeros(len(self.ids))
         elif self.backend == "embedding":
-            query_vector = self.embedding_provider.embed([query or ""])[0]
+            query_vector = _normalized_query_embedding(self.embedding_provider, query or "")
+            if self._document_vectors.shape[1] != query_vector.shape[0]:
+                raise RuntimeError(
+                    "embedding dimension mismatch between local candidate papers and query"
+                )
             values = self._document_vectors @ query_vector
         else:
             raise ValueError(f"unsupported scoring backend: {self.backend}")
@@ -421,12 +403,30 @@ class S2GraphClient:
         self.timeout = timeout
         self.max_retries = max_retries
         self.limiter = _RateLimiter(rate_limit_rps)
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "ScholarGym-Graph-Rerank/1.0"})
+        self._thread_local = threading.local()
+        self._session_headers = {"User-Agent": "ScholarGym-Graph-Rerank/1.0"}
         if self.api_key:
-            self.session.headers.update({"x-api-key": self.api_key})
+            self._session_headers["x-api-key"] = self.api_key
         self.stats = defaultdict(int)
         self._lock = threading.Lock()
+        self._cache_locks: Dict[str, threading.Lock] = {}
+
+    def _session_for_thread(self) -> requests.Session:
+        session = getattr(self._thread_local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._session_headers)
+            self._thread_local.session = session
+        return session
+
+    def _cache_lock(self, path: Path) -> threading.Lock:
+        key = str(path)
+        with self._lock:
+            lock = self._cache_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._cache_locks[key] = lock
+            return lock
 
     def snapshot_stats(self) -> Dict[str, int]:
         with self._lock:
@@ -443,6 +443,12 @@ class S2GraphClient:
         return path
 
     def _get(self, endpoint: str, params: Mapping[str, Any], path: Path) -> Tuple[Optional[dict], bool, int]:
+        # Concurrent events often share seeds.  Serialize identical cache keys
+        # so only one worker calls S2 and the others reuse its atomic result.
+        with self._cache_lock(path):
+            return self._get_locked(endpoint, params, path)
+
+    def _get_locked(self, endpoint: str, params: Mapping[str, Any], path: Path) -> Tuple[Optional[dict], bool, int]:
         if path.exists():
             try:
                 cached = json.loads(path.read_text(encoding="utf-8"))
@@ -460,7 +466,9 @@ class S2GraphClient:
         for attempt in range(1, self.max_retries + 1):
             self.limiter.wait()
             try:
-                response = self.session.get(url, params=dict(params), timeout=self.timeout)
+                response = self._session_for_thread().get(
+                    url, params=dict(params), timeout=self.timeout
+                )
                 last_status = response.status_code
                 self._inc("api_calls")
                 if response.status_code == 404:
@@ -470,7 +478,9 @@ class S2GraphClient:
                     continue
                 response.raise_for_status()
                 data = response.json()
-                tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+                tmp = path.with_suffix(
+                    path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp"
+                )
                 tmp.write_text(json.dumps({"endpoint": endpoint, "params": dict(params), "data": data}), encoding="utf-8")
                 os.replace(tmp, path)
                 return data, False, attempt - 1
@@ -614,7 +624,7 @@ class PerSubqueryProcessor:
         s2_client: S2GraphClient,
         *,
         scoring_backend: str,
-        embedding_provider: Optional[EmbeddingProvider],
+        embedding_provider: Optional[Any],
         expansion_method: str = "citations_references",
         expansion_limit: int = 100,
         weights: Optional[Mapping[str, float]] = None,
@@ -701,6 +711,12 @@ class PerSubqueryProcessor:
             provenance = edge_map.get(paper_id, [])
             source_seeds = sorted({edge["seed_arxiv_id"] for edge in provenance})
             is_seed, is_expanded = paper_id in seed_set, bool(provenance)
+            observed_rank = observed.get(paper_id, {}).get("observed_retrieval_rank")
+            rank_after_exclusion = (
+                int(event.get("retrieval_offset") or 0) + int(observed_rank)
+                if observed_rank is not None
+                else None
+            )
             rows.append(
                 {
                     **{key: event.get(key) for key in (
@@ -722,12 +738,12 @@ class PerSubqueryProcessor:
                     "date_cutoff_month": cutoff,
                     "retrieval_backend": self.backend,
                     "observed_retrieval_score": observed.get(paper_id, {}).get("observed_retrieval_score"),
-                    "observed_retrieval_rank": observed.get(paper_id, {}).get("observed_retrieval_rank"),
-                    "observed_retrieval_absolute_rank": (
-                        int(event.get("retrieval_offset") or 0) + int(observed[paper_id]["observed_retrieval_rank"])
-                        if paper_id in observed and observed[paper_id].get("observed_retrieval_rank") is not None
-                        else None
-                    ),
+                    "observed_retrieval_rank": observed_rank,
+                    "observed_retrieval_rank_scope": "one_based_rank_in_returned_baseline_page",
+                    "observed_retrieval_rank_after_exclusion": rank_after_exclusion,
+                    # Backward-compatible alias; it is not a pre-exclusion global rank.
+                    "observed_retrieval_absolute_rank": rank_after_exclusion,
+                    "observed_retrieval_absolute_rank_scope": "one_based_rank_after_frozen_exclusion",
                     "retrieval_score_raw": sub_raw.get(paper_id, 0.0),
                     "retrieval_score_normalized": sub_norm.get(paper_id, 0.0),
                     "retrieval_rank": sub_rank.get(paper_id),

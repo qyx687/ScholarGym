@@ -3,36 +3,31 @@
 
 import argparse
 import json
-import os
 import uuid
 from pathlib import Path
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langchain_qdrant import QdrantVectorStore
+from langchain_ollama import OllamaEmbeddings
 
-from graph_methods import EmbeddingProvider, normalize_arxiv_id
+import config
+from graph_methods import normalize_arxiv_id
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--paper_db", required=True)
-    parser.add_argument("--qdrant_url", default="http://localhost:6333")
+    parser.add_argument("--qdrant_url", default=config.QDRANT_URL)
     parser.add_argument("--qdrant_collection", default="paper_knowledge_base")
-    parser.add_argument("--embedding_backend", choices=["ollama", "api"], default="ollama")
-    parser.add_argument("--embedding_model", default="qwen3-embedding:0.6b")
-    parser.add_argument("--embedding_base_url", default="http://localhost:11434")
-    parser.add_argument("--embedding_api_key_env", default="EMBEDDING_API_KEY")
+    parser.add_argument("--embedding_base_url", default=config.OLLAMA_URL)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--recreate", action="store_true")
     args = parser.parse_args()
 
-    provider = EmbeddingProvider(
-        args.embedding_backend,
-        args.embedding_model,
+    provider = OllamaEmbeddings(
+        model=getattr(config, "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b"),
         base_url=args.embedding_base_url,
-        api_key=os.environ.get(args.embedding_api_key_env, ""),
-        batch_size=args.batch_size,
     )
     probe = provider.embed_query("dimension probe")
     client = QdrantClient(url=args.qdrant_url)
@@ -54,7 +49,10 @@ def main() -> None:
         if not isinstance(paper, dict):
             continue
         arxiv_id = normalize_arxiv_id(paper.get("arxiv_id") or key)
-        text = f"{paper.get('title') or ''} {paper.get('abstract') or ''}".strip()
+        title = paper.get("title") or ""
+        abstract = paper.get("abstract") or ""
+        # Match ScholarGym's baseline build_vector_db.py serialization exactly.
+        text = f"title: {title}\n abstract: {abstract}" if title or abstract else ""
         if not arxiv_id or not text:
             continue
         texts.append(text)
