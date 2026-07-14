@@ -1,11 +1,21 @@
 import json
 import sys
 import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from graph_methods import ArtifactWriter, PerSubqueryProcessor
+import config
+from graph_methods import (
+    ArtifactWriter,
+    BoundedEmbeddingProvider,
+    CandidateIndex,
+    PerSubqueryProcessor,
+    S2GraphClient,
+)
 
 
 class FakeS2:
@@ -43,6 +53,111 @@ class FakeS2:
 
     def snapshot_stats(self):
         return {}
+
+
+class FakeOllamaEmbeddings:
+    """LangChain-compatible surface; deliberately has no custom ``embed`` method."""
+
+    def __init__(self):
+        self.document_batch_sizes = []
+        self.document_texts = []
+
+    @staticmethod
+    def _vector(text):
+        if "alpha" in text and "gamma" not in text:
+            return [2.0, 0.0]
+        if "beta" in text:
+            return [0.0, 3.0]
+        return [1.0, 1.0]
+
+    def embed_documents(self, texts):
+        self.document_batch_sizes.append(len(texts))
+        self.document_texts.extend(texts)
+        return [self._vector(text) for text in texts]
+
+    def embed_query(self, text):
+        return self._vector(text)
+
+
+def test_embedding_candidate_index_accepts_baseline_ollama_interface_and_batches(monkeypatch):
+    monkeypatch.setattr(config, "LOCAL_RERANK_EMBEDDING_BATCH_SIZE", 2)
+    provider = FakeOllamaEmbeddings()
+    metadata = {
+        "a": {"title": "alpha", "abstract": "paper"},
+        "b": {"title": "beta", "abstract": "paper"},
+        "c": {"title": "gamma", "abstract": "paper"},
+    }
+
+    index = CandidateIndex(["a", "b", "c"], metadata, "embedding", provider)
+    raw, normalized, ranks = index.score("alpha query")
+
+    assert provider.document_batch_sizes == [2, 1]
+    assert provider.document_texts[0] == "title: alpha\n abstract: paper"
+    assert raw["a"] == 1.0
+    assert raw["b"] == 0.0
+    assert 0.70 < raw["c"] < 0.71
+    assert normalized["a"] == 1.0
+    assert ranks == {"a": 1, "c": 2, "b": 3}
+
+
+def test_postprocess_embedding_wrapper_enforces_bound():
+    class TrackingProvider:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def embed_documents(self, texts):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.02)
+            with self.lock:
+                self.active -= 1
+            return [[1.0, 0.0] for _ in texts]
+
+        def embed_query(self, _text):
+            return [1.0, 0.0]
+
+    provider = TrackingProvider()
+    bounded = BoundedEmbeddingProvider(provider, max_concurrency=1)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        list(executor.map(lambda _: bounded.embed_documents(["paper"]), range(4)))
+    assert provider.max_active == 1
+
+
+def test_s2_cache_singleflight_avoids_duplicate_concurrent_api_calls(tmp_path):
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+        @staticmethod
+        def json():
+            return {"paperId": "S2", "externalIds": {"ArXiv": "2001.00001"}}
+
+    class Session:
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def get(self, *_args, **_kwargs):
+            with self.lock:
+                self.calls += 1
+            time.sleep(0.03)
+            return Response()
+
+    client = S2GraphClient(str(tmp_path), rate_limit_rps=0)
+    session = Session()
+    client._session_for_thread = lambda: session
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        results = list(executor.map(lambda _: client.resolve("2001.00001"), range(4)))
+
+    assert session.calls == 1
+    assert [row[0]["paperId"] for row in results] == ["S2"] * 4
+    assert sum(bool(row[1]) for row in results) == 3
 
 
 def test_expanded_candidate_has_scores_rank_and_all_seed_origins():
@@ -122,7 +237,7 @@ def test_aborted_artifact_query_never_reaches_canonical_jsonl():
     with tempfile.TemporaryDirectory() as tmp:
         writer = ArtifactWriter(tmp, "full")
         writer.begin_query("q-abort", 4)
-        writer.append("global/final_paper_rows.jsonl", {"query_id": "q-abort", "benchmark_idx": 4})
+        writer.append("deep_event/paper_rows.jsonl", {"query_id": "q-abort", "benchmark_idx": 4})
         writer.abort_query()
 
-        assert not (Path(tmp) / "global/final_paper_rows.jsonl").exists()
+        assert not (Path(tmp) / "deep_event/paper_rows.jsonl").exists()

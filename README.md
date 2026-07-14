@@ -1,7 +1,11 @@
 # Packaged graph-rerank workflow
 
-See [README_PACKAGE.md](README_PACKAGE.md) for the one-pass baseline plus two
-independent shadow postprocessors, commands, parameters, and output schemas.
+See [README_PACKAGE.md](README_PACKAGE.md) for the one-pass baseline plus the
+per-subquery graph shadow and two matched deep-retrieval controls, including
+commands, parameters, and output schemas.
+
+This branch is the fixed sequential scheduler variant. All postprocess
+concurrency settings are locked to `1`.
 
 # ScholarGym: Benchmarking Large Language Model Capabilities in the Information-Gathering Stage of Deep Research
 
@@ -214,18 +218,10 @@ MsDataset.load('shenhao23/ScholarGym')
 
 ### Run Evaluation
 
-```bash
-# Evaluate with Deep Research workflow
-python code/eval.py \
-    --paper_db data/scholargym_paper_db.json \
-    --benchmark_jsonl data/scholargym_bench.jsonl \
-    --bm25_path data/bm25_index.pkl \
-    --workflow deep_research \
-    --search_method bm25 \
-    --max_iterations 5 \
-    --results_per_query 10 \
-    --llm_model qwen3:8b
-```
+Use the complete sparse and dense commands in
+[README_PACKAGE.md](README_PACKAGE.md). This package uses
+`configs/config_qwen30b_api.py` for the non-thinking Qwen 30B Planner/Selector;
+local Ollama is used only for baseline dense embeddings.
 
 ## Project Structure
 

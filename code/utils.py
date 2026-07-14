@@ -487,17 +487,42 @@ class CheckpointManager:
         
         logger.info(f"[📂] Loading checkpoint: {self.checkpoint_file}")
         processed_indices = set()
-        cached_results = []
+        cached_by_index = {}
         
         with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                if line.strip():
-                    result = json.loads(line.strip())
-                    idx = result.get('idx', -1)
-                    if idx >= 0:
-                        processed_indices.add(idx)
-                        cached_results.append(result)
-        
+            lines = f.readlines()
+        repair_at = None
+        for position, line in enumerate(lines):
+            if not line.strip():
+                continue
+            try:
+                result = json.loads(line.strip())
+                if not isinstance(result, dict):
+                    raise ValueError("checkpoint row is not a JSON object")
+            except (json.JSONDecodeError, ValueError) as exc:
+                if any(remaining.strip() for remaining in lines[position + 1:]):
+                    raise ValueError(
+                        f"Malformed checkpoint row before the file tail at line {position + 1}"
+                    ) from exc
+                repair_at = position
+                logger.warning(
+                    f"[🧹] Truncating incomplete checkpoint tail at line {position + 1}"
+                )
+                break
+            idx = result.get('idx', -1)
+            if isinstance(idx, int) and idx >= 0:
+                processed_indices.add(idx)
+                cached_by_index[idx] = result
+
+        if repair_at is not None:
+            tmp_path = self.checkpoint_file + ".repair.tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as handle:
+                handle.writelines(lines[:repair_at])
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.checkpoint_file)
+
+        cached_results = [cached_by_index[idx] for idx in sorted(cached_by_index)]
         self.processed_indices = processed_indices
         self.cached_results = cached_results
         logger.info(f"[✓] Loaded {len(processed_indices)} processed queries from checkpoint")
