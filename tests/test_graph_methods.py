@@ -1,9 +1,16 @@
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from graph_methods import PerSubqueryProcessor
+from graph_methods import (
+    CandidateIndex,
+    DEFAULT_FEATURE_WEIGHTS,
+    RERANK_FORMULA_ID,
+    PerSubqueryProcessor,
+)
 
 
 class FakeS2:
@@ -43,6 +50,37 @@ class FakeS2:
         return {}
 
 
+class RecordingEmbeddingProvider:
+    def __init__(self):
+        self.calls = []
+
+    def embed(self, texts):
+        self.calls.append(list(texts))
+        return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
+
+
+def test_dense_candidate_text_matches_baseline_qdrant_serialization_exactly():
+    provider = RecordingEmbeddingProvider()
+    index = CandidateIndex(
+        ["2001.00001"],
+        {
+            "2001.00001": {
+                "title": "Multimodal foundation model",
+                "abstract": "Visual and audio pretraining.",
+            }
+        },
+        backend="embedding",
+        embedding_provider=provider,
+    )
+
+    index.score("multimodal query")
+
+    assert provider.calls[0] == [
+        "title: Multimodal foundation model\n abstract: Visual and audio pretraining."
+    ]
+    assert provider.calls[1] == ["multimodal query"]
+
+
 def test_expanded_candidate_has_scores_rank_and_all_seed_origins():
     paper_db = {
         "2001.00001": {"title": "graph retrieval", "abstract": "query method", "date": "2001-01"},
@@ -77,6 +115,20 @@ def test_expanded_candidate_has_scores_rank_and_all_seed_origins():
     assert expanded["retrieval_rank"] is not None
     assert expanded["source_seed_arxiv_ids"] == ["2001.00001", "2001.00002"]
     assert expanded["path_count"] == 2
+    assert expanded["rerank_formula_id"] == RERANK_FORMULA_ID
+    assert expanded["feature_weights"] == {
+        "query_score_normalized": 0.30,
+        "subquery_score_normalized": 0.40,
+        "intent_score": 0.15,
+        "path_count_normalized": 0.15,
+    }
+    assert expanded["feature_weights"] == DEFAULT_FEATURE_WEIGHTS
+    assert expanded["rerank_score"] == (
+        0.30 * expanded["query_score_normalized"]
+        + 0.40 * expanded["subquery_score_normalized"]
+        + 0.15 * expanded["intent_score"]
+        + 0.15 * expanded["path_count_normalized"]
+    )
     assert len([edge for edge in result["edges"] if edge["expanded_arxiv_id"] == "2001.00003"]) == 2
     assert "2003.00004" not in rows
 

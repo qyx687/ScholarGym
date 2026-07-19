@@ -20,11 +20,82 @@ class OnlinePerSubqueryManager:
         self._query_candidates: List[str] = []
         self._query_selected: List[str] = []
         self._s2_before: Dict[str, int] = {}
+        self._paper_type_before: Dict[str, int] = {}
+        self._query_policy_record: Dict[str, Any] = {}
 
-    def start_query(self) -> None:
+    @property
+    def query_policy_id(self) -> Optional[str]:
+        value = self._query_policy_record.get("rerank_policy_id")
+        return str(value) if value else None
+
+    @property
+    def dynamic_rerank_enabled(self) -> bool:
+        return bool(
+            self.processor.active_compiled_policy
+            and not self.processor.active_compiled_policy.used_fallback
+        )
+
+    def start_query(
+        self,
+        original_query: str = "",
+        *,
+        query_id: str = "",
+        benchmark_idx: Optional[int] = None,
+    ) -> None:
         self._query_candidates = []
         self._query_selected = []
         self._s2_before = self.processor.s2.snapshot_stats()
+        resolver = self.processor.paper_type_resolver
+        self._paper_type_before = resolver.snapshot_stats() if resolver else {}
+        policy, compiled = self.processor.configure_query(original_query)
+        paper_type_provenance = {
+            "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_evidence_source": getattr(
+                resolver, "evidence_source", None
+            ),
+            "paper_type_classifier_version": getattr(
+                resolver, "classifier_version", None
+            ),
+            "paper_type_model": getattr(resolver, "model", None),
+            "paper_type_supported_types": list(
+                getattr(resolver, "supported_types", ()) or ()
+            ),
+        }
+        if policy is not None and compiled is not None:
+            assert self.processor.rerank_skill is not None
+            record = self.processor.rerank_skill.artifact_record(
+                query_id=str(query_id),
+                original_query=original_query,
+                policy=policy,
+                compiled=compiled,
+            )
+            record.update(
+                {
+                    "schema_version": "1.0",
+                    "run_id": self.run_id,
+                    "benchmark_idx": benchmark_idx,
+                    "formula_scope": "one_policy_per_original_query_all_iterations",
+                    "affects_selector_and_next_iteration": True,
+                    **paper_type_provenance,
+                }
+            )
+        else:
+            record = {
+                "schema_version": "1.0",
+                "run_id": self.run_id,
+                "query_id": str(query_id),
+                "benchmark_idx": benchmark_idx,
+                "original_query": original_query,
+                "rerank_policy_id": "legacy-static",
+                "rerank_formula_id": "q030_sq040_intent015_path015_closed_pool_minmax_v1",
+                "compiled_weights": dict(self.processor.weights),
+                "dynamic_rerank_enabled": False,
+                "formula_scope": "one_static_formula_all_queries",
+                "affects_selector_and_next_iteration": True,
+                **paper_type_provenance,
+            }
+        self._query_policy_record = record
+        self.writer.append("query_rerank_policies.jsonl", record)
 
     def process_event(
         self,
@@ -34,6 +105,17 @@ class OnlinePerSubqueryManager:
     ) -> Dict[str, Any]:
         if isinstance(event, dict):
             event.setdefault("run_id", self.run_id)
+            event.setdefault(
+                "rerank_policy_id",
+                self._query_policy_record.get("rerank_policy_id"),
+            )
+            event.setdefault(
+                "dynamic_rerank_enabled",
+                bool(
+                    self.processor.active_compiled_policy
+                    and not self.processor.active_compiled_policy.used_fallback
+                ),
+            )
         for seed in event.get("seed_papers") or []:
             paper_id = normalize_arxiv_id(seed.get("paper_arxiv_id"))
             if not paper_id:
@@ -86,6 +168,7 @@ class OnlinePerSubqueryManager:
         pass_id: int,
         is_after_browsing: bool,
     ) -> None:
+        input_papers = list(input_papers)
         kept, overview, to_browse = result[:3] if result else ([], "", {})
         details = result[3] if result and len(result) > 3 else {}
         input_ids = [
@@ -118,6 +201,18 @@ class OnlinePerSubqueryManager:
                 "to_browse_goals": browse_goals,
                 "selector_reasons": (details or {}).get("reasons") or {},
                 "selector_overview": overview or "",
+                "rerank_policy_id": self._query_policy_record.get(
+                    "rerank_policy_id"
+                ),
+                "dynamic_rerank_enabled": bool(
+                    self.processor.active_compiled_policy
+                    and not self.processor.active_compiled_policy.used_fallback
+                ),
+                "input_rerank_scores": {
+                    paper_id: float(getattr(paper, "score", 0.0) or 0.0)
+                    for paper_id, paper in zip(input_ids, input_papers)
+                    if paper_id
+                },
             },
             full_only=True,
         )
@@ -163,6 +258,17 @@ class OnlinePerSubqueryManager:
                 "subquery_id": event.get("subquery_id"),
                 "retrieved_memory_arxiv_ids": sorted(top_ids),
                 "selected_memory_arxiv_ids": sorted(selected),
+                "retrieved_memory_rerank_scores": {
+                    row["paper_arxiv_id"]: row.get("rerank_score")
+                    for row in processed.get("top_rows") or []
+                },
+                "rerank_policy_id": processed.get("rerank_policy_id"),
+                "dynamic_rerank_enabled": bool(
+                    (processed.get("compiled_rerank_policy") or {}).get(
+                        "used_fallback"
+                    )
+                    is False
+                ),
                 "affects_next_iteration": True,
             },
             full_only=True,
@@ -176,6 +282,8 @@ class OnlinePerSubqueryManager:
         candidate_hits = gt_ids & candidates
         selected_hits = gt_ids & selected
         s2_after = self.processor.s2.snapshot_stats()
+        resolver = self.processor.paper_type_resolver
+        paper_type_after = resolver.snapshot_stats() if resolver else {}
         summary = {
             "query_id": query_id,
             "benchmark_idx": benchmark_idx,
@@ -190,11 +298,33 @@ class OnlinePerSubqueryManager:
             "candidate_precision": _safe_div(len(candidate_hits), len(candidates)),
             "selection_recall": _safe_div(len(selected_hits), len(gt_ids)),
             "selection_precision": _safe_div(len(selected_hits), len(selected)),
+            "rerank_policy_id": self._query_policy_record.get("rerank_policy_id"),
+            "compiled_rerank_policy": self._query_policy_record.get(
+                "compiled_policy"
+            ),
+            "dynamic_rerank_enabled": bool(
+                self.processor.active_compiled_policy
+                and not self.processor.active_compiled_policy.used_fallback
+            ),
             "s2_stats_delta": {
                 key: int(s2_after.get(key, 0)) - int(self._s2_before.get(key, 0))
                 for key in set(self._s2_before) | set(s2_after)
             },
             "s2_stats_cumulative": s2_after,
+            "paper_type_stats_delta": {
+                key: int(paper_type_after.get(key, 0))
+                - int(self._paper_type_before.get(key, 0))
+                for key in set(self._paper_type_before) | set(paper_type_after)
+            },
+            "paper_type_stats_cumulative": paper_type_after,
+            "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_evidence_source": getattr(
+                resolver, "evidence_source", None
+            ),
+            "paper_type_classifier_version": getattr(
+                resolver, "classifier_version", None
+            ),
+            "paper_type_model": getattr(resolver, "model", None),
         }
         self.writer.append("query_results.jsonl", summary)
         return summary

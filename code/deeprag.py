@@ -165,7 +165,11 @@ class DeepResearchWorkflow:
         history: List[Dict] = []
         query_id = query.get('qid') or query.get('query_id') or f"idx-{idx}"
         if self.online_per_subquery_manager is not None:
-            self.online_per_subquery_manager.start_query()
+            self.online_per_subquery_manager.start_query(
+                query.get('query', ''),
+                query_id=str(query_id),
+                benchmark_idx=idx,
+            )
 
         # Memory across the entire workflow
         memory = ResearchMemory()
@@ -233,6 +237,12 @@ class DeepResearchWorkflow:
                         'planner_checklist': checklist,
                         'experience_replay': experience,
                         'is_complete': is_complete,
+                        'rerank_policy_id': self.online_per_subquery_manager.query_policy_id,
+                        'dynamic_rerank_enabled': self.online_per_subquery_manager.dynamic_rerank_enabled,
+                        'receives_prior_dynamic_selector_memory': (
+                            iter_idx > 1
+                            and self.online_per_subquery_manager.dynamic_rerank_enabled
+                        ),
                     },
                     full_only=True,
                 )

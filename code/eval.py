@@ -15,8 +15,25 @@ import config
 from deeprag import DeepResearchWorkflow, RANK_METRIC_SCHEMA_VERSION
 from simplerag import SimpleWorkflow
 from utils import extract_ground_truth_arxiv_ids, CheckpointManager, calculate_retrieval_metrics, AgentTraceRecorder
-from graph_methods import ArtifactWriter, EmbeddingProvider, PerSubqueryProcessor, S2GraphClient, load_paper_db
+from graph_methods import (
+    ArtifactWriter,
+    EmbeddingProvider,
+    PAPER_EMBEDDING_SERIALIZATION_ID,
+    PerSubqueryProcessor,
+    RERANK_FORMULA_ID,
+    S2GraphClient,
+    load_paper_db,
+)
+from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
+from online_paper_type import QwenPaperTypeResolver, S2PublicationTypeResolver
 from online_per_subquery import OnlinePerSubqueryManager
+from rerank_skill import (
+    DEFAULT_MAX_NEGATIVE_MASS,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_NEGATIVE_WEIGHT,
+    DEFAULT_SEMANTIC_MIN_MASS,
+    RerankSkill,
+)
 
 logger = get_logger(__name__, log_file='./log/eval.log')
 
@@ -619,6 +636,59 @@ def main():
     parser.add_argument('--graph_cache_dir', default='cache/s2_graph_oracle')
     parser.add_argument('--graph_rate_limit_rps', type=float, default=4.0)
     parser.add_argument('--graph_offline_cache_only', action='store_true')
+    parser.add_argument(
+        '--dynamic_rerank',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Compile one query-conditioned policy and reuse it across all online iterations',
+    )
+    parser.add_argument('--rerank_policy_model', default=None)
+    parser.add_argument(
+        '--rerank_policy_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        '--rerank_policy_cache',
+        default='cache/dynamic_rerank/query_policies.jsonl',
+    )
+    parser.add_argument('--rerank_retry_cached_fallbacks', action='store_true')
+    parser.add_argument('--rerank_min_confidence', type=float, default=DEFAULT_MIN_CONFIDENCE)
+    parser.add_argument(
+        '--rerank_semantic_min_mass',
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_MASS,
+    )
+    parser.add_argument('--rerank_negative_weight', type=float, default=DEFAULT_NEGATIVE_WEIGHT)
+    parser.add_argument(
+        '--rerank_max_negative_mass',
+        type=float,
+        default=DEFAULT_MAX_NEGATIVE_MASS,
+    )
+    parser.add_argument(
+        '--paper_type_backend',
+        choices=['s2', 'qwen'],
+        default='s2',
+        help='Candidate paper-type evidence provider (default: s2)',
+    )
+    parser.add_argument(
+        '--paper_type_cache',
+        default=None,
+        help='Backend-specific append-only cache; defaults to paper_types_<backend>.jsonl',
+    )
+    parser.add_argument('--paper_type_rate_limit_rps', type=float, default=1.0)
+    parser.add_argument('--paper_type_qwen_model', default=None)
+    parser.add_argument(
+        '--paper_type_qwen_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--paper_type_qwen_batch_size', type=int, default=16)
+    parser.add_argument(
+        '--paper_type_offline_cache_only',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument('--embedding_backend', choices=['ollama', 'api'], default='ollama')
     parser.add_argument('--embedding_service_model', default='qwen3-embedding:0.6b')
     parser.add_argument('--embedding_base_url', default=None)
@@ -628,6 +698,8 @@ def main():
     parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
 
     args = parser.parse_args()
+    if args.paper_type_qwen_batch_size <= 0:
+        parser.error('--paper_type_qwen_batch_size must be positive')
     
     # Load config from custom path if specified
     cfg = config
@@ -673,7 +745,15 @@ def main():
     structured_flag = 'structured' if cfg.ENABLE_STRUCTURED_OUTPUT else 'non-structured'
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    method_suffix = '_per_subquery_online' if args.enable_per_subquery_graph else '_baseline'
+    if args.enable_per_subquery_graph and args.dynamic_rerank:
+        method_suffix = (
+            '_per_subquery_online_dynamic_rerank_v1'
+            f'_type-{args.paper_type_backend}'
+        )
+    elif args.enable_per_subquery_graph:
+        method_suffix = '_per_subquery_online_q030_sq040_intent015_path015'
+    else:
+        method_suffix = '_baseline'
     label_suffix = f"_{args.run_label}" if args.run_label else ''
     current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{method_suffix}{label_suffix}")
     os.makedirs(current_output_dir, exist_ok=True)
@@ -751,6 +831,63 @@ def main():
             offline=args.graph_offline_cache_only,
         )
         scoring_backend = 'embedding' if search_method == 'vector' else 'bm25'
+        rerank_policy_model = (
+            args.rerank_policy_model
+            or os.environ.get('SCHOLARGYM_MODEL')
+            or llm_model
+        )
+        rerank_policy_is_local = (
+            args.rerank_policy_is_local
+            if args.rerank_policy_is_local is not None
+            else is_local
+        )
+        paper_type_offline = (
+            args.paper_type_offline_cache_only
+            if args.paper_type_offline_cache_only is not None
+            else args.graph_offline_cache_only
+        )
+        paper_type_cache = args.paper_type_cache or (
+            f'cache/dynamic_rerank/paper_types_{args.paper_type_backend}.jsonl'
+        )
+        paper_type_qwen_model = (
+            args.paper_type_qwen_model
+            or os.environ.get('SCHOLARGYM_MODEL')
+            or llm_model
+        )
+        paper_type_qwen_is_local = (
+            args.paper_type_qwen_is_local
+            if args.paper_type_qwen_is_local is not None
+            else is_local
+        )
+        rerank_skill = None
+        paper_type_resolver = None
+        if args.dynamic_rerank:
+            if args.paper_type_backend == 's2':
+                paper_type_resolver = S2PublicationTypeResolver(
+                    paper_type_cache,
+                    requests_per_second=args.paper_type_rate_limit_rps,
+                    offline=paper_type_offline,
+                )
+            else:
+                paper_type_resolver = QwenPaperTypeResolver(
+                    paper_type_cache,
+                    paper_db_index,
+                    paper_type_qwen_model,
+                    is_local=paper_type_qwen_is_local,
+                    batch_size=args.paper_type_qwen_batch_size,
+                    offline=paper_type_offline,
+                )
+            rerank_skill = RerankSkill(
+                rerank_policy_model,
+                is_local=rerank_policy_is_local,
+                policy_cache_path=args.rerank_policy_cache,
+                retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
+                paper_type_cache=paper_type_resolver.snapshot_cache(),
+                min_confidence=args.rerank_min_confidence,
+                semantic_min_mass=args.rerank_semantic_min_mass,
+                negative_weight=args.rerank_negative_weight,
+                max_negative_mass=args.rerank_max_negative_mass,
+            )
         processor = PerSubqueryProcessor(
             paper_db_index,
             s2_client,
@@ -758,6 +895,8 @@ def main():
             embedding_provider=embedding_provider,
             expansion_method=args.graph_method,
             expansion_limit=args.graph_expansion_limit,
+            rerank_skill=rerank_skill,
+            paper_type_resolver=paper_type_resolver,
         )
         online_manager = OnlinePerSubqueryManager(processor, artifact_writer, os.path.basename(current_output_dir))
         artifact_writer.write_json('run_manifest.json', {
@@ -767,8 +906,10 @@ def main():
             'artifact_schema_version': '1.0',
             'rank_metric_schema_version': RANK_METRIC_SCHEMA_VERSION,
             'package_source_sha256': package_source_sha256([
-                'api.py', 'deeprag.py', 'eval.py', 'graph_methods.py', 'metrics.py',
-                'online_per_subquery.py', 'rag.py', 'utils.py',
+                'api.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
+                'graph_methods.py', 'metrics.py', 'online_paper_type.py',
+                'online_per_subquery.py', 'paper_type.py', 'rag.py',
+                'rerank_skill.py', 'utils.py',
                 os.path.join('agent', 'selector.py'),
                 os.path.join('mcp', 'retrieval_mcp.py'),
             ]),
@@ -786,6 +927,9 @@ def main():
             'scoring_backend': scoring_backend,
             'embedding_backend': args.embedding_backend if embedding_provider else None,
             'embedding_model': args.embedding_service_model if embedding_provider else None,
+            'paper_embedding_serialization_id': (
+                PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+            ),
             'embedding_base_url': embedding_provider.base_url if embedding_provider else None,
             'qdrant_url': args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
             'qdrant_collection': args.qdrant_collection,
@@ -794,11 +938,56 @@ def main():
             'graph_expansion_limit': args.graph_expansion_limit,
             'graph_rate_limit_rps': args.graph_rate_limit_rps,
             'graph_offline_cache_only': args.graph_offline_cache_only,
+            'dynamic_rerank_requested': args.dynamic_rerank,
+            'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+            'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+            'rerank_policy_cache': args.rerank_policy_cache if args.dynamic_rerank else None,
+            'rerank_min_confidence': args.rerank_min_confidence if args.dynamic_rerank else None,
+            'rerank_semantic_min_mass': args.rerank_semantic_min_mass if args.dynamic_rerank else None,
+            'rerank_negative_weight': args.rerank_negative_weight if args.dynamic_rerank else None,
+            'rerank_max_negative_mass': args.rerank_max_negative_mass if args.dynamic_rerank else None,
+            'paper_type_backend': args.paper_type_backend if args.dynamic_rerank else None,
+            'paper_type_source': (
+                paper_type_resolver.evidence_source if paper_type_resolver else None
+            ),
+            'paper_type_classifier_version': (
+                paper_type_resolver.classifier_version if paper_type_resolver else None
+            ),
+            'paper_type_model': (
+                paper_type_resolver.model if paper_type_resolver else None
+            ),
+            'paper_type_supported_types': (
+                list(paper_type_resolver.supported_types)
+                if paper_type_resolver
+                else None
+            ),
+            'paper_type_cache': paper_type_cache if args.dynamic_rerank else None,
+            'paper_type_offline_cache_only': paper_type_offline if args.dynamic_rerank else None,
+            'paper_type_rate_limit_rps': (
+                args.paper_type_rate_limit_rps
+                if args.dynamic_rerank and args.paper_type_backend == 's2'
+                else None
+            ),
+            'paper_type_qwen_batch_size': (
+                args.paper_type_qwen_batch_size
+                if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+                else None
+            ),
+            'paper_type_qwen_is_local': (
+                paper_type_qwen_is_local
+                if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+                else None
+            ),
+            'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+            'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
             'date_policy': 'seeds_trust_retriever_expanded_require_db_date_lte_cutoff',
             'results_per_query': results_per_query,
             'run_label': args.run_label,
             'limit': args.limit,
-            'feature_weights': processor.weights,
+            'rerank_formula_id': POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID,
+            'feature_weights': None if args.dynamic_rerank else processor.weights,
+            'query_policy_artifact': 'online_artifacts/query_rerank_policies.jsonl',
+            'closed_loop_effect': 'dynamic_topk_to_selector_to_memory_to_next_planner_iteration',
             'prompts_saved': False,
             'paper_identity_in_artifacts': 'arxiv_id_only',
         })
@@ -831,16 +1020,36 @@ def main():
         enable_resume=True
     )
     results['method_config'] = {
-        'PACKAGE_METHOD': 'online_per_subquery_graph_rerank' if args.enable_per_subquery_graph else 'baseline',
+        'PACKAGE_METHOD': (
+            'online_per_subquery_dynamic_rerank'
+            if args.enable_per_subquery_graph and args.dynamic_rerank
+            else ('online_per_subquery_graph_rerank' if args.enable_per_subquery_graph else 'baseline')
+        ),
         'RANK_METRIC_SCHEMA_VERSION': RANK_METRIC_SCHEMA_VERSION,
         'SAVE_LEVEL': args.save_level,
         'ENABLE_PER_SUBQUERY_GRAPH': args.enable_per_subquery_graph,
         'GRAPH_METHOD': args.graph_method,
         'GRAPH_EXPANSION_LIMIT': args.graph_expansion_limit,
         'GRAPH_RATE_LIMIT_RPS': args.graph_rate_limit_rps,
-        'RERANK_FEATURE_WEIGHTS': processor.weights if args.enable_per_subquery_graph else None,
+        'DYNAMIC_RERANK': args.dynamic_rerank if args.enable_per_subquery_graph else False,
+        'RERANK_FORMULA_ID': (
+            POLICY_VERSION if args.enable_per_subquery_graph and args.dynamic_rerank
+            else (RERANK_FORMULA_ID if args.enable_per_subquery_graph else None)
+        ),
+        'RERANK_FEATURE_WEIGHTS': (
+            None if args.enable_per_subquery_graph and args.dynamic_rerank
+            else (processor.weights if args.enable_per_subquery_graph else None)
+        ),
+        'RERANK_POLICY_MODEL': (
+            rerank_policy_model
+            if args.enable_per_subquery_graph and args.dynamic_rerank
+            else None
+        ),
         'EMBEDDING_BACKEND': args.embedding_backend if embedding_provider else None,
         'EMBEDDING_MODEL': args.embedding_service_model if embedding_provider else None,
+        'PAPER_EMBEDDING_SERIALIZATION_ID': (
+            PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+        ),
         'QDRANT_COLLECTION': args.qdrant_collection if embedding_provider else None,
         'RUN_LABEL': args.run_label,
     }

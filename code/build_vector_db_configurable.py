@@ -11,7 +11,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 from langchain_qdrant import QdrantVectorStore
 
-from graph_methods import EmbeddingProvider, normalize_arxiv_id
+from graph_methods import (
+    EmbeddingProvider,
+    baseline_paper_embedding_text,
+    normalize_arxiv_id,
+)
 
 
 def main() -> None:
@@ -54,7 +58,9 @@ def main() -> None:
         if not isinstance(paper, dict):
             continue
         arxiv_id = normalize_arxiv_id(paper.get("arxiv_id") or key)
-        text = f"{paper.get('title') or ''} {paper.get('abstract') or ''}".strip()
+        title = paper.get("title") or ""
+        abstract = paper.get("abstract") or ""
+        text = baseline_paper_embedding_text(title, abstract)
         if not arxiv_id or not text:
             continue
         texts.append(text)
