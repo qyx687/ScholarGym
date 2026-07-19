@@ -350,11 +350,15 @@ Selector 输入；Selector 的 selected papers、overview 与 checklist 继续�
 
 `--dynamic_rerank` 默认开启。若 policy API 失败、JSON 不合法且一次修复仍失败，
 或 confidence 低于阈值，该 query 会安全回退到静态四因子公式，并在
-`query_rerank_policies.jsonl` 中记录原因。S2 `publicationTypes` 只在 policy
+`query_rerank_policies.jsonl` 中记录原因。policy cache key 包含
+`--rerank_min_confidence`，改变阈值不会复用旧阈值下的接受结果。S2
+`publicationTypes` 只在 policy
 包含论文类型规则时才按需解析候选类型。`--paper_type_backend s2` 是默认值，读取
 S2 `publicationTypes`，属于保守的 positive-only 证据；S2 未解析或无类型时视为
 unknown，不会误触发硬过滤。`--paper_type_backend qwen` 使用 title+abstract 批量
 执行 query-independent 九类多标签分类，并将完整结果写入独立缓存。Qwen 类型
+cache 同时绑定 `--paper_type_qwen_model`；更换模型时旧记录不会被复用。Qwen
+miss/失败保持 unknown，不会回退使用候选自带的 S2 类型。
 分类 prompt 不包含原始 query、subquery、policy 或 GT。
 
 两种 backend 禁止共用同一个 cache 文件。若未显式给出 `--paper_type_cache`，程序

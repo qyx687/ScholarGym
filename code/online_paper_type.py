@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -29,6 +30,13 @@ from paper_type import (
 
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 S2_BATCH_MAX_IDS = 500
+
+
+def qwen_model_classifier_version(model: str, base_version: str) -> str:
+    """Bind append-only Qwen cache records to the exact configured model."""
+
+    model_digest = hashlib.sha256(str(model).strip().encode("utf-8")).hexdigest()[:16]
+    return f"{base_version}.model-{model_digest}"
 
 
 class PaperTypeResolver(Protocol):
@@ -289,8 +297,9 @@ class QwenPaperTypeResolver:
             self.model,
             is_local=is_local,
         )
-        self.classifier_version = str(
-            getattr(self.classifier, "classifier_version", CLASSIFIER_VERSION)
+        self.classifier_version = qwen_model_classifier_version(
+            self.model,
+            str(getattr(self.classifier, "classifier_version", CLASSIFIER_VERSION)),
         )
         self._lock = threading.Lock()
         self._stats: Dict[str, int] = defaultdict(int)

@@ -883,6 +883,7 @@ def main():
                 policy_cache_path=args.rerank_policy_cache,
                 retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
                 paper_type_cache=paper_type_resolver.snapshot_cache(),
+                paper_type_backend=args.paper_type_backend,
                 min_confidence=args.rerank_min_confidence,
                 semantic_min_mass=args.rerank_semantic_min_mass,
                 negative_weight=args.rerank_negative_weight,

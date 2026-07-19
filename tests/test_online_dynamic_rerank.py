@@ -394,6 +394,39 @@ def test_online_type_caches_reject_records_from_the_other_backend(tmp_path):
     assert stats["offline_misses"] == 1
 
 
+def test_online_qwen_cache_is_bound_to_the_configured_model(tmp_path):
+    cache_path = tmp_path / "qwen-types.jsonl"
+    paper_db = {
+        "2001.00001": {"title": "Dataset one", "abstract": "A benchmark."}
+    }
+    first = QwenPaperTypeResolver(
+        cache_path,
+        paper_db,
+        "qwen-model-a",
+        classifier=FakeQwenTypeClassifier(),
+    )
+    assert set(first.resolve(paper_db)) == {"2001.00001"}
+
+    same_model = QwenPaperTypeResolver(
+        cache_path,
+        paper_db,
+        "qwen-model-a",
+        offline=True,
+        classifier=FakeQwenTypeClassifier(),
+    )
+    other_model = QwenPaperTypeResolver(
+        cache_path,
+        paper_db,
+        "qwen-model-b",
+        offline=True,
+        classifier=FakeQwenTypeClassifier(),
+    )
+
+    assert set(same_model.resolve(paper_db)) == {"2001.00001"}
+    assert other_model.resolve(paper_db) == {}
+    assert other_model.snapshot_stats()["cache_backend_mismatch_lines"] == 1
+
+
 def test_qwen_backend_enables_full_taxonomy_while_s2_stays_conservative(tmp_path):
     paper_db = {
         "2001.00001": {"title": "Robot benchmark", "abstract": "Dataset."}

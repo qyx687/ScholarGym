@@ -33,6 +33,8 @@ from paper_type import (
     DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
     DEFAULT_REQUIRE_THRESHOLD,
     DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
+    QWEN_EVIDENCE_SOURCE,
+    S2_EVIDENCE_SOURCE,
     S2_SUPPORTED_CANONICAL_TYPES,
     evaluate_paper_type_rules,
     normalize_paper_id,
@@ -335,6 +337,7 @@ class RerankSkill:
         policy_cache_path: str | Path | None = None,
         retry_cached_fallbacks: bool = False,
         paper_type_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        paper_type_backend: Optional[str] = None,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         catalog_version: str = CATALOG_VERSION,
         prompt_version: str = PROMPT_VERSION,
@@ -352,6 +355,10 @@ class RerankSkill:
         self.llm_call = llm_call
         self.policy_cache_path = Path(policy_cache_path) if policy_cache_path else None
         self.retry_cached_fallbacks = bool(retry_cached_fallbacks)
+        normalized_paper_type_backend = str(paper_type_backend or "").strip().lower()
+        if normalized_paper_type_backend not in {"", "s2", "qwen"}:
+            raise ValueError("paper_type_backend must be one of: s2, qwen")
+        self.paper_type_backend = normalized_paper_type_backend or None
         self.paper_type_cache = {
             normalize_paper_id(paper_id): dict(record)
             for paper_id, record in (paper_type_cache or {}).items()
@@ -414,6 +421,7 @@ class RerankSkill:
                 "model": self.model,
                 "catalog_version": self.catalog_version,
                 "prompt_version": self.prompt_version,
+                "min_confidence": self.min_confidence,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -455,6 +463,7 @@ class RerankSkill:
                         record.get("model") != self.model
                         or record.get("catalog_version") != self.catalog_version
                         or record.get("prompt_version") != self.prompt_version
+                        or record.get("min_confidence") != self.min_confidence
                     ):
                         continue
                     policy_id = str(record.get("policy_id") or record.get("cache_key") or "")
@@ -493,6 +502,7 @@ class RerankSkill:
             "model": self.model,
             "catalog_version": self.catalog_version,
             "prompt_version": self.prompt_version,
+            "min_confidence": self.min_confidence,
             "raw_model_output": policy.raw_model_output,
             "validated_policy": policy.to_dict(),
             "used_fallback": policy.used_fallback,
@@ -818,17 +828,37 @@ class RerankSkill:
             ):
                 if candidate.get(candidate_key) is not None:
                     provided_record[record_key] = candidate.get(candidate_key)
-            return provided_record
+            expected_source = (
+                QWEN_EVIDENCE_SOURCE
+                if self.paper_type_backend == "qwen"
+                else S2_EVIDENCE_SOURCE
+            )
+            if self.paper_type_backend is None or (
+                str(provided_record.get("evidence_source") or "").lower()
+                == expected_source
+            ):
+                return provided_record
         cached = self.paper_type_cache.get(paper_id)
-        if cached:
+        expected_source = (
+            QWEN_EVIDENCE_SOURCE
+            if self.paper_type_backend == "qwen"
+            else S2_EVIDENCE_SOURCE
+        )
+        if cached and (
+            self.paper_type_backend is None
+            or str(cached.get("evidence_source") or "").lower()
+            == expected_source
+        ):
             return dict(cached)
-        if isinstance(candidate.get("s2_publication_types"), (list, tuple, set)):
+        if self.paper_type_backend != "qwen" and isinstance(
+            candidate.get("s2_publication_types"), (list, tuple, set)
+        ):
             return s2_publication_types_to_record(
                 paper_id,
                 candidate.get("s2_publication_types"),
                 resolved=True,
             )
-        if isinstance(provided_probs, Mapping):
+        if self.paper_type_backend is None and isinstance(provided_probs, Mapping):
             return {
                 "paper_arxiv_id": paper_id,
                 "type_probs": dict(provided_probs),
@@ -877,6 +907,7 @@ class RerankSkill:
             if not paper_id:
                 raise ValueError("candidate is missing paper_arxiv_id")
             row["paper_arxiv_id"] = paper_id
+            row["paper_type_backend"] = self.paper_type_backend
             if policy.used_fallback:
                 contributions = {
                     "query_similarity": LEGACY_FEATURE_WEIGHTS["query_score_normalized"]

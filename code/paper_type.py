@@ -505,6 +505,8 @@ class PaperTypeClassifier:
             f"Allowed types: {', '.join(PAPER_TYPES)}\n"
             "Return one JSON array only. Each item must contain exactly "
             "paper_arxiv_id, type_probs, confidence, and classifier_version. "
+            "type_probs must contain every allowed type exactly once; do not "
+            "omit types with probability 0. "
             f"classifier_version must be {self.classifier_version}. "
             "All probabilities and confidence values must be in [0, 1].\n\n"
             "Papers:\n"
@@ -533,6 +535,11 @@ class PaperTypeClassifier:
                 raise ValueError(
                     "paper-type response items must contain exactly "
                     f"{sorted(model_keys)}"
+                )
+            raw_probs = item.get("type_probs")
+            if not isinstance(raw_probs, Mapping) or set(raw_probs) != set(PAPER_TYPES):
+                raise ValueError(
+                    "Qwen type_probs must contain exactly every canonical paper type"
                 )
             # Provider provenance is controlled by the caller, never trusted
             # from model-generated text. Qwen is a closed-world classifier over
