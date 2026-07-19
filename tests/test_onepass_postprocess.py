@@ -7,11 +7,17 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
 from deep_retrieval import DeepRetrievalProcessor
-from graph_methods import ArtifactWriter, BoundedEmbeddingProvider, PerSubqueryProcessor
+from graph_methods import (
+    ArtifactWriter,
+    BoundedEmbeddingProvider,
+    PerSubqueryProcessor,
+    QueryScopedEmbeddingCache,
+)
 from onepass_postprocess import OnePassPostprocessor, aggregate_postprocess_metrics
 
 
@@ -122,6 +128,11 @@ class FailFirstSelector(FakeSelector):
         if self.attempts == 1:
             raise RuntimeError("per-subquery selector failed")
         return await super().decide_for_subquery(*args, **kwargs)
+
+
+class NeverCallSelector:
+    async def decide_for_subquery(self, *args, **kwargs):
+        raise AssertionError("Stage A must not call a shadow Selector")
 
 
 class FixedScores:
@@ -263,12 +274,13 @@ def test_dense_graph_concurrency_keeps_postprocess_embedding_calls_serial(tmp_pa
     }
     raw_provider = TrackingEmbeddingProvider()
     bounded_provider = BoundedEmbeddingProvider(raw_provider, max_concurrency=1)
+    cached_provider = QueryScopedEmbeddingCache(bounded_provider)
     s2 = ConcurrentS2()
     processor = PerSubqueryProcessor(
         paper_db,
         s2,
         scoring_backend="embedding",
-        embedding_provider=bounded_provider,
+        embedding_provider=cached_provider,
     )
     events = [
         {
@@ -306,17 +318,25 @@ def test_dense_graph_concurrency_keeps_postprocess_embedding_calls_serial(tmp_pa
         per_subquery_processor=processor,
         deep_retrieval_processor=None,
         scoring_backend="embedding",
-        embedding_provider=bounded_provider,
+        embedding_provider=cached_provider,
         run_per_subquery=True,
         event_workers=4,
     )
 
-    manager.process_query(
+    result = manager.process_query(
         {"query": "dense graph retrieval", "date": "2002-01"}, [], events, set()
     )
 
     assert s2.max_active >= 2
     assert raw_provider.max_active == 1
+    cache_stats = result["postprocess_embedding_cache_stats"]
+    assert cache_stats["enabled"] is True
+    assert cache_stats["saved_embedding_count"] > 0
+    assert cache_stats["backend_embedding_count"] < cache_stats["total_request_count"]
+    after_scope = cached_provider.snapshot_query_stats()
+    assert after_scope["enabled"] is False
+    assert after_scope["document_cache_entry_count"] == 0
+    assert after_scope["query_cache_entry_count"] == 0
     pool_records = _read_jsonl(tmp_path / "per_subquery/pool_records.jsonl")
     assert [row["retrieval_event_id"] for row in pool_records] == [
         f"dense-event-{index}" for index in range(1, 5)
@@ -740,3 +760,249 @@ def test_postprocess_metrics_aggregate_unique_queries_and_three_methods():
     assert metrics["deep_event"]["evaluated_query_count"] == 1
     assert metrics["deep_event"]["failed_query_count"] == 1
     assert metrics["deep_merged"]["missing_query_count"] == 2
+
+
+def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(tmp_path):
+    paper_db = {
+        "2001.00001": {
+            "title": "seed graph query",
+            "abstract": "retrieval",
+            "date": "2001-01",
+        },
+        "2001.00002": {
+            "title": "deep query",
+            "abstract": "retrieval",
+            "date": "2001-02",
+        },
+        "2001.00003": {
+            "title": "expanded methodology",
+            "abstract": "graph query",
+            "date": "2001-03",
+        },
+    }
+    s2 = FakeS2()
+    graph_processor = PerSubqueryProcessor(
+        paper_db, s2, scoring_backend="bm25", embedding_provider=None
+    )
+    deep_processor = DeepRetrievalProcessor(
+        FakeRAG(paper_db), paper_db, scoring_backend="bm25", embedding_provider=None
+    )
+
+    def legacy_rerank_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Stage A entered a legacy rerank method")
+
+    graph_processor.process = legacy_rerank_must_not_run
+    deep_processor.rerank_pool = legacy_rerank_must_not_run
+    event = {
+        "schema_version": "1.0",
+        "query_id": "q-stage-a",
+        "benchmark_idx": 0,
+        "query": "graph query",
+        "query_date": "2001-12",
+        "iteration_idx": 1,
+        "subquery_id": 1,
+        "subquery": "graph retrieval",
+        "subquery_target_k": 1,
+        "subquery_link_type": "derive",
+        "parent_subquery_id": 0,
+        "subquery_before_date": "2001-12",
+        "retrieval_event_id": "q-stage-a:retrieval:i1:s1:p1",
+        "retrieval_page_idx": 1,
+        "retrieval_offset": 0,
+        "results_per_query": 1,
+        "selector_top_k": 1,
+        "planner_checklist": "retain methods",
+        "retrieval_exclusion_arxiv_ids": [],
+        "seed_papers": [
+            {
+                "paper_arxiv_id": "2001.00001",
+                "observed_retrieval_score": 1.0,
+                "observed_retrieval_rank": 1,
+            }
+        ],
+        "baseline_selected_arxiv_ids": ["2001.00001"],
+    }
+    manager = OnePassPostprocessor(
+        selector=NeverCallSelector(),
+        paper_db=paper_db,
+        writer=ArtifactWriter(str(tmp_path), "full"),
+        s2_client=s2,
+        per_subquery_processor=graph_processor,
+        deep_retrieval_processor=deep_processor,
+        scoring_backend="bm25",
+        embedding_provider=None,
+        run_per_subquery=True,
+        run_deep_event=True,
+        run_deep_merged=True,
+        postprocess_stage="materialize",
+    )
+
+    result = manager.process_query(
+        {"query": "graph query", "date": "2001-12"},
+        [],
+        [event],
+        {"2001.00003"},
+    )
+
+    assert result["postprocess_stage"] == "materialize"
+    for method in ("per_subquery", "deep_event", "deep_merged"):
+        assert result[method]["materialization_complete"] is True
+        assert result[method]["legacy_rerank_applied"] is False
+        assert result[method]["shadow_selector_applied"] is False
+        assert result[method]["selector_call_count"] == 0
+
+    graph_record = _read_jsonl(
+        tmp_path / "per_subquery/pool_records.jsonl"
+    )[0]
+    graph_row = graph_record["local_pool_rows"][0]
+    assert graph_record["local_pool_size"] == 2
+    assert "selector_topk_arxiv_ids" not in graph_record
+    assert "selected_arxiv_ids" not in graph_record
+    assert {
+        "query_score_raw",
+        "query_score_normalized",
+        "subquery_score_raw",
+        "subquery_score_normalized",
+        "intent_score",
+        "path_count",
+        "path_count_normalized",
+        "source_seed_arxiv_ids",
+        "intent_labels",
+        "materialization_order_rank",
+    } <= set(graph_row)
+    assert not {"feature_weights", "rerank_score", "rerank_rank"} & set(graph_row)
+
+    deep_event_record = _read_jsonl(
+        tmp_path / "deep_event/pool_records.jsonl"
+    )[0]
+    deep_row = deep_event_record["deep_pool_rows"][0]
+    assert deep_event_record["deep_retrieval_order_arxiv_ids"] == [
+        row["paper_arxiv_id"] for row in deep_event_record["deep_pool_rows"]
+    ]
+    assert "deep_rerank_order_arxiv_ids" not in deep_event_record
+    assert "deep_selector_topk_arxiv_ids" not in deep_event_record
+    assert "deep_selected_arxiv_ids" not in deep_event_record
+    assert "feature_scorable" in deep_row
+    assert not {"feature_weights", "rerank_score", "rerank_rank"} & set(deep_row)
+
+    merged_record = _read_jsonl(
+        tmp_path / "deep_merged/pool_records.jsonl"
+    )[0]
+    assert "selector_slices" not in merged_record
+    assert "deep_rerank_order_arxiv_ids" not in merged_record
+    assert merged_record["source_event_budgets"][0]["planner_checklist"] == (
+        "retain methods"
+    )
+    assert merged_record["source_event_budgets"][0]["selector_top_k"] == 1
+    assert merged_record["source_graph_pool_occurrence_budget"] == 2
+
+    for method in ("per_subquery", "deep_event", "deep_merged"):
+        assert not (tmp_path / method / "selector_decisions.jsonl").exists()
+
+    aggregate = aggregate_postprocess_metrics(
+        [{"idx": 0, "postprocess_results": result}]
+    )
+    assert aggregate["postprocess_stage"] == "materialize"
+    assert aggregate["per_subquery"]["materialized_query_count"] == 1
+    assert aggregate["per_subquery"]["avg_pool_recall"] == 1.0
+    assert aggregate["per_subquery"]["avg_candidate_recall"] is None
+    assert aggregate["deep_event"]["micro_selection_recall"] is None
+
+
+def test_stage_a_pool_aggregates_exclude_zero_gt_queries_without_dropping_artifacts():
+    def materialized_result(ground_truth_count, pool_count, pool_gt_count, recall):
+        return {
+            "postprocess_stage": "materialize",
+            "materialization_complete": True,
+            "ground_truth_count": ground_truth_count,
+            "local_pool_count": pool_count,
+            "local_pool_gt_count": pool_gt_count,
+            "local_pool_recall": recall,
+            "local_pool_precision": (
+                pool_gt_count / pool_count if pool_count else 0.0
+            ),
+        }
+
+    metrics = aggregate_postprocess_metrics(
+        [
+            {
+                "idx": 0,
+                "postprocess_results": {
+                    "postprocess_stage": "materialize",
+                    "per_subquery": materialized_result(2, 4, 1, 0.5),
+                },
+            },
+            {
+                "idx": 1,
+                "postprocess_results": {
+                    "postprocess_stage": "materialize",
+                    "per_subquery": materialized_result(0, 7, 0, 0.0),
+                },
+            },
+        ]
+    )
+
+    per_subquery = metrics["per_subquery"]
+    assert per_subquery["materialized_query_count"] == 2
+    assert per_subquery["pool_evaluated_query_count"] == 1
+    assert per_subquery["queries_without_ground_truth_count"] == 1
+    assert per_subquery["total_materialized_pool_count"] == 11
+    assert per_subquery["total_pool_count"] == 4
+    assert per_subquery["avg_pool_recall"] == 0.5
+
+
+def test_stage_a_rolls_back_query_when_an_enabled_materializer_fails(tmp_path):
+    class FailingS2(FakeS2):
+        def expand(self, *_args, **_kwargs):
+            raise RuntimeError("temporary graph failure")
+
+    paper_db = {
+        "2001.00001": {
+            "title": "seed",
+            "abstract": "paper",
+            "date": "2001-01",
+        }
+    }
+    s2 = FailingS2()
+    manager = OnePassPostprocessor(
+        selector=NeverCallSelector(),
+        paper_db=paper_db,
+        writer=ArtifactWriter(str(tmp_path), "full"),
+        s2_client=s2,
+        per_subquery_processor=PerSubqueryProcessor(
+            paper_db, s2, scoring_backend="bm25", embedding_provider=None
+        ),
+        deep_retrieval_processor=None,
+        scoring_backend="bm25",
+        embedding_provider=None,
+        run_per_subquery=True,
+        postprocess_stage="materialize",
+    )
+    event = {
+        "query_id": "q-stage-a-retry",
+        "benchmark_idx": 4,
+        "query": "query",
+        "query_date": "2001-12",
+        "iteration_idx": 1,
+        "subquery_id": 1,
+        "subquery": "query",
+        "subquery_before_date": "2001-12",
+        "retrieval_event_id": "q-stage-a-retry:event-1",
+        "retrieval_page_idx": 1,
+        "retrieval_offset": 0,
+        "selector_top_k": 1,
+        "retrieval_exclusion_arxiv_ids": [],
+        "seed_papers": [
+            {"paper_arxiv_id": "2001.00001", "observed_retrieval_rank": 1}
+        ],
+        "baseline_selected_arxiv_ids": [],
+    }
+
+    with pytest.raises(RuntimeError, match="not committed and can be retried"):
+        manager.process_query(
+            {"query": "query", "date": "2001-12"}, [], [event], set()
+        )
+
+    assert not (tmp_path / "per_subquery/pool_records.jsonl").exists()
+    assert not (tmp_path / "per_subquery/errors.jsonl").exists()
+    assert not (tmp_path / "query_results.jsonl").exists()

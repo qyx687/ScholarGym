@@ -46,8 +46,9 @@ EVENT_METHOD = "event_offset_matched_text_deep_retrieval"
 MERGED_METHOD = "merged_subquery_sum_budget_text_deep_retrieval"
 METHODS = (EVENT_METHOD, MERGED_METHOD)
 SCHEMA_VERSION = "1.0-experimental"
-IMPLEMENTATION_VERSION = "1.2"
-TEXT_ONLY_WEIGHTS = {
+IMPLEMENTATION_VERSION = "1.3"
+RERANK_FORMULA_ID = "q030_sq040_intent015_path015_closed_pool_minmax_v1"
+RERANK_FEATURE_WEIGHTS = {
     "query_score_normalized": 0.30,
     "subquery_score_normalized": 0.40,
     "intent_score": 0.15,
@@ -718,10 +719,19 @@ def retrieve_bm25_requests(
     return outputs, request_diagnostics(len(sorted_indices))
 
 
-def text_only_formula_score(query_normalized: float, subquery_normalized: float) -> float:
+def text_only_formula_score(
+    query_normalized: float,
+    subquery_normalized: float,
+    intent_score: float = 0.0,
+    path_count_normalized: float = 0.0,
+) -> float:
+    """Apply the shared formula; deep-only graph features are explicitly zero."""
     return (
-        TEXT_ONLY_WEIGHTS["query_score_normalized"] * float(query_normalized)
-        + TEXT_ONLY_WEIGHTS["subquery_score_normalized"] * float(subquery_normalized)
+        RERANK_FEATURE_WEIGHTS["query_score_normalized"] * float(query_normalized)
+        + RERANK_FEATURE_WEIGHTS["subquery_score_normalized"] * float(subquery_normalized)
+        + RERANK_FEATURE_WEIGHTS["intent_score"] * float(intent_score)
+        + RERANK_FEATURE_WEIGHTS["path_count_normalized"]
+        * float(path_count_normalized)
     )
 
 
@@ -780,7 +790,8 @@ def rerank_text_pool(
             "intent_score": 0.0,
             "path_count": 0,
             "path_count_normalized": 0.0,
-            "feature_weights": dict(TEXT_ONLY_WEIGHTS),
+            "rerank_formula_id": RERANK_FORMULA_ID,
+            "feature_weights": dict(RERANK_FEATURE_WEIGHTS),
             "rerank_score": float(scores[paper_id]),
             "rerank_rank": rerank_rank[paper_id],
         }
@@ -816,7 +827,8 @@ def deep_paper_scoring_fields(
         "intent_score": 0.0,
         "path_count": 0,
         "path_count_normalized": 0.0,
-        "feature_weights": dict(TEXT_ONLY_WEIGHTS),
+        "rerank_formula_id": RERANK_FORMULA_ID,
+        "feature_weights": dict(RERANK_FEATURE_WEIGHTS),
         "rerank_score": None,
         "rerank_rank": None,
         "rerankable": False,
@@ -1759,7 +1771,8 @@ def main() -> None:
         },
         "save_level": args.save_level,
         "selector": selector_config,
-        "formula_weights": TEXT_ONLY_WEIGHTS,
+        "rerank_formula_id": RERANK_FORMULA_ID,
+        "formula_weights": RERANK_FEATURE_WEIGHTS,
         "event_pagination": "event exclusion snapshot -> saved event offset -> N_i",
         "merged_pagination": "first-event exclusion snapshot -> offset 0 -> sum_i N_i",
         "merged_selector_slicing": "one rerank, chronological disjoint slices by actual event selector_top_k",

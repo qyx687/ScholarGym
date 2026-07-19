@@ -45,9 +45,24 @@ def parse_json_from_tag(response: str, tag: str) -> Optional[Dict]:
     
     try:
         return json.loads(content)
-    except Exception as e:
-        logger.warning(f"Failed to parse JSON from response: {e}")
-        return None
+    except json.JSONDecodeError as original_error:
+        # Qwen occasionally emits otherwise valid JSON with literal newlines in
+        # overview strings or LaTeX-like backslashes (for example ``\alpha``).
+        # Keep the repair deliberately narrow: allow control characters inside
+        # strings, escape only JSON-invalid backslashes, and remove trailing
+        # commas immediately before a closing object/array delimiter.
+        repaired = re.sub(r"\\u(?![0-9a-fA-F]{4})", r"\\\\u", content)
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", repaired)
+        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
+        try:
+            value = json.loads(repaired, strict=False)
+        except json.JSONDecodeError:
+            logger.warning(f"Failed to parse JSON from response: {original_error}")
+            return None
+        logger.warning(
+            "Recovered malformed JSON response using conservative escape/control-character repair"
+        )
+        return value
 
 def parse_response_to_keys(response: str) -> List[str]:
     """

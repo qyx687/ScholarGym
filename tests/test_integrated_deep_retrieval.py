@@ -73,6 +73,18 @@ class FixedScores:
         return self.scores
 
 
+class TinyEmbeddings:
+    @staticmethod
+    def _vector(text):
+        return [1.0, 0.0] if "alpha" in text else [0.0, 1.0]
+
+    def embed_documents(self, texts):
+        return [self._vector(text) for text in texts]
+
+    def embed_query(self, text):
+        return self._vector(text)
+
+
 def test_bm25_deep_retrieval_matches_baseline_exclusion_before_offset_order():
     ids = [f"2001.0000{index}" for index in range(1, 7)]
     rag = SimpleNamespace(
@@ -110,7 +122,7 @@ def test_bm25_deep_retrieval_matches_baseline_exclusion_before_offset_order():
     assert [row["paper_arxiv_id"] for row in pools["continue"]] == ids[3:5]
 
 
-def test_integrated_text_only_rerank_keeps_graph_weights_and_zero_graph_features():
+def test_integrated_deep_rerank_uses_four_factor_formula_with_zero_graph_features():
     paper_db = {
         "2001.00001": {"title": "query method", "abstract": "query", "date": "2001-01"},
         "2001.00002": {"title": "subquery method", "abstract": "subquery", "date": "2001-02"},
@@ -147,8 +159,57 @@ def test_integrated_text_only_rerank_keeps_graph_weights_and_zero_graph_features
         assert row["rerank_score"] == (
             0.30 * row["query_score_normalized"]
             + 0.40 * row["subquery_score_normalized"]
+            + 0.15 * row["intent_score"]
+            + 0.15 * row["path_count_normalized"]
         )
-        assert 0.0 <= row["rerank_score"] <= 0.7
+        assert 0.0 <= row["rerank_score"] <= 0.70
+
+
+def test_embedding_deep_materialization_preserves_retriever_order_without_formula():
+    paper_db = {
+        "2001.00001": {
+            "title": "beta first",
+            "abstract": "paper",
+            "date": "2001-01",
+        },
+        "2001.00002": {
+            "title": "alpha second",
+            "abstract": "paper",
+            "date": "2001-02",
+        },
+    }
+    processor = DeepRetrievalProcessor(
+        SimpleNamespace(),
+        paper_db,
+        scoring_backend="embedding",
+        embedding_provider=TinyEmbeddings(),
+    )
+    result = processor.materialize_pool_features(
+        [
+            {
+                "paper_arxiv_id": paper_id,
+                "deep_retrieval_score_raw": 1.0 / rank,
+                "deep_retrieval_rank_global_date_valid": rank,
+                "deep_retrieval_rank_after_exclusion": rank,
+                "deep_retrieval_rank_in_local_pool": rank,
+                "_metadata": metadata,
+            }
+            for rank, (paper_id, metadata) in enumerate(paper_db.items(), start=1)
+        ],
+        query="alpha query",
+        subquery="beta query",
+        cutoff="2001-12",
+    )
+
+    assert result["retrieval_order_arxiv_ids"] == ["2001.00001", "2001.00002"]
+    assert [row["paper_arxiv_id"] for row in result["rows"]] == result[
+        "retrieval_order_arxiv_ids"
+    ]
+    assert result["scorable_arxiv_ids"] == result["retrieval_order_arxiv_ids"]
+    assert result["legacy_rerank_applied"] is False
+    assert all(row["feature_scorable"] is True for row in result["rows"])
+    assert all("rerank_score" not in row for row in result["rows"])
+    assert "rerank_order_arxiv_ids" not in result
 
 
 def test_vector_deep_retrieval_honors_date_exclusion_then_offset_and_records_ranks():

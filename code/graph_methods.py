@@ -30,6 +30,10 @@ from structures import Paper, SubQuery
 
 
 EPSILON = 1e-12
+RERANK_FORMULA_ID = "q030_sq040_intent015_path015_closed_pool_minmax_v1"
+PAPER_EMBEDDING_SERIALIZATION_ID = (
+    "scholargym_baseline_title_newline_space_abstract_v1"
+)
 DEFAULT_FEATURE_WEIGHTS = {
     "query_score_normalized": 0.30,
     "subquery_score_normalized": 0.40,
@@ -37,6 +41,9 @@ DEFAULT_FEATURE_WEIGHTS = {
     "path_count_normalized": 0.15,
 }
 INTENT_WEIGHTS = {"methodology": 1.0, "result": 0.75, "background": 0.35}
+QUERY_SCOPED_EMBEDDING_CACHE_POLICY = (
+    "query_scoped_exact_text_singleflight_float32_v1"
+)
 
 
 class BoundedEmbeddingProvider:
@@ -63,6 +70,260 @@ class BoundedEmbeddingProvider:
     def embed_query(self, text: str) -> List[float]:
         with self._semaphore:
             return self.provider.embed_query(text)
+
+
+class _PendingEmbedding:
+    """One in-flight exact-text embedding shared by concurrent callers."""
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.vector: Optional[np.ndarray] = None
+        self.error: Optional[BaseException] = None
+
+
+class QueryScopedEmbeddingCache:
+    """Share exact-text postprocess embeddings within one benchmark query.
+
+    Graph, deep-event, and deep-merged pools repeatedly serialize the same
+    papers and score the same query/subquery strings.  This wrapper stores raw
+    float32 vectors for the lifetime of one benchmark query and coalesces
+    concurrent misses, while leaving pool-local normalization and ranking in
+    ``CandidateIndex`` unchanged.  Document and query caches are deliberately
+    separate because embedding backends may apply different instructions to
+    their two APIs.
+
+    Calls made outside ``begin_query_scope``/``end_query_scope`` pass through
+    unchanged.  The baseline retriever receives the unwrapped provider, so the
+    cache affects only the three postprocess arms.
+    """
+
+    policy = QUERY_SCOPED_EMBEDDING_CACHE_POLICY
+
+    def __init__(self, provider: Any) -> None:
+        if provider is None:
+            raise ValueError("provider is required")
+        self.provider = provider
+        self._lock = threading.Lock()
+        self._active = False
+        self._scope_id: Optional[str] = None
+        self._document_cache: Dict[str, np.ndarray] = {}
+        self._query_cache: Dict[str, np.ndarray] = {}
+        self._document_pending: Dict[str, _PendingEmbedding] = {}
+        self._query_pending: Dict[str, _PendingEmbedding] = {}
+        self._stats: Dict[str, int] = self._empty_stats()
+
+    @staticmethod
+    def _empty_stats() -> Dict[str, int]:
+        return {
+            "document_request_count": 0,
+            "document_duplicate_input_count": 0,
+            "document_cache_hit_unique_text_count": 0,
+            "document_inflight_wait_unique_text_count": 0,
+            "document_backend_batch_count": 0,
+            "document_backend_text_count": 0,
+            "query_request_count": 0,
+            "query_cache_hit_count": 0,
+            "query_inflight_wait_count": 0,
+            "query_backend_call_count": 0,
+        }
+
+    @staticmethod
+    def _raw_vector(value: Any) -> np.ndarray:
+        # CandidateIndex converts every backend result to float32 immediately;
+        # storing that representation avoids retaining Python-float lists that
+        # are several times larger without changing the downstream arithmetic.
+        vector = np.asarray(value, dtype=np.float32)
+        if vector.ndim != 1:
+            raise RuntimeError("embedding provider returned an unexpected vector shape")
+        return vector.copy()
+
+    def begin_query_scope(self, scope_id: Any) -> None:
+        with self._lock:
+            if self._active:
+                raise RuntimeError("an embedding-cache query scope is already active")
+            if self._document_pending or self._query_pending:
+                raise RuntimeError("cannot start an embedding-cache scope with pending calls")
+            self._active = True
+            self._scope_id = str(scope_id) if scope_id is not None else "unknown"
+            self._document_cache.clear()
+            self._query_cache.clear()
+            self._stats = self._empty_stats()
+
+    def snapshot_query_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            stats: Dict[str, Any] = dict(self._stats)
+            stats.update(
+                {
+                    "enabled": self._active,
+                    "policy": self.policy,
+                    "scope_id": self._scope_id,
+                    "document_cache_entry_count": len(self._document_cache),
+                    "query_cache_entry_count": len(self._query_cache),
+                    "cached_vector_bytes": sum(
+                        int(vector.nbytes)
+                        for vector in list(self._document_cache.values())
+                        + list(self._query_cache.values())
+                    ),
+                }
+            )
+        total_requests = int(stats["document_request_count"]) + int(
+            stats["query_request_count"]
+        )
+        backend_texts = int(stats["document_backend_text_count"]) + int(
+            stats["query_backend_call_count"]
+        )
+        saved = max(0, total_requests - backend_texts)
+        stats["total_request_count"] = total_requests
+        stats["backend_embedding_count"] = backend_texts
+        stats["saved_embedding_count"] = saved
+        stats["reuse_ratio"] = (saved / total_requests) if total_requests else 0.0
+        return stats
+
+    def end_query_scope(self) -> Dict[str, Any]:
+        stats = self.snapshot_query_stats()
+        with self._lock:
+            if self._document_pending or self._query_pending:
+                raise RuntimeError("cannot end an embedding-cache scope with pending calls")
+            self._active = False
+            self._scope_id = None
+            self._document_cache.clear()
+            self._query_cache.clear()
+        return stats
+
+    @staticmethod
+    def _publish_error(
+        pending_map: Dict[str, _PendingEmbedding],
+        owned: Mapping[str, _PendingEmbedding],
+        error: BaseException,
+        lock: threading.Lock,
+    ) -> None:
+        with lock:
+            for text, pending in owned.items():
+                pending.error = error
+                if pending_map.get(text) is pending:
+                    pending_map.pop(text, None)
+                pending.event.set()
+
+    def embed_documents(self, texts: Sequence[str]) -> List[Any]:
+        items = list(texts)
+        if not items:
+            return []
+        with self._lock:
+            if not self._active:
+                passthrough = True
+                owned: Dict[str, _PendingEmbedding] = {}
+                pending_for_text: Dict[str, _PendingEmbedding] = {}
+                resolved: Dict[str, np.ndarray] = {}
+            else:
+                passthrough = False
+                unique_texts = list(dict.fromkeys(items))
+                self._stats["document_request_count"] += len(items)
+                self._stats["document_duplicate_input_count"] += (
+                    len(items) - len(unique_texts)
+                )
+                owned = {}
+                pending_for_text = {}
+                resolved = {}
+                for text in unique_texts:
+                    cached = self._document_cache.get(text)
+                    if cached is not None:
+                        resolved[text] = cached
+                        self._stats["document_cache_hit_unique_text_count"] += 1
+                        continue
+                    pending = self._document_pending.get(text)
+                    if pending is not None:
+                        pending_for_text[text] = pending
+                        self._stats["document_inflight_wait_unique_text_count"] += 1
+                        continue
+                    pending = _PendingEmbedding()
+                    self._document_pending[text] = pending
+                    pending_for_text[text] = pending
+                    owned[text] = pending
+                if owned:
+                    self._stats["document_backend_batch_count"] += 1
+                    self._stats["document_backend_text_count"] += len(owned)
+
+        if passthrough:
+            return self.provider.embed_documents(items)
+
+        if owned:
+            try:
+                raw_vectors = self.provider.embed_documents(list(owned))
+                if len(raw_vectors) != len(owned):
+                    raise RuntimeError(
+                        "embedding provider returned an unexpected document count"
+                    )
+                vectors = [self._raw_vector(vector) for vector in raw_vectors]
+            except BaseException as exc:
+                self._publish_error(
+                    self._document_pending, owned, exc, self._lock
+                )
+                raise
+            with self._lock:
+                for (text, pending), vector in zip(owned.items(), vectors):
+                    self._document_cache[text] = vector
+                    pending.vector = vector
+                    if self._document_pending.get(text) is pending:
+                        self._document_pending.pop(text, None)
+                    pending.event.set()
+
+        for text, pending in pending_for_text.items():
+            pending.event.wait()
+            if pending.error is not None:
+                raise pending.error
+            if pending.vector is None:
+                raise RuntimeError("embedding single-flight completed without a vector")
+            resolved[text] = pending.vector
+        return [resolved[text] for text in items]
+
+    def embed_query(self, text: str) -> Any:
+        with self._lock:
+            if not self._active:
+                passthrough = True
+                pending = None
+                owned = False
+            else:
+                passthrough = False
+                self._stats["query_request_count"] += 1
+                cached = self._query_cache.get(text)
+                if cached is not None:
+                    self._stats["query_cache_hit_count"] += 1
+                    return cached
+                pending = self._query_pending.get(text)
+                if pending is not None:
+                    owned = False
+                    self._stats["query_inflight_wait_count"] += 1
+                else:
+                    pending = _PendingEmbedding()
+                    self._query_pending[text] = pending
+                    owned = True
+                    self._stats["query_backend_call_count"] += 1
+
+        if passthrough:
+            return self.provider.embed_query(text)
+
+        assert pending is not None
+        if owned:
+            try:
+                vector = self._raw_vector(self.provider.embed_query(text))
+            except BaseException as exc:
+                self._publish_error(
+                    self._query_pending, {text: pending}, exc, self._lock
+                )
+                raise
+            with self._lock:
+                self._query_cache[text] = vector
+                pending.vector = vector
+                if self._query_pending.get(text) is pending:
+                    self._query_pending.pop(text, None)
+                pending.event.set()
+
+        pending.event.wait()
+        if pending.error is not None:
+            raise pending.error
+        if pending.vector is None:
+            raise RuntimeError("embedding single-flight completed without a vector")
+        return pending.vector
 
 
 def normalize_arxiv_id(value: Any) -> str:
@@ -93,6 +354,16 @@ def month_key(value: Any) -> str:
 def tokenize(text: str) -> List[str]:
     # Match ScholarGym's baseline BM25 preprocessing exactly.
     return re.findall(r"\b[a-z]+\b", str(text or "").lower())
+
+
+def baseline_paper_embedding_text(title: Any, abstract: Any) -> str:
+    """Return the exact paper text used by ScholarGym build_vector_db.py."""
+
+    title_text = str(title or "")
+    abstract_text = str(abstract or "")
+    if not title_text and not abstract_text:
+        return ""
+    return f"title: {title_text}\n abstract: {abstract_text}"
 
 
 def minmax(values: Mapping[str, float], ids: Sequence[str]) -> Dict[str, float]:
@@ -331,7 +602,7 @@ class CandidateIndex:
                 # Match the paper serialization in ScholarGym's baseline Qdrant
                 # builder so retrieval and closed-pool reranking encode papers
                 # through the same model input format.
-                text = f"title: {title}\n abstract: {abstract}" if title or abstract else ""
+                text = baseline_paper_embedding_text(title, abstract)
             else:
                 # Preserve the established graph-method BM25 local corpus.
                 text = f"{title} {abstract}".strip()
@@ -383,8 +654,12 @@ class _RateLimiter:
 
 class S2GraphClient:
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
-    PAPER_FIELDS = "paperId,externalIds,citationCount,referenceCount"
-    EDGE_PAPER_FIELDS = "paperId,externalIds,citationCount,referenceCount"
+    PAPER_FIELDS = (
+        "paperId,externalIds,citationCount,referenceCount,publicationTypes"
+    )
+    EDGE_PAPER_FIELDS = (
+        "paperId,externalIds,citationCount,referenceCount,publicationTypes"
+    )
 
     def __init__(
         self,
@@ -548,6 +823,11 @@ class S2GraphClient:
                             "seed_reference_count": seed.get("referenceCount"),
                             "expanded_citation_count": candidate.get("citationCount"),
                             "expanded_reference_count": candidate.get("referenceCount"),
+                            "seed_publication_types": seed.get("publicationTypes") or [],
+                            "expanded_publication_types": candidate.get(
+                                "publicationTypes"
+                            )
+                            or [],
                             "s2_cache_hit": bool(seed_hit and relation_hit),
                             "s2_api_status": "cache" if seed_hit and relation_hit else "api",
                             "s2_retry_count": seed_retries + relation_retries,
@@ -635,15 +915,28 @@ class PerSubqueryProcessor:
         self.embedding_provider = embedding_provider
         self.method = expansion_method
         self.limit = expansion_limit
-        self.weights = dict(DEFAULT_FEATURE_WEIGHTS)
-        self.weights.update(weights or {})
+        requested_weights = dict(DEFAULT_FEATURE_WEIGHTS)
+        requested_weights.update(weights or {})
+        if requested_weights != DEFAULT_FEATURE_WEIGHTS:
+            raise ValueError(
+                f"{RERANK_FORMULA_ID} is fixed; custom rerank weights are unsupported"
+            )
+        self.weights = requested_weights
 
-    def process(
+    def materialize(
         self,
         event: Mapping[str, Any],
         gt_ids: Optional[Set[str]] = None,
         exclude_arxiv_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
+        """Materialize one graph pool and its component features only.
+
+        The returned rows are in canonical arXiv-ID order.  This method does
+        not apply the runtime weighted formula, choose a Top-K, or construct
+        Selector inputs.  Keeping this boundary explicit lets later offline
+        formulas reuse the expensive graph/embedding work without inheriting
+        an old ranking through row order.
+        """
         seed_records = [row for row in event.get("seed_papers") or [] if normalize_arxiv_id(row.get("paper_arxiv_id"))]
         seed_ids = list(dict.fromkeys(normalize_arxiv_id(row["paper_arxiv_id"]) for row in seed_records))
         seed_set = set(seed_ids)
@@ -685,29 +978,24 @@ class PerSubqueryProcessor:
         query_raw, query_norm, query_rank = index.score(str(event.get("query") or ""))
         sub_raw, sub_norm, sub_rank = index.score(str(event.get("subquery") or ""))
         edge_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        s2_publication_type_map: Dict[str, Set[str]] = defaultdict(set)
         for edge in kept_edges:
             edge_map[edge["expanded_arxiv_id"]].append(edge)
+            s2_publication_type_map[edge["seed_arxiv_id"]].update(
+                str(value)
+                for value in edge.get("seed_publication_types") or []
+                if str(value)
+            )
+            s2_publication_type_map[edge["expanded_arxiv_id"]].update(
+                str(value)
+                for value in edge.get("expanded_publication_types") or []
+                if str(value)
+            )
         intent_scores, intent_labels = _intent_features(candidate_ids, seed_set, edge_map)
         path_count, path_norm = _path_features(candidate_ids, seed_set, kept_edges)
-        final_scores = {
-            paper_id: (
-                self.weights["query_score_normalized"] * query_norm.get(paper_id, 0.0)
-                + self.weights["subquery_score_normalized"] * sub_norm.get(paper_id, 0.0)
-                + self.weights["intent_score"] * intent_scores.get(paper_id, 0.0)
-                + self.weights["path_count_normalized"] * path_norm.get(paper_id, 0.0)
-            )
-            for paper_id in candidate_ids
-        }
-
-        def final_key(paper_id: str) -> Tuple[float, int, int, str]:
-            observed_rank = observed.get(paper_id, {}).get("observed_retrieval_rank")
-            return (-final_scores[paper_id], -int(paper_id in seed_set), int(observed_rank or 10**12), paper_id)
-
-        ordered = sorted(candidate_ids, key=final_key)
-        final_rank = {paper_id: rank for rank, paper_id in enumerate(ordered, start=1)}
         rows: List[Dict[str, Any]] = []
         gt = set(gt_ids or set())
-        for paper_id in ordered:
+        for materialization_rank, paper_id in enumerate(candidate_ids, start=1):
             provenance = edge_map.get(paper_id, [])
             source_seeds = sorted({edge["seed_arxiv_id"] for edge in provenance})
             is_seed, is_expanded = paper_id in seed_set, bool(provenance)
@@ -754,13 +1042,17 @@ class PerSubqueryProcessor:
                     "subquery_score_raw": sub_raw.get(paper_id, 0.0),
                     "subquery_score_normalized": sub_norm.get(paper_id, 0.0),
                     "subquery_component_rank": sub_rank.get(paper_id),
+                    "component_rank_scope": "closed_seed_expanded_pool",
+                    "normalization_scope": "closed_seed_expanded_pool_minmax",
                     "intent_labels": intent_labels.get(paper_id, []),
                     "intent_score": intent_scores.get(paper_id, 0.0),
                     "path_count": path_count.get(paper_id, 0),
                     "path_count_normalized": path_norm.get(paper_id, 0.0),
-                    "feature_weights": dict(self.weights),
-                    "rerank_score": final_scores.get(paper_id, 0.0),
-                    "rerank_rank": final_rank.get(paper_id),
+                    "s2_publication_types": sorted(
+                        s2_publication_type_map.get(paper_id, set())
+                    ),
+                    "materialization_order_rank": materialization_rank,
+                    "materialization_order_scope": "canonical_arxiv_id",
                     "is_ground_truth": paper_id in gt,
                 }
             )
@@ -778,6 +1070,75 @@ class PerSubqueryProcessor:
                     "passed_date_cutoff": True,
                 }
             )
+        return {
+            "rows": rows,
+            "edges": edge_rows,
+            "filter_stats": filter_stats,
+            "features_materialized": True,
+            "legacy_rerank_applied": False,
+        }
+
+    def process(
+        self,
+        event: Mapping[str, Any],
+        gt_ids: Optional[Set[str]] = None,
+        exclude_arxiv_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """Apply the fixed four-factor rerank to a materialized graph pool."""
+        materialized = self.materialize(
+            event,
+            gt_ids,
+            exclude_arxiv_ids=exclude_arxiv_ids,
+        )
+        rows = [dict(row) for row in materialized["rows"]]
+        row_by_id = {row["paper_arxiv_id"]: row for row in rows}
+        final_scores = {
+            paper_id: (
+                self.weights["query_score_normalized"]
+                * float(row.get("query_score_normalized") or 0.0)
+                + self.weights["subquery_score_normalized"]
+                * float(row.get("subquery_score_normalized") or 0.0)
+                + self.weights["intent_score"]
+                * float(row.get("intent_score") or 0.0)
+                + self.weights["path_count_normalized"]
+                * float(row.get("path_count_normalized") or 0.0)
+            )
+            for paper_id, row in row_by_id.items()
+        }
+
+        def final_key(paper_id: str) -> Tuple[float, int, int, str]:
+            row = row_by_id[paper_id]
+            observed_rank = row.get("observed_retrieval_rank")
+            return (
+                -final_scores[paper_id],
+                -int(bool(row.get("is_seed"))),
+                int(observed_rank or 10**12),
+                paper_id,
+            )
+
+        ordered = sorted(row_by_id, key=final_key)
+        final_rank = {paper_id: rank for rank, paper_id in enumerate(ordered, start=1)}
+        rows = [row_by_id[paper_id] for paper_id in ordered]
+        for row in rows:
+            paper_id = row["paper_arxiv_id"]
+            row.pop("materialization_order_rank", None)
+            row.pop("materialization_order_scope", None)
+            row.update(
+                {
+                    "rerank_formula_id": RERANK_FORMULA_ID,
+                    "feature_weights": dict(self.weights),
+                    "rerank_score": final_scores[paper_id],
+                    "rerank_rank": final_rank[paper_id],
+                }
+            )
+
+        seed_ids = list(
+            dict.fromkeys(
+                normalize_arxiv_id(row.get("paper_arxiv_id"))
+                for row in event.get("seed_papers") or []
+                if normalize_arxiv_id(row.get("paper_arxiv_id"))
+            )
+        )
         requested_top_k = event.get("selector_top_k")
         top_k = int(requested_top_k if requested_top_k is not None else len(seed_ids))
         top_rows = rows[:top_k]
@@ -803,7 +1164,17 @@ class PerSubqueryProcessor:
             }
             for row in rows
         }
-        return {"rows": rows, "edges": edge_rows, "top_rows": top_rows, "papers": papers, "rank_dict": rank_dict, "filter_stats": filter_stats}
+        return {
+            "rows": rows,
+            "edges": materialized["edges"],
+            "top_rows": top_rows,
+            "papers": papers,
+            "rank_dict": rank_dict,
+            "filter_stats": materialized["filter_stats"],
+            "features_materialized": True,
+            "legacy_rerank_applied": True,
+            "rerank_formula_id": RERANK_FORMULA_ID,
+        }
 
 
 def selector_decision_record(event: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], selected_ids: Iterable[str], overview: str, reasons: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:

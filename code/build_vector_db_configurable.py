@@ -12,7 +12,7 @@ from langchain_qdrant import QdrantVectorStore
 from langchain_ollama import OllamaEmbeddings
 
 import config
-from graph_methods import normalize_arxiv_id
+from graph_methods import baseline_paper_embedding_text, normalize_arxiv_id
 
 
 def main() -> None:
@@ -51,8 +51,7 @@ def main() -> None:
         arxiv_id = normalize_arxiv_id(paper.get("arxiv_id") or key)
         title = paper.get("title") or ""
         abstract = paper.get("abstract") or ""
-        # Match ScholarGym's baseline build_vector_db.py serialization exactly.
-        text = f"title: {title}\n abstract: {abstract}" if title or abstract else ""
+        text = baseline_paper_embedding_text(title, abstract)
         if not arxiv_id or not text:
             continue
         texts.append(text)

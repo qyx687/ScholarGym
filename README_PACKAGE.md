@@ -1,141 +1,235 @@
-# ScholarGym One-Pass Baseline + Shadow Postprocessors
+# ScholarGym OnePass 中文运行说明
 
-This directory is an independent ScholarGym checkout pinned to upstream baseline
-commit `f426fd15e3ff28ee11ddeafc253dffd73ef88500`.
+## 1. 方法概览
 
-For every benchmark query, one command runs:
+本目录是可独立运行的 ScholarGym baseline 副本，固定上游提交：
 
-```text
-complete baseline query trajectory
-  -> optional per-retrieval-page per-subquery graph rerank + Selector replay
-  -> optional event/offset-matched text deep retrieval + rerank + Selector replay
-  -> optional stable-subquery merged-budget text deep retrieval + rerank + Selector replay
-  -> next benchmark query
-```
+~~~text
+f426fd15e3ff28ee11ddeafc253dffd73ef88500
+~~~
 
-The three shadows never write into baseline memory. The benchmark is run once,
-not once per method. Deep-retrieval budgets are taken from the already computed
-per-subquery graph pools, so the deep controls do not call Semantic Scholar.
+每个 benchmark query 只执行一次完整 baseline 轨迹：
 
-## Method definitions
+~~~text
+baseline Planner / Retriever / Selector
+  -> 可选 per-subquery 图扩展与 shadow Selector
+  -> 可选 event/offset 对齐的 deep 检索与 shadow Selector（deep event，可不考虑）
+  -> 可选稳定 subquery 合并预算的 deep 检索与 shadow Selector（deep merge，我们目前选中其作为deep深检索）
+  -> 下一个 benchmark query
+~~~
 
-Per-subquery shadow replay uses only the newly retrieved page as seeds:
+三个 shadow 分支不会写回 baseline memory，因此不会改变 baseline 的后续
+Planner 轨迹。deep 分支的候选预算来自已经生成的 graph local pool，不会再次
+调用 Semantic Scholar 来决定预算。
 
-```text
-0.30 * query_score_normalized
-+ 0.40 * subquery_score_normalized
-+ 0.15 * intent_score
-+ 0.15 * path_count_normalized
-```
+### 1.1 主表指标聚合口径
 
-Both deep controls use the same weights, with graph-only terms fixed to zero:
+对包含 N 个 benchmark query 的主表，先分别计算逐 query recall 和 precision
+的 macro average：
 
-```text
-0.30 * query_score_normalized
-+ 0.40 * subquery_score_normalized
-+ 0.15 * 0
-+ 0.15 * 0
-```
+~~~text
+macro R = (R_1 + ... + R_N) / N
+macro P = (P_1 + ... + P_N) / N
+~~~
 
-All Q/SQ components use closed-pool min-max normalization. Retrieval and local
-reranking use the same mode as baseline: BM25 with BM25, or Qdrant plus the fixed
-Ollama `qwen3-embedding:0.6b` model for dense runs.
+主表展示的 F1 再由 macro R、macro P 计算调和平均：
 
-`deep_event_offset_matched` operates once per baseline retrieval event. Its
-budget `N_i` is the corresponding graph local-pool size; it applies that event's
-frozen exclusion first, then the saved offset, retrieves `N_i`, reranks the pool,
-and passes the event's actual `selector_top_k`.
+~~~text
+F1 = 2 * macro R * macro P / (macro R + macro P)
+~~~
 
-`deep_merged_subquery_sum_budget` groups all continue events with the same stable
-`subquery_id`. Its budget is `N = sum_i N_i`; it freezes the first event's
-exclusion, starts from offset 0, retrieves/reranks once, then gives Selector
-chronological, disjoint slices `[0:k1)`, `[k1:k1+k2)`, etc. Each slice uses its
-own event checklist and iteration; selections are not fed to later slices.
+分母为 0 时 F1 记为 0。Sel F1 使用 macro Sel R/P，若展示 Ret F1，则使用
+macro Ret R/P。这里明确不使用 `(F1_1 + ... + F1_N) / N`；后者是另一种
+macro-F1 定义，不能与本项目主表的 F1 混用。调和平均必须使用未四舍五入的
+macro R/P 计算，最后一步才格式化为百分比。
 
-When both controls are enabled, the full retriever ranking for one stable
-subquery is computed/fetched once and the two controls materialize their own
-exclusion/offset slices from it. Their rerank normalization scopes remain
-independent: one closed pool per event for scheme 1 and one merged closed pool
-per stable subquery for scheme 2.
+OnePass 外层 summary 当前为兼容既有产物，仍保留：
 
-Within each completed baseline query, independent graph events and deep reranks
-use a bounded worker pool. Shadow Selector calls use bounded async concurrency,
-while output rows are committed in the original retrieval-event order. The
-default limits are 4 event workers, 4 Selector calls, and 1 postprocess Ollama
-embedding call. S2 requests still share the global `--graph_rate_limit_rps`;
-identical concurrent cache keys use single-flight so a shared seed is fetched
-only once. These settings change scheduling, not candidate pools, formulas,
-Selector inputs, or baseline feedback.
+~~~text
+avg_selection_f1 = mean(query-level selection F1)
+avg_candidate_f1 = mean(query-level candidate F1)
+~~~
 
-For the graph shadow, only expanded papers present in the local paper DB, with a non-missing paper
-month no later than the query/subquery cutoff month, enter scoring and artifacts.
-Baseline seeds are trusted because retrieval already applied the cutoff. Deep
-retrieval likewise keeps only canonical arXiv papers with a non-missing date no
-later than the corresponding subquery cutoff.
+这两个字段不能直接填入主表。主表 Sel F1 应从 `avg_selection_recall`、
+`avg_selection_precision` 重算；若展示 Ret F1，则从相应 candidate/retrieval
+macro R/P 字段重算。
 
-## Install
+## 2. 两种运行阶段
 
-```bash
+### 2.1 Stage A：只物化候选池和特征
+
+使用：
+
+~~~bash
+--postprocess_stage materialize
+~~~
+
+Stage A 仍完整运行一次 baseline，因为 retrieval event、continue offset、
+冻结 exclusion、checklist 和 Selector budget 都由 baseline 轨迹决定。
+三个后处理分支只生成：
+
+~~~text
+per_subquery: 图扩展/过滤 + 闭池 Q/SQ + intent/path 特征
+deep_event:   event-offset 对齐的 deep pool + 检索排名 + 闭池 Q/SQ 特征
+deep_merged:  sum-budget deep pool + 检索排名 + 闭池 Q/SQ 特征
+~~~
+
+Stage A 不计算最终 rerank score，不产生 rerank Top-K，也不调用 shadow
+Selector。产物中会明确记录：
+
+~~~text
+legacy_rerank_applied=false
+shadow_selector_applied=false
+~~~
+
+为了后续 Stage B 能读取完整的候选行和图边，建议使用：
+
+~~~bash
+--postprocess_stage materialize
+--save_level full
+~~~
+
+Stage A 采用 query 级原子提交。某个 query 的图扩展、embedding 或 deep
+检索失败时，该 query 的临时行不会进入正式 JSONL，也不会被 checkpoint；
+用完全相同的命令重跑即可重试。
+
+现有 scripts/replay_graph_rerank_formulas.py 面向历史 full-run schema，
+不是 Stage A 的正式动态权重 Stage B 实现。
+
+### 2.2 Full：固定公式加 shadow Selector
+
+full 模式的 graph、deep_event 和 deep_merged 统一记录公式 ID：
+
+~~~text
+q030_sq040_intent015_path015_closed_pool_minmax_v1
+~~~
+
+公式为：
+
+~~~text
+score = 0.30 * query_score_normalized
+      + 0.40 * subquery_score_normalized
+      + 0.15 * intent_score
+      + 0.15 * path_count_normalized
+~~~
+
+graph 分支使用全部四项。deep 分支没有图边，因此 intent_score 和
+path_count_normalized 明确保存为 0；其有效排序分数为 0.30Q + 0.40SQ，
+但 manifest 和候选行仍使用同一个四项公式 ID 与完整权重表。
+
+## 3. 特征定义
+
+- query_score_normalized：论文与原始 query 的本地匹配分数，在当前闭合候选池内 min-max。
+- subquery_score_normalized：论文与当前 subquery 的匹配分数，在当前闭合候选池内 min-max。
+- intent_score：只给非 seed 图扩展论文赋值；methodology=1.0、result=0.75、background=0.35，多条边取最大值。
+- path_count_normalized：候选在当前 seed-expanded 图中的唯一邻居数，再在当前闭池 min-max。
+
+如果一个特征在当前池内全部相同，min-max 结果统一为 0。
+
+最终排序的稳定 tie-break 为：
+
+~~~text
+rerank score 降序
+-> seed 优先
+-> baseline 观测排名升序
+-> arXiv ID 升序
+~~~
+
+## 4. Dense 与 baseline 的严格一致性
+
+baseline Qdrant 建库时，论文 embedding 输入字符串严格为：
+
+~~~text
+title: <title>
+ abstract: <abstract>
+~~~
+
+也就是 title 后有换行，abstract: 前保留一个空格。OnePass 的可配置建库脚本
+和闭池 reranker 都使用这个精确格式。query 和 subquery 直接按原始字符串编码，
+不添加字段前缀。
+
+run manifest 中记录的序列化策略 ID 为：
+
+~~~text
+scholargym_baseline_title_newline_space_abstract_v1
+~~~
+
+默认 dense 模型固定为：
+
+~~~text
+qwen3-embedding:0.6b
+~~~
+
+检索与 rerank 必须使用同一个 embedding 模型和同一种论文序列化。严格复现时，
+优先恢复原始 Qdrant collection，而不是重新建库。
+
+## 5. 三个后处理分支
+
+### per_subquery
+
+针对每个新检索页，使用页内 seed 做 citation/reference 扩展。扩展论文必须：
+
+- 能映射到本地 paper DB；
+- 具有有效月份；
+- 不晚于 query/subquery cutoff；
+- 不在该事件冻结的已选 exclusion 中。
+
+### deep_event
+
+每个 baseline retrieval event 单独运行。预算 N_i 等于对应 graph local pool
+大小；先应用事件冻结 exclusion，再应用保存的 offset，取 N_i 条，闭池重排后
+按照该事件真实 selector_top_k 交给 shadow Selector。
+
+### deep_merged
+
+将相同稳定 subquery_id 的 continue 事件合并，预算为 N=sum_i N_i。从 offset 0
+检索并重排一次，再按时间顺序切成互不重叠的 [0:k1)、[k1:k1+k2) 等 Selector
+输入。每一片使用自己的 checklist 和 iteration，前一片的选择不会写入后一片。
+
+## 6. 安装
+
+~~~bash
 conda create -n scholargym-graph python=3.10 -y
 conda activate scholargym-graph
 pip install -r requirements.txt
-```
+~~~
 
-On macOS, the requirements select `faiss-cpu` instead of `faiss-gpu`.
+配置 LLM 和 Semantic Scholar 密钥：
 
-Set the LLM and S2 credentials required by your config, for example:
-
-```bash
+~~~bash
 export DASHSCOPE_API_KEY="..."
 export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export S2_API_KEY="..."
-```
+~~~
 
-`DASHSCOPE_*` is used only by the Qwen 30B Planner/Selector LLM. Embedding does
-not call a remote/cloud embedding API; it is served only by local Ollama.
+DASHSCOPE 只用于 Planner/Selector LLM。默认 dense embedding 由本地 Ollama
+提供。
 
-Large baseline assets are intentionally not committed in this package. Before
-running, provide `scholargym_paper_db.json`, the BM25 pickle for sparse runs, or
-the original `paper_knowledge_base` Qdrant storage for dense runs. They may be
-copied/symlinked into `data/`, or supplied with absolute `--paper_db` and
-`--bm25_path` paths. The baseline Qdrant archive is
-`qdrant_vector_index_qwen3_embedding_0.6b.tgz`; it already contains collection
-`paper_knowledge_base` and should be preferred when strict baseline retrieval
-comparability is required.
+运行前需要自行提供大文件：
 
-For the original archive, the expected SHA-256 is
-`329b681a0b98b9523af08df413bdd1adfe82e3947f3e63f699812336563043ea`.
-It was built with Qdrant `1.18.0`; restore and expose it consistently, for
-example:
+~~~text
+data/scholargym_paper_db.json
+data/bm25_index.pkl
+Qdrant paper_knowledge_base collection
+~~~
 
-```bash
-sha256sum /path/to/qdrant_vector_index_qwen3_embedding_0.6b.tgz
-tar -xzf /path/to/qdrant_vector_index_qwen3_embedding_0.6b.tgz -C .
-docker run --rm \
-  -p 6433:6333 -p 6434:6334 \
-  -v "$PWD/data/qdrant_storage:/qdrant/storage" \
-  qdrant/qdrant:v1.18.0
-```
+## 7. BM25 full 运行示例
 
-The original Ollama model blob digest was
-`sha256-06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
-
-## Sparse/BM25 run
-
-```bash
+~~~bash
 python code/eval.py \
   --config configs/config_qwen30b_api.py \
   --paper_db data/scholargym_paper_db.json \
   --benchmark_jsonl data/scholargym_bench.jsonl \
   --bm25_path data/bm25_index.pkl \
   --output_dir eval_results_onepass \
-  --run_label testfast_run1 \
+  --run_label bm25_q030_sq040_intent015_path015_run1 \
   --workflow deep_research \
   --search_method bm25 \
   --max_iterations 5 \
   --results_per_query 10 \
   --browser_mode NONE \
   --save_level full \
+  --postprocess_stage full \
   --run_per_subquery_postprocess \
   --run_deep_event_postprocess \
   --run_deep_merged_postprocess \
@@ -146,70 +240,29 @@ python code/eval.py \
   --postprocess_event_workers 4 \
   --postprocess_selector_concurrency 4 \
   --postprocess_embedding_concurrency 1
-```
+~~~
 
-Use a new `--run_label` for a new experiment. ScholarGym resume is keyed by the
-existing `detailed_results.jsonl`; reusing a completed output directory skips
-the baseline query and therefore also skips its replay.
+可单独关闭 deep 对照：
 
-Before resume, `run_manifest.json` verifies a signature over the package code,
-config, benchmark content, local corpus/index file metadata, Qdrant/Ollama
-endpoint plus collection/model locator, baseline parameters, graph/deep arms,
-and fixed embedding settings. It cannot hash a live Qdrant collection, so this
-is not a content-level check of the remote index; strict dense reproducibility
-still relies on the archive/model digests above. A mismatch, unreadable
-manifest, or checkpoint rows without a manifest are rejected instead of mixing
-old checkpoints with a new experiment; use a new `--run_label` in that case.
-For an already-started run upgraded only to this audited parallel scheduler,
-restart with the original command plus
-`--allow_resume_compatible_code_change`. The override still requires every
-recorded data, model, method, and experiment parameter to match; it ignores only
-the package source hash and the three postprocess parallelism settings, and is
-recorded in the replacement manifest. Do not use it for formula, prompt, model,
-dataset, or retrieval changes.
-
-Artifact writes are query-transactional without changing the baseline agents.
-During one query, baseline/shadow rows go to `onepass_artifacts/.staging/` and
-the canonical JSONLs remain unchanged. Only after the baseline and all enabled
-shadows finish are the staged rows flushed to the existing flat JSONLs;
-then ScholarGym appends the query to `detailed_results.jsonl`. On every resume,
-`detailed_results.jsonl` is the commit source of truth: stale staging directories,
-malformed tail rows, and rows belonging to uncommitted benchmark indices/query
-IDs are removed atomically before the unfinished query is rerun. Reconciliation
-statistics are saved in `onepass_artifacts/resume_reconciliation.json`.
-An incomplete final line in `detailed_results.jsonl` is also atomically
-truncated; corruption before later valid rows is rejected instead of guessed.
-
-Resume remains query-level. An interruption inside a query restarts that query's
-baseline trajectory from iteration 1; it does not resume an individual Planner,
-retrieval, or Selector call.
-
-Disable either deep control independently:
-
-```bash
+~~~bash
 --no-run_deep_event_postprocess
 --no-run_deep_merged_postprocess
-```
+~~~
 
-The deep controls require `--run_per_subquery_postprocess`, because its local
-graph pools define `N_i`. Disable all three shadows with all three `--no-run_*`
-flags when a baseline-only run is needed.
+deep 分支依赖 graph pool 提供预算，所以启用任何 deep 分支时必须启用
+--run_per_subquery_postprocess。
 
-Replay requires `--browser_mode NONE` and `ENABLE_SUMMARIZATION=False`; this
-keeps the replay Selector call identical to the baseline abstract-only Selector
-except for candidate IDs and their rerank scores.
+## 8. Dense 运行示例
 
-## Dense run with Ollama + Qdrant
+启动 Ollama 与 Qdrant，并准备模型：
 
-Start Ollama and Qdrant, then pull the exact model:
-
-```bash
+~~~bash
 ollama pull qwen3-embedding:0.6b
-```
+~~~
 
-Build the collection with the same backend/model used by evaluation:
+如不恢复原始 collection，可按 baseline 序列化重新建库：
 
-```bash
+~~~bash
 python code/build_vector_db_configurable.py \
   --paper_db data/scholargym_paper_db.json \
   --qdrant_url http://localhost:6433 \
@@ -217,115 +270,102 @@ python code/build_vector_db_configurable.py \
   --embedding_base_url http://localhost:11434 \
   --batch_size 64 \
   --recreate
-```
+~~~
 
-Run retrieval and local reranking with that same model:
+运行：
 
-```bash
+~~~bash
 python code/eval.py \
   --config configs/config_qwen30b_api.py \
   --paper_db data/scholargym_paper_db.json \
   --benchmark_jsonl data/scholargym_bench.jsonl \
   --output_dir eval_results_onepass_dense \
+  --run_label dense_q030_sq040_intent015_path015_run1 \
   --workflow deep_research \
   --search_method vector \
   --results_per_query 10 \
   --max_iterations 5 \
   --browser_mode NONE \
   --save_level full \
+  --postprocess_stage full \
   --embedding_base_url http://localhost:11434 \
   --qdrant_url http://localhost:6433 \
   --qdrant_collection paper_knowledge_base \
   --postprocess_event_workers 4 \
   --postprocess_selector_concurrency 4 \
   --postprocess_embedding_concurrency 1
-```
+~~~
 
-The configurable builder and dense local reranker use the baseline
-`OllamaEmbeddings` class, fixed model, cosine distance, and exact baseline
-`title: ...\n abstract: ...` paper serialization. Configurable fields are limited
-to service URL, collection name, and batching. A newly built collection is operationally
-compatible, but restoring the original collection is the stronger choice when
-exact ranking reproducibility matters.
+Stage A 使用同一条命令，只需把：
 
-## Save levels and outputs
+~~~bash
+--postprocess_stage full
+~~~
 
-`minimal` saves manifests, query metrics, graph/deep compact pool records with
-complete arXiv ID/score/rank lists, comparisons, warnings, and errors. `full`
-also saves flat per-paper analysis rows, exact expansion edges and Selector
-decision rows. No rendered prompt, title, abstract, author, API key, or paper
-rejected by the date cutoff is written to analysis artifacts.
+替换为：
 
-Main full files under `<run>/onepass_artifacts/`:
+~~~bash
+--postprocess_stage materialize
+~~~
 
-```text
-baseline/planner_events.jsonl
-baseline/paper_rows.jsonl
-baseline/selector_decisions.jsonl
-per_subquery/paper_rows.jsonl
-per_subquery/pool_records.jsonl
-per_subquery/expansion_edges.jsonl
-per_subquery/selector_decisions.jsonl
-deep_event/pool_records.jsonl
-deep_event/paper_rows.jsonl
-deep_event/comparisons.jsonl
-deep_event/selector_decisions.jsonl
-deep_merged/pool_records.jsonl
-deep_merged/paper_rows.jsonl
-deep_merged/comparisons.jsonl
-deep_merged/selector_decisions.jsonl
-query_results.jsonl
-run_manifest.json
-resume_reconciliation.json
-```
+## 9. 断点续跑
 
-The outer `<output_dir>/evaluation_summary.jsonl` also contains
-`postprocess_overall_metrics.per_subquery`, `.deep_event`, and `.deep_merged`.
-Each block reports macro averages over
-successful unique benchmark queries, micro recall/precision, total GT/candidate/
-selected counts, and failed or missing query counts. Here `candidate_*` means the
-deduplicated rerank top-k actually passed to that shadow Selector, not the larger
-pre-top-k expansion pool. Resume/retry duplicates are collapsed by benchmark
-`idx`, with the last detailed result treated as authoritative.
+checkpoint 以 detailed_results.jsonl 中已经提交的 benchmark idx 为准。
+必须使用完全相同的命令和输出目录才能正常续跑。
 
-Planner events include the structured pre-call `ResearchMemory`, every prior
-subquery page state, selected/retrieved arXiv IDs, overview/checklist, retrieval
-exclusion IDs, and stable planner/retrieval event IDs. Raw prompts are not saved.
+run_manifest.json 的签名包含：
 
-`observed_retrieval_score/rank` is the actual baseline page result and therefore
-exists only for seeds. `observed_retrieval_rank_after_exclusion` adds the saved
-offset after baseline's frozen exclusion; it is not a pre-exclusion global rank.
-The legacy `observed_retrieval_absolute_rank` is retained as an explicitly scoped
-alias. `retrieval_score/rank` is recomputed with the same backend inside the
-closed seed+expanded pool and therefore exists for seeds and expanded papers.
+- 代码、配置与 benchmark 内容；
+- paper DB、BM25/Qdrant/Ollama 定位信息；
+- baseline 参数和三个后处理开关；
+- 公式 ID 与精确权重；
+- embedding、并发和缓存策略。
 
-Every deep paper is keyed by `(query_id, subquery_id, retrieval_event_id,
-paper_arxiv_id)`. Both `deep_*/pool_records.jsonl` files are written in minimal
-and full mode and contain, for every deep-pool paper:
+公式发生变化后不能续跑旧目录。本次四项公式必须使用新的 run_label 和输出目录，
+不能在历史 q040_sq060 checkpoint 上继续。
 
-- retriever raw score, global date-valid rank, exclusion-adjusted rank, and local-pool rank;
-- Q/SQ raw score, min-max score, and component rank;
-- text-only rerank score/rank, with intent/path explicitly zero;
-- Selector membership/input rank/selection fields and graph-pool overlap flags.
+--allow_resume_compatible_code_change 只允许经过审计且不改变实验结果的代码升级，
+不能用于公式、模型、prompt、数据集或检索参数变化。
 
-Full mode additionally emits one flat `paper_rows.jsonl` row per paper. The
-comparison files directly save graph/deep intersection, graph-only, deep-only,
-Jaccard, and ordered arXiv ID lists for the complete local pool and rerank top-k.
-For merged mode they also save every event's `N_i`, graph local/top-k IDs and the
-chronological Selector slices, so graph event top-k can be compared with its
-matching deep slice without reconstructing provenance. Overlapping full rows
-also carry the matching graph rerank features: scheme 1 has direct graph
-score/rank fields, while scheme 2 stores a list keyed by source event because one
-paper may occur in several continue-event graph pools.
+## 10. 产物
 
-One expanded paper may have several source seeds. `paper_rows` contains the
-aggregated `source_seed_arxiv_ids`; `expansion_edges` stores one exact
-`(query_id, subquery_id, seed_arxiv_id, expanded_arxiv_id)` edge per provenance.
+full 模式的主要文件位于：
 
-## Important parameters
+~~~text
+<run>/onepass_artifacts/
+  baseline/planner_events.jsonl
+  baseline/paper_rows.jsonl
+  baseline/selector_decisions.jsonl
+  per_subquery/paper_rows.jsonl
+  per_subquery/pool_records.jsonl
+  per_subquery/expansion_edges.jsonl
+  per_subquery/selector_decisions.jsonl
+  deep_event/pool_records.jsonl
+  deep_event/paper_rows.jsonl
+  deep_event/comparisons.jsonl
+  deep_event/selector_decisions.jsonl
+  deep_merged/pool_records.jsonl
+  deep_merged/paper_rows.jsonl
+  deep_merged/comparisons.jsonl
+  deep_merged/selector_decisions.jsonl
+  query_results.jsonl
+  run_manifest.json
+  resume_reconciliation.json
+~~~
 
-```text
+minimal 保留 manifest、query 指标和紧凑 pool 记录；full 额外保存逐论文行、
+精确扩展边和 Selector decision。产物不写入 API key、原始 prompt、论文标题、
+摘要或作者。
+
+Stage A 的 summary 只报告候选池覆盖、预算满足率和特征可计算数量；由于没有
+rerank Top-K 和 shadow selection，candidate/selection 指标会明确保存为不可用，
+而不是伪装成 0。
+
+## 11. 重要参数
+
+~~~text
 --save_level minimal|full
+--postprocess_stage full|materialize
 --run_label LABEL
 --limit N
 --results_per_query N
@@ -344,20 +384,13 @@ aggregated `source_seed_arxiv_ids`; `expansion_edges` stores one exact
 --postprocess_selector_concurrency N
 --postprocess_embedding_concurrency N
 --allow_resume_compatible_code_change
-```
+~~~
 
-Dense model selection is intentionally not a CLI option. Fixed settings are
-`OLLAMA_EMBEDDING_MODEL=qwen3-embedding:0.6b`, local-rerank batch size `64`, and
-adaptive deep-retrieval fetch cap `20000`; all are written to the run manifest.
-Parallelism defaults are event workers `4`, remote shadow Selector concurrency
-`4`, and postprocess Ollama embedding concurrency `1`. For a 3060, keep the
-embedding value at `1` initially; graph and remote Selector concurrency do not
-consume GPU memory.
-If date filtering, collection exhaustion, or that cap prevents a requested
-budget from being filled, the actual count and fulfillment rate remain explicit
-in each pool record rather than being silently treated as matched.
+同一 S2 key 被两个进程同时使用时，graph_rate_limit_rps 是按进程计算的，
+两个进程的速率之和必须保持在 key 配额内。
 
-When both independent packages run simultaneously with the same S2 key, the
-rate limit is per process. Set the two `--graph_rate_limit_rps` values so their
-sum stays within the key quota. Cache writes use atomic replacement, but two
-processes may still issue the same uncached request once.
+## 12. 测试
+
+~~~bash
+python -m pytest -q
+~~~

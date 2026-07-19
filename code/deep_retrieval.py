@@ -14,7 +14,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 import numpy as np
 
 import config
-from graph_methods import CandidateIndex, DEFAULT_FEATURE_WEIGHTS, month_key, normalize_arxiv_id
+from graph_methods import (
+    CandidateIndex,
+    DEFAULT_FEATURE_WEIGHTS,
+    RERANK_FORMULA_ID,
+    month_key,
+    normalize_arxiv_id,
+)
 from structures import Paper
 
 
@@ -63,7 +69,7 @@ def id_set_comparison(graph_ids: Sequence[str], deep_ids: Sequence[str]) -> Dict
 
 
 class DeepRetrievalProcessor:
-    """Prepare shared deep pools and apply the graph formula with graph terms zeroed."""
+    """Prepare shared deep pools and apply the fixed four-factor rerank."""
 
     def __init__(
         self,
@@ -393,7 +399,7 @@ class DeepRetrievalProcessor:
             diagnostics.update(group_diagnostics)
         return {"groups": groups, "pools": pools, "diagnostics": diagnostics}
 
-    def rerank_pool(
+    def materialize_pool_features(
         self,
         pool: Sequence[Mapping[str, Any]],
         *,
@@ -401,6 +407,7 @@ class DeepRetrievalProcessor:
         subquery: str,
         cutoff: Optional[str],
     ) -> Dict[str, Any]:
+        """Materialize retriever-order deep-pool component features only."""
         retrieval_order = ordered_unique(item.get("paper_arxiv_id") for item in pool)
         retrieval_by_id = {
             normalize_arxiv_id(item.get("paper_arxiv_id")): item
@@ -420,27 +427,12 @@ class DeepRetrievalProcessor:
         query_raw, query_norm, query_rank = index.score(query)
         subquery_raw, subquery_norm, subquery_rank = index.score(subquery)
         scorable = [paper_id for paper_id in retrieval_order if paper_id in query_raw and paper_id in subquery_raw]
-        unscorable = [paper_id for paper_id in retrieval_order if paper_id not in set(scorable)]
-        rerank_scores = {
-            paper_id: (
-                self.weights["query_score_normalized"] * query_norm.get(paper_id, 0.0)
-                + self.weights["subquery_score_normalized"] * subquery_norm.get(paper_id, 0.0)
-            )
-            for paper_id in scorable
-        }
-        ordered = sorted(
-            scorable,
-            key=lambda paper_id: (
-                -rerank_scores[paper_id],
-                _as_int(retrieval_by_id[paper_id].get("deep_retrieval_rank_in_local_pool"), 10**12),
-                paper_id,
-            ),
-        )
-        rerank_rank = {paper_id: rank for rank, paper_id in enumerate(ordered, start=1)}
+        scorable_set = set(scorable)
+        unscorable = [paper_id for paper_id in retrieval_order if paper_id not in scorable_set]
         rows: List[Dict[str, Any]] = []
-        for paper_id in ordered + unscorable:
+        for materialization_rank, paper_id in enumerate(retrieval_order, start=1):
             hit = retrieval_by_id[paper_id]
-            is_scorable = paper_id in rerank_rank
+            is_scorable = paper_id in scorable_set
             rows.append(
                 {
                     "paper_arxiv_id": paper_id,
@@ -465,19 +457,104 @@ class DeepRetrievalProcessor:
                     "intent_score": 0.0,
                     "path_count": 0,
                     "path_count_normalized": 0.0,
-                    "feature_weights": dict(self.weights),
-                    "rerank_score": float(rerank_scores[paper_id]) if is_scorable else None,
-                    "rerank_rank": rerank_rank.get(paper_id),
-                    "rerankable": is_scorable,
-                    "rerank_drop_reason": None if is_scorable else "missing non-empty title/abstract",
+                    "feature_scorable": is_scorable,
+                    "feature_unavailable_reason": (
+                        None if is_scorable else "missing non-empty title/abstract"
+                    ),
+                    "materialization_order_rank": materialization_rank,
+                    "materialization_order_scope": "deep_retrieval_order",
                 }
             )
         return {
             "retrieval_order_arxiv_ids": retrieval_order,
-            "rerank_order_arxiv_ids": ordered,
+            "scorable_arxiv_ids": scorable,
             "unscorable_arxiv_ids": unscorable,
             "rows": rows,
             "metadata": metadata,
+            "features_materialized": True,
+            "legacy_rerank_applied": False,
+        }
+
+    def rerank_pool(
+        self,
+        pool: Sequence[Mapping[str, Any]],
+        *,
+        query: str,
+        subquery: str,
+        cutoff: Optional[str],
+    ) -> Dict[str, Any]:
+        """Apply the shared four-factor formula to a deep pool.
+
+        Deep controls have no graph edges, so their intent/path features are
+        explicitly zero while the formula and manifest schema stay identical
+        to the graph arm.
+        """
+        materialized = self.materialize_pool_features(
+            pool,
+            query=query,
+            subquery=subquery,
+            cutoff=cutoff,
+        )
+        row_by_id = {
+            row["paper_arxiv_id"]: dict(row) for row in materialized["rows"]
+        }
+        scorable = list(materialized["scorable_arxiv_ids"])
+        rerank_scores = {
+            paper_id: (
+                self.weights["query_score_normalized"]
+                * float(row_by_id[paper_id].get("query_score_normalized") or 0.0)
+                + self.weights["subquery_score_normalized"]
+                * float(row_by_id[paper_id].get("subquery_score_normalized") or 0.0)
+                + self.weights["intent_score"]
+                * float(row_by_id[paper_id].get("intent_score") or 0.0)
+                + self.weights["path_count_normalized"]
+                * float(row_by_id[paper_id].get("path_count_normalized") or 0.0)
+            )
+            for paper_id in scorable
+        }
+        ordered = sorted(
+            scorable,
+            key=lambda paper_id: (
+                -rerank_scores[paper_id],
+                _as_int(
+                    row_by_id[paper_id].get("deep_retrieval_rank_in_local_pool"),
+                    10**12,
+                ),
+                paper_id,
+            ),
+        )
+        rerank_rank = {
+            paper_id: rank for rank, paper_id in enumerate(ordered, start=1)
+        }
+        rows: List[Dict[str, Any]] = []
+        for paper_id in ordered + list(materialized["unscorable_arxiv_ids"]):
+            row = row_by_id[paper_id]
+            is_scorable = bool(row.pop("feature_scorable", False))
+            unavailable_reason = row.pop("feature_unavailable_reason", None)
+            row.pop("materialization_order_rank", None)
+            row.pop("materialization_order_scope", None)
+            row.update(
+                {
+                    "rerank_formula_id": RERANK_FORMULA_ID,
+                    "feature_weights": dict(self.weights),
+                    "rerank_score": (
+                        float(rerank_scores[paper_id]) if is_scorable else None
+                    ),
+                    "rerank_rank": rerank_rank.get(paper_id),
+                    "rerankable": is_scorable,
+                    "rerank_drop_reason": unavailable_reason,
+                }
+            )
+            rows.append(row)
+        return {
+            "retrieval_order_arxiv_ids": materialized["retrieval_order_arxiv_ids"],
+            "rerank_order_arxiv_ids": ordered,
+            "unscorable_arxiv_ids": materialized["unscorable_arxiv_ids"],
+            "rows": rows,
+            "metadata": materialized["metadata"],
+            "features_materialized": True,
+            "legacy_rerank_applied": True,
+            "rerank_formula_id": RERANK_FORMULA_ID,
         }
 
     @staticmethod
@@ -506,6 +583,7 @@ class DeepRetrievalProcessor:
 
 COMPACT_DEEP_ROW_FIELDS = (
     "paper_arxiv_id",
+    "candidate_type",
     "deep_retrieval_score_raw",
     "deep_retrieval_rank_global_date_valid",
     "deep_retrieval_rank_after_exclusion",
@@ -516,8 +594,16 @@ COMPACT_DEEP_ROW_FIELDS = (
     "subquery_score_raw",
     "subquery_score_normalized",
     "subquery_component_rank",
+    "component_rank_scope",
+    "normalization_scope",
     "intent_score",
     "path_count",
+    "path_count_normalized",
+    "feature_scorable",
+    "feature_unavailable_reason",
+    "materialization_order_rank",
+    "materialization_order_scope",
+    "rerank_formula_id",
     "rerank_score",
     "rerank_rank",
     "rerankable",
@@ -526,6 +612,12 @@ COMPACT_DEEP_ROW_FIELDS = (
     "selector_selected",
     "in_source_graph_local_pool",
     "in_source_graph_topk",
+    "source_graph_query_score_normalized",
+    "source_graph_subquery_score_normalized",
+    "source_graph_intent_score",
+    "source_graph_path_count_normalized",
+    "source_graph_event_ids",
+    "source_graph_event_features",
     "source_graph_rerank_score",
     "source_graph_rerank_rank",
     "in_matching_event_graph_local_pool",

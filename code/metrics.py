@@ -269,7 +269,11 @@ class MetricsCalculator:
         }
         
         # Step 5: Calculate average distance
-        avg_distance = sum(cur_iter_distances.values()) / len(cur_iter_distances)
+        avg_distance = (
+            sum(cur_iter_distances.values()) / len(cur_iter_distances)
+            if cur_iter_distances
+            else -1.0
+        )
         
         return {
             "gt_rank": gt_rank_details,

@@ -49,18 +49,18 @@ Semantic Scholar 图拓展。
 
 ## 重排公式
 
-所有深检索论文的 intent/path 特征固定为 0：
+所有深检索论文的 intent/path 特征仍固定为 0 并保存在记录中，但不参与得分。
+固定公式 ID 为 `q030_sq040_intent015_path015_closed_pool_minmax_v1`：
 
 ```text
 0.30 * query_score_normalized
 + 0.40 * subquery_score_normalized
-+ 0.15 * 0
-+ 0.15 * 0
++ 0.15 * intent_score
++ 0.15 * path_count_normalized
 ```
 
-不把 0.30/0.40 重新缩放为 3/7、4/7；排序相同，但保存的 score 保持原公式
-尺度 `[0, 0.7]`。Q/SQ 都在当前 event 池或 merged subquery 池内用 BM25
-重新计算并 min-max。
+保存的 score 尺度为 `[0, 1]`。Q/SQ 都在当前 event 池或 merged subquery 池内
+用 BM25 重新计算并 min-max。
 
 ## 输入要求与历史重复处理
 

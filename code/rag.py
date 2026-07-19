@@ -541,7 +541,7 @@ class CitationRAGSystem:
             embeddings = OllamaEmbeddings(model=embedding_model_name, base_url=config.OLLAMA_URL)
         self.embedding_provider = embeddings
 
-        client = QdrantClient(url=self.qdrant_url)
+        client = QdrantClient(url=self.qdrant_url, timeout=120, )
         if not client.collection_exists(self.qdrant_collection):
             raise ValueError(
                 f"Qdrant collection {self.qdrant_collection!r} does not exist at {self.qdrant_url}; "

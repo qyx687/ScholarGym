@@ -246,8 +246,8 @@ def test_contiguous_selector_slices_use_each_event_actual_topk():
     assert [value["rerank_start_rank"] for value in slices] == [1, 3, 6]
 
 
-def test_text_only_formula_keeps_original_point_seven_scale():
-    assert replay.text_only_formula_score(1.0, 1.0) == 0.7
+def test_text_only_formula_uses_shared_four_factor_weights_with_zero_graph_features():
+    assert replay.text_only_formula_score(1.0, 1.0) == 0.70
     assert replay.text_only_formula_score(0.5, 0.25) == 0.25
 
 
