@@ -7,8 +7,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from dimension_catalog import DIMENSION_NAMES, intent_dimension_values
+from dimension_catalog import DIMENSION_NAMES, PAPER_TYPES, intent_dimension_values
 from paper_type import (
+    CLASSIFIER_VERSION,
+    PaperTypeClassifier,
+    S2_SUPPORTED_CANONICAL_TYPES,
     evaluate_paper_type_rules,
     s2_publication_types_to_record,
 )
@@ -91,6 +94,63 @@ class FakeLLM:
         return output
 
 
+def test_qwen_paper_type_classifier_controls_provenance_and_full_taxonomy():
+    type_probs = {type_name: 0.0 for type_name in PAPER_TYPES}
+    type_probs["dataset_benchmark"] = 0.95
+    raw = json.dumps(
+        [
+            {
+                "paper_arxiv_id": "2001.00001",
+                "type_probs": type_probs,
+                "confidence": 0.96,
+                "classifier_version": "model-invented-version",
+            }
+        ]
+    )
+    fake = FakeLLM([raw])
+    classifier = PaperTypeClassifier("qwen-test", llm_call=fake)
+
+    records = classifier.classify_batch(
+        [
+            {
+                "paper_arxiv_id": "2001.00001",
+                "title": "A benchmark",
+                "abstract": "A dataset and evaluation benchmark.",
+            }
+        ]
+    )
+
+    assert records[0]["classifier_version"] == CLASSIFIER_VERSION
+    assert records[0]["evidence_source"] == "qwen"
+    assert set(records[0]["supported_types"]) == set(PAPER_TYPES)
+    assert set(records[0]["negative_evidence_types"]) == set(PAPER_TYPES)
+
+
+def test_qwen_paper_type_classifier_rejects_sparse_probabilities():
+    raw = json.dumps(
+        [
+            {
+                "paper_arxiv_id": "2001.00001",
+                "type_probs": {"dataset_benchmark": 0.95},
+                "confidence": 0.96,
+                "classifier_version": CLASSIFIER_VERSION,
+            }
+        ]
+    )
+    classifier = PaperTypeClassifier("qwen-test", llm_call=FakeLLM([raw, raw]))
+
+    with pytest.raises(ValueError, match="every canonical paper type"):
+        classifier.classify_batch(
+            [
+                {
+                    "paper_arxiv_id": "2001.00001",
+                    "title": "A benchmark",
+                    "abstract": "A dataset and evaluation benchmark.",
+                }
+            ]
+        )
+
+
 def test_markdown_wrapped_policy_is_parsed_and_cached_once(tmp_path):
     raw = "Here is the policy:\n```json\n" + json.dumps(valid_policy()) + "\n```\nextra"
     fake = FakeLLM([raw])
@@ -136,6 +196,18 @@ def test_illegal_dimension_type_and_action_are_rejected(mutate):
         validate_policy_object(value, policy_id="p")
 
 
+def test_unambiguous_paper_type_alias_is_canonicalized():
+    value = valid_policy(
+        paper_type_rules=[
+            {"types": ["survey"], "action": "exclude", "logic": "any"}
+        ]
+    )
+
+    policy = validate_policy_object(value, policy_id="p")
+
+    assert policy.paper_type_rules[0].types == ("survey_review",)
+
+
 def test_low_confidence_automatically_falls_back_to_legacy():
     fake = FakeLLM([json.dumps(valid_policy(confidence=0.59))])
     skill = RerankSkill("qwen-test", llm_call=fake, min_confidence=0.60)
@@ -169,6 +241,29 @@ def test_cached_fallback_can_be_explicitly_retried(tmp_path):
     assert first.used_fallback
     assert not retried.used_fallback
     assert len(retry_llm.prompts) == 1
+
+
+def test_policy_cache_is_bound_to_minimum_confidence(tmp_path):
+    cache = tmp_path / "policies.jsonl"
+    first_llm = FakeLLM([json.dumps(valid_policy(confidence=0.65))])
+    first = RerankSkill(
+        "qwen-test",
+        llm_call=first_llm,
+        min_confidence=0.60,
+        policy_cache_path=cache,
+    ).build_policy("query")
+    second_llm = FakeLLM([json.dumps(valid_policy(confidence=0.85))])
+    second = RerankSkill(
+        "qwen-test",
+        llm_call=second_llm,
+        min_confidence=0.70,
+        policy_cache_path=cache,
+    ).build_policy("query")
+
+    assert not first.used_fallback
+    assert not second.used_fallback
+    assert first.policy_id != second.policy_id
+    assert len(second_llm.prompts) == 1
 
 
 def test_semantic_mass_positive_normalization_and_negative_cap():
@@ -327,6 +422,46 @@ def test_s2_capabilities_disable_only_unsupported_soft_type_alignment():
         validate_policy_object(supported_value, policy_id="supported")
     )
     assert supported.paper_type_alignment_enabled
+
+
+def test_qwen_backend_never_falls_back_to_candidate_s2_types():
+    policy = validate_policy_object(
+        valid_policy(
+            paper_type_rules=[
+                {
+                    "types": ["survey_review"],
+                    "action": "exclude",
+                    "logic": "any",
+                    "threshold": 0.8,
+                }
+            ]
+        ),
+        policy_id="p",
+    )
+    candidate = {
+        "paper_arxiv_id": "survey",
+        "query_score_normalized": 0.5,
+        "subquery_score_normalized": 0.5,
+        "intent_labels": [],
+        "path_count_normalized": 0.0,
+        "s2_publication_types": ["Review"],
+    }
+    qwen_skill = RerankSkill("qwen-test", paper_type_backend="qwen")
+    qwen_skill.paper_type_supported_types.update(PAPER_TYPES)
+    qwen_row = qwen_skill.score_candidates(
+        [candidate], qwen_skill.compile_weights(policy)
+    )[0]
+    s2_skill = RerankSkill("qwen-test", paper_type_backend="s2")
+    s2_skill.paper_type_supported_types.update(S2_SUPPORTED_CANONICAL_TYPES)
+    s2_row = s2_skill.score_candidates(
+        [candidate], s2_skill.compile_weights(policy)
+    )[0]
+
+    assert qwen_row["paper_type_backend"] == "qwen"
+    assert qwen_row["paper_type_evidence_source"] is None
+    assert not qwen_row["hard_filtered"]
+    assert s2_row["paper_type_evidence_source"] == "semantic_scholar"
+    assert s2_row["hard_filtered"]
 
 
 def test_hard_filtered_rows_do_not_enter_ranking_and_ties_are_reproducible():

@@ -4,7 +4,7 @@
 The pipeline deliberately separates semantic annotation from retrieval provenance:
 
 1. ``prepare`` unions and deduplicates query-paper candidates from the saved
-   baseline, graph, deep-event, and deep-merged full artifacts; joins paper
+   baseline, graph, and deep-merged full artifacts; joins paper
    metadata; writes blinded Codex inputs; and preserves normalized occurrence
    rows for later Top-K analysis.
 2. ``annotate-rubrics`` creates one stable query rubric per benchmark query.
@@ -44,7 +44,6 @@ PROMPT_VERSION = "candidate_annotation_prompt_v2"
 SOURCE_PATHS = {
     "baseline": Path("onepass_artifacts/baseline/paper_rows.jsonl"),
     "graph": Path("onepass_artifacts/per_subquery/paper_rows.jsonl"),
-    "deep_event": Path("onepass_artifacts/deep_event/paper_rows.jsonl"),
     "deep_merged": Path("onepass_artifacts/deep_merged/paper_rows.jsonl"),
 }
 DEFAULT_SOURCES = tuple(SOURCE_PATHS)
@@ -440,7 +439,7 @@ def _query_id_from_detailed(row: Mapping[str, Any]) -> Optional[str]:
     postprocess = row.get("postprocess_results")
     if not isinstance(postprocess, Mapping):
         return None
-    for method in ("per_subquery", "deep_event", "deep_merged", "baseline"):
+    for method in ("per_subquery", "deep_merged", "baseline"):
         value = postprocess.get(method)
         if isinstance(value, Mapping) and value.get("query_id"):
             return str(value["query_id"])
@@ -570,7 +569,7 @@ def _finalize_source_stats(stats: Mapping[str, Any]) -> Dict[str, Any]:
 
 def _source_partition(sources: Set[str]) -> str:
     in_graph = "graph" in sources
-    in_deep = "deep_event" in sources or "deep_merged" in sources
+    in_deep = "deep_merged" in sources
     if in_graph and in_deep:
         return "graph_and_deep"
     if in_graph:
@@ -1445,7 +1444,7 @@ def _analysis_groups(candidate: Mapping[str, Any]) -> List[str]:
     for source in DEFAULT_SOURCES:
         if source in sources:
             groups.append(f"source:{source}")
-    if "deep_event" in sources or "deep_merged" in sources:
+    if "deep_merged" in sources:
         groups.append("source:deep_any")
     return groups
 

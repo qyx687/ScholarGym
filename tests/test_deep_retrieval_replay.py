@@ -96,6 +96,10 @@ def _paper_row(checklist, paper_id, *, local=False, rerank_rank=1):
     return row
 
 
+def test_only_merged_subquery_method_is_exposed():
+    assert replay.METHODS == (replay.MERGED_METHOD,)
+
+
 def test_baseline_compatible_exclude_then_offset_can_skip_unseen_papers():
     pools, diagnostics = replay.retrieve_bm25_requests(
         _fake_rag(),
@@ -371,7 +375,7 @@ def test_selector_free_summary_marks_selection_metrics_unavailable():
 
     summary = replay.build_query_summary(
         context=context,
-        method=replay.EVENT_METHOD,
+        method=replay.MERGED_METHOD,
         deep_pool_ids=["a", "x", "y"],
         selector_input_ids=["a", "x"],
         selected_ids=[],
@@ -402,7 +406,7 @@ def test_aggregate_f1_exposes_mean_query_and_main_table_macro_harmonic():
     }
     first = replay.build_query_summary(
         context={**base, "gt_ids": {"a"}},
-        method=replay.EVENT_METHOD,
+        method=replay.MERGED_METHOD,
         deep_pool_ids=["a", "x"],
         selector_input_ids=["a", "x"],
         selected_ids=["a"],
@@ -415,7 +419,7 @@ def test_aggregate_f1_exposes_mean_query_and_main_table_macro_harmonic():
     )
     second = replay.build_query_summary(
         context={**base, "gt_ids": {"b"}},
-        method=replay.EVENT_METHOD,
+        method=replay.MERGED_METHOD,
         deep_pool_ids=["b"],
         selector_input_ids=["b"],
         selected_ids=["b"],
@@ -436,7 +440,7 @@ def test_aggregate_f1_exposes_mean_query_and_main_table_macro_harmonic():
 
 def test_output_directory_rejects_a_different_signature_when_query_files_exist(tmp_path):
     replay.atomic_write_json(tmp_path / "run_manifest.json", {"run_signature": "old"})
-    replay.atomic_write_json(tmp_path / replay.EVENT_METHOD / "queries" / "000000.json", {"ok": True})
+    replay.atomic_write_json(tmp_path / replay.MERGED_METHOD / "queries" / "000000.json", {"ok": True})
 
     with pytest.raises(ValueError, match="different run signature"):
         replay.ensure_compatible_output_dir(tmp_path, "new")

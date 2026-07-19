@@ -26,6 +26,8 @@ import requests
 from rank_bm25 import BM25Okapi
 
 import config
+from online_paper_type import PaperTypeResolver
+from rerank_skill import CompiledPolicy, RerankPolicy, RerankSkill
 from structures import Paper, SubQuery
 
 
@@ -84,7 +86,7 @@ class _PendingEmbedding:
 class QueryScopedEmbeddingCache:
     """Share exact-text postprocess embeddings within one benchmark query.
 
-    Graph, deep-event, and deep-merged pools repeatedly serialize the same
+    Graph and deep-merged pools repeatedly serialize the same
     papers and score the same query/subquery strings.  This wrapper stores raw
     float32 vectors for the lifetime of one benchmark query and coalesces
     concurrent misses, while leaving pool-local normalization and ranking in
@@ -908,6 +910,8 @@ class PerSubqueryProcessor:
         expansion_method: str = "citations_references",
         expansion_limit: int = 100,
         weights: Optional[Mapping[str, float]] = None,
+        rerank_skill: Optional[RerankSkill] = None,
+        paper_type_resolver: Optional[PaperTypeResolver] = None,
     ) -> None:
         self.paper_db = dict(paper_db)
         self.s2 = s2_client
@@ -922,6 +926,46 @@ class PerSubqueryProcessor:
                 f"{RERANK_FORMULA_ID} is fixed; custom rerank weights are unsupported"
             )
         self.weights = requested_weights
+        self.rerank_skill = rerank_skill
+        self.paper_type_resolver = paper_type_resolver
+        self.active_policy: Optional[RerankPolicy] = None
+        self.active_compiled_policy: Optional[CompiledPolicy] = None
+        self.active_original_query = ""
+        if self.rerank_skill is not None and self.paper_type_resolver is not None:
+            resolver_backend = str(self.paper_type_resolver.backend).lower()
+            if self.rerank_skill.paper_type_backend not in {None, resolver_backend}:
+                raise ValueError(
+                    "rerank skill paper-type backend does not match resolver backend"
+                )
+            self.rerank_skill.paper_type_backend = resolver_backend
+            # The backend advertises its usable taxonomy even before its
+            # append-only cache contains any records.
+            self.rerank_skill.paper_type_supported_types.update(
+                self.paper_type_resolver.supported_types
+            )
+
+    @property
+    def dynamic_rerank_enabled(self) -> bool:
+        return self.rerank_skill is not None
+
+    def configure_query(
+        self, original_query: str
+    ) -> Tuple[Optional[RerankPolicy], Optional[CompiledPolicy]]:
+        """Compile one immutable rerank policy for the original query."""
+
+        self.active_original_query = str(original_query or "").strip()
+        self.active_policy = None
+        self.active_compiled_policy = None
+        if self.rerank_skill is None:
+            return None, None
+        self.active_policy = self.rerank_skill.build_policy(self.active_original_query)
+        self.active_compiled_policy = self.rerank_skill.compile_weights(
+            self.active_policy,
+            paper_type_available=bool(
+                self.paper_type_resolver or self.rerank_skill.paper_type_cache
+            ),
+        )
+        return self.active_policy, self.active_compiled_policy
 
     def materialize(
         self,
@@ -1084,53 +1128,105 @@ class PerSubqueryProcessor:
         gt_ids: Optional[Set[str]] = None,
         exclude_arxiv_ids: Optional[Set[str]] = None,
     ) -> Dict[str, Any]:
-        """Apply the fixed four-factor rerank to a materialized graph pool."""
+        """Apply the configured query policy, or the exact static baseline."""
+        event_query = str(event.get("query") or "").strip()
+        if self.rerank_skill is not None and (
+            self.active_compiled_policy is None
+            or event_query != self.active_original_query
+        ):
+            # The OnePass manager configures this before concurrent event work;
+            # this fallback keeps direct processor use and unit tests safe.
+            self.configure_query(event_query)
         materialized = self.materialize(
             event,
             gt_ids,
             exclude_arxiv_ids=exclude_arxiv_ids,
         )
         rows = [dict(row) for row in materialized["rows"]]
-        row_by_id = {row["paper_arxiv_id"]: row for row in rows}
-        final_scores = {
-            paper_id: (
-                self.weights["query_score_normalized"]
-                * float(row.get("query_score_normalized") or 0.0)
-                + self.weights["subquery_score_normalized"]
-                * float(row.get("subquery_score_normalized") or 0.0)
-                + self.weights["intent_score"]
-                * float(row.get("intent_score") or 0.0)
-                + self.weights["path_count_normalized"]
-                * float(row.get("path_count_normalized") or 0.0)
-            )
-            for paper_id, row in row_by_id.items()
-        }
+        compiled_policy = self.active_compiled_policy
+        if self.rerank_skill is not None and compiled_policy is not None:
+            type_records: Dict[str, Dict[str, Any]] = {}
+            if (
+                self.paper_type_resolver is not None
+                and compiled_policy.paper_type_rules
+                and not compiled_policy.used_fallback
+            ):
+                type_records = self.paper_type_resolver.resolve(
+                    row["paper_arxiv_id"] for row in rows
+                )
+            for row in rows:
+                type_record = type_records.get(row["paper_arxiv_id"])
+                if type_record:
+                    row.update(
+                        {
+                            "paper_type_probs": dict(
+                                type_record.get("type_probs") or {}
+                            ),
+                            "paper_type_classifier_confidence": float(
+                                type_record.get("confidence") or 0.0
+                            ),
+                            "paper_type_evidence_source": type_record.get(
+                                "evidence_source"
+                            ),
+                            "paper_type_publication_types": list(
+                                type_record.get("publication_types") or []
+                            ),
+                            "paper_type_supported_types": list(
+                                type_record.get("supported_types") or []
+                            ),
+                            "paper_type_negative_evidence_types": list(
+                                type_record.get("negative_evidence_types") or []
+                            ),
+                        }
+                    )
+            rows = self.rerank_skill.score_candidates(rows, compiled_policy)
+            for row in rows:
+                row.pop("materialization_order_rank", None)
+                row.pop("materialization_order_scope", None)
+                row["feature_weights"] = dict(compiled_policy.feature_weights)
+        else:
+            row_by_id = {row["paper_arxiv_id"]: row for row in rows}
+            final_scores = {
+                paper_id: (
+                    self.weights["query_score_normalized"]
+                    * float(row.get("query_score_normalized") or 0.0)
+                    + self.weights["subquery_score_normalized"]
+                    * float(row.get("subquery_score_normalized") or 0.0)
+                    + self.weights["intent_score"]
+                    * float(row.get("intent_score") or 0.0)
+                    + self.weights["path_count_normalized"]
+                    * float(row.get("path_count_normalized") or 0.0)
+                )
+                for paper_id, row in row_by_id.items()
+            }
 
-        def final_key(paper_id: str) -> Tuple[float, int, int, str]:
-            row = row_by_id[paper_id]
-            observed_rank = row.get("observed_retrieval_rank")
-            return (
-                -final_scores[paper_id],
-                -int(bool(row.get("is_seed"))),
-                int(observed_rank or 10**12),
-                paper_id,
-            )
+            def final_key(paper_id: str) -> Tuple[float, int, int, str]:
+                row = row_by_id[paper_id]
+                observed_rank = row.get("observed_retrieval_rank")
+                return (
+                    -final_scores[paper_id],
+                    -int(bool(row.get("is_seed"))),
+                    int(observed_rank or 10**12),
+                    paper_id,
+                )
 
-        ordered = sorted(row_by_id, key=final_key)
-        final_rank = {paper_id: rank for rank, paper_id in enumerate(ordered, start=1)}
-        rows = [row_by_id[paper_id] for paper_id in ordered]
-        for row in rows:
-            paper_id = row["paper_arxiv_id"]
-            row.pop("materialization_order_rank", None)
-            row.pop("materialization_order_scope", None)
-            row.update(
-                {
-                    "rerank_formula_id": RERANK_FORMULA_ID,
-                    "feature_weights": dict(self.weights),
-                    "rerank_score": final_scores[paper_id],
-                    "rerank_rank": final_rank[paper_id],
-                }
-            )
+            ordered = sorted(row_by_id, key=final_key)
+            final_rank = {
+                paper_id: rank for rank, paper_id in enumerate(ordered, start=1)
+            }
+            rows = [row_by_id[paper_id] for paper_id in ordered]
+            for row in rows:
+                paper_id = row["paper_arxiv_id"]
+                row.pop("materialization_order_rank", None)
+                row.pop("materialization_order_scope", None)
+                row.update(
+                    {
+                        "rerank_formula_id": RERANK_FORMULA_ID,
+                        "feature_weights": dict(self.weights),
+                        "rerank_score": final_scores[paper_id],
+                        "rerank_rank": final_rank[paper_id],
+                    }
+                )
 
         seed_ids = list(
             dict.fromkeys(
@@ -1141,7 +1237,7 @@ class PerSubqueryProcessor:
         )
         requested_top_k = event.get("selector_top_k")
         top_k = int(requested_top_k if requested_top_k is not None else len(seed_ids))
-        top_rows = rows[:top_k]
+        top_rows = [row for row in rows if not row.get("hard_filtered")][:top_k]
         papers = []
         for row in top_rows:
             metadata = self.paper_db.get(row["paper_arxiv_id"], {})
@@ -1158,22 +1254,67 @@ class PerSubqueryProcessor:
         rank_dict = {
             row["paper_arxiv_id"]: {
                 "rank": int(row["rerank_rank"]) - 1,
-                "total": max(len(rows) - 1, 0),
+                "total": max(
+                    sum(item.get("rerank_rank") is not None for item in rows) - 1,
+                    0,
+                ),
                 "score": row["rerank_score"],
                 "raw_score": row["rerank_score"],
             }
             for row in rows
+            if row.get("rerank_rank") is not None
         }
+        filter_stats = dict(materialized["filter_stats"])
+        filter_stats.update(
+            {
+                "dynamic_rerank_enabled": bool(
+                    compiled_policy is not None and not compiled_policy.used_fallback
+                ),
+                "rerank_used_fallback": bool(
+                    compiled_policy is not None and compiled_policy.used_fallback
+                ),
+                "rerank_policy_id": (
+                    compiled_policy.policy_id if compiled_policy is not None else None
+                ),
+                "paper_type_rule_count": (
+                    len(compiled_policy.paper_type_rules)
+                    if compiled_policy is not None
+                    else 0
+                ),
+                "paper_type_record_count": sum(
+                    bool(row.get("paper_type_evidence_source")) for row in rows
+                ),
+                "hard_filtered_candidate_count": sum(
+                    bool(row.get("hard_filtered")) for row in rows
+                ),
+                "paper_type_backend": getattr(
+                    self.paper_type_resolver, "backend", None
+                ),
+                "paper_type_classifier_version": getattr(
+                    self.paper_type_resolver, "classifier_version", None
+                ),
+            }
+        )
         return {
             "rows": rows,
             "edges": materialized["edges"],
             "top_rows": top_rows,
             "papers": papers,
             "rank_dict": rank_dict,
-            "filter_stats": materialized["filter_stats"],
+            "filter_stats": filter_stats,
             "features_materialized": True,
-            "legacy_rerank_applied": True,
-            "rerank_formula_id": RERANK_FORMULA_ID,
+            "legacy_rerank_applied": bool(
+                compiled_policy is None or compiled_policy.used_fallback
+            ),
+            "rerank_formula_id": (
+                rows[0].get("rerank_formula_id") if rows else RERANK_FORMULA_ID
+            ),
+            "rerank_policy_id": (
+                compiled_policy.policy_id if compiled_policy is not None else None
+            ),
+            "compiled_rerank_policy": (
+                compiled_policy.to_dict() if compiled_policy is not None else None
+            ),
         }
 
 

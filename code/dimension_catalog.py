@@ -76,6 +76,20 @@ PAPER_TYPES: Tuple[str, ...] = (
     "position_perspective",
 )
 
+# Conservative lexical aliases observed from instruction-tuned policy models.
+# Each maps unambiguously to one catalog value; no paper type is inferred here.
+PAPER_TYPE_ALIASES = {
+    "survey": "survey_review",
+    "review": "survey_review",
+    "survey_paper": "survey_review",
+    "review_paper": "survey_review",
+    "tutorial": "taxonomy_tutorial",
+    "taxonomy": "taxonomy_tutorial",
+    "position": "position_perspective",
+    "perspective": "position_perspective",
+    "case_study": "application_case_study",
+}
+
 PAPER_TYPE_ACTIONS: Tuple[str, ...] = (
     "require",
     "prefer",

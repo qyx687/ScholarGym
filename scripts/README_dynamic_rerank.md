@@ -1,5 +1,21 @@
 # Query-conditioned rerank replay
 
+The same policy/scorer is also integrated into the OnePass `code/eval.py`
+full pipeline. Runtime selection is explicit:
+
+```bash
+--no-dynamic_rerank
+--dynamic_rerank --paper_type_backend s2
+--dynamic_rerank --paper_type_backend qwen
+```
+
+The first command is the exact static arm. The latter two use the same
+query-policy generator but differ in how candidate paper type is determined.
+S2 and Qwen must use separate `--paper_type_cache` files. The rest of this
+document describes the saved-pool replay used to tune and validate the method.
+Runtime Qwen cache records are also bound to the configured Qwen model. A Qwen
+miss remains unknown and never falls back to Semantic Scholar evidence.
+
 This experiment reuses materialized OnePass graph pools. It does not rerun the
 retriever, graph expansion, date filtering, Planner, or Selector.
 
@@ -72,6 +88,8 @@ never cause a hard drop. Explicit hard rules are enforced even when the policy
 leaves the soft `paper_type_alignment` dimension off. To reduce false-negative
 drops, `exclude` requires classifier confidence at least 0.80 while `require`
 uses the more conservative threshold 0.95.
+The query-policy cache key includes `--rerank_min_confidence`, so changing that
+threshold cannot silently reuse a policy accepted under a different setting.
 
 ## S2-first publication types
 
@@ -340,10 +358,11 @@ Run the focused test suite with:
 ```bash
 python -m pytest -q \
   tests/test_dynamic_rerank_skill.py \
-  tests/test_dynamic_rerank_replay.py
+  tests/test_dynamic_rerank_replay.py \
+  tests/test_online_paper_type.py
 ```
 
-The final repository-wide run passes 107 tests.
+The final repository-wide run passes 123 tests.
 
 ## Frozen OnePass Selector replay
 

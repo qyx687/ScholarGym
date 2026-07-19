@@ -24,7 +24,6 @@ from graph_methods import (
 from structures import Paper
 
 
-DEEP_EVENT_METHOD = "deep_event_offset_matched"
 DEEP_MERGED_METHOD = "deep_merged_subquery_sum_budget"
 DEEP_FEATURE_WEIGHTS = dict(DEFAULT_FEATURE_WEIGHTS)
 
@@ -308,11 +307,8 @@ class DeepRetrievalProcessor:
     def prepare_pools(
         self,
         graph_events: Sequence[Mapping[str, Any]],
-        *,
-        include_event: bool,
-        include_merged: bool,
     ) -> Dict[str, Any]:
-        """Score a stable subquery once and serve both deep-control requests."""
+        """Prepare one sum-budget deep pool for each stable subquery."""
         grouped: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
         group_order: List[str] = []
         for item in graph_events:
@@ -375,21 +371,13 @@ class DeepRetrievalProcessor:
                 ),
             }
             groups.append(group)
-            requests: Dict[Any, Dict[str, Any]] = {}
-            if include_event:
-                for item in event_records:
-                    event = item["event"]
-                    requests[(DEEP_EVENT_METHOD, item["retrieval_event_id"])] = {
-                        "offset": event.get("retrieval_offset") or 0,
-                        "count": item["source_local_graph_pool_size"],
-                        "exclude_arxiv_ids": event.get("retrieval_exclusion_arxiv_ids") or [],
-                    }
-            if include_merged:
-                requests[(DEEP_MERGED_METHOD, subquery_id)] = {
+            requests: Dict[Any, Dict[str, Any]] = {
+                (DEEP_MERGED_METHOD, subquery_id): {
                     "offset": 0,
                     "count": graph_occurrence_budget,
                     "exclude_arxiv_ids": group["frozen_first_event_exclusion_arxiv_ids"],
                 }
+            }
             group_pools, group_diagnostics = self._retrieve_requests(
                 subquery=group["subquery"],
                 before_date=group["subquery_before_date"],

@@ -31,6 +31,15 @@ from graph_methods import (
     load_paper_db,
 )
 from onepass_postprocess import OnePassPostprocessor, aggregate_postprocess_metrics
+from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
+from online_paper_type import QwenPaperTypeResolver, S2PublicationTypeResolver
+from rerank_skill import (
+    DEFAULT_MAX_NEGATIVE_MASS,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_NEGATIVE_WEIGHT,
+    DEFAULT_SEMANTIC_MIN_MASS,
+    RerankSkill,
+)
 
 logger = get_logger(__name__, log_file='./log/eval.log')
 
@@ -741,18 +750,73 @@ def main():
         choices=['full', 'materialize'],
         default='full',
         help=(
-            'full applies the fixed four-factor postprocess formula and shadow Selectors; '
+            'full applies the selected static/dynamic rerank and shadow Selectors; '
             'materialize is Stage A and writes candidate pools/component features only'
         ),
     )
     parser.add_argument('--run_per_subquery_postprocess', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--run_deep_event_postprocess', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--run_deep_merged_postprocess', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--graph_method', choices=['citations', 'references', 'citations_references'], default='citations_references')
     parser.add_argument('--graph_expansion_limit', type=int, default=100)
     parser.add_argument('--graph_cache_dir', default='cache/s2_graph_oracle')
     parser.add_argument('--graph_rate_limit_rps', type=float, default=4.0)
     parser.add_argument('--graph_offline_cache_only', action='store_true')
+    parser.add_argument(
+        '--dynamic_rerank',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Generate one query-conditioned policy for all OnePass graph events; '
+            'disabled by default to preserve the static baseline'
+        ),
+    )
+    parser.add_argument('--rerank_policy_model', default=None)
+    parser.add_argument(
+        '--rerank_policy_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        '--rerank_policy_cache',
+        default='cache/dynamic_rerank/onepass_query_policies.jsonl',
+    )
+    parser.add_argument('--rerank_retry_cached_fallbacks', action='store_true')
+    parser.add_argument('--rerank_min_confidence', type=float, default=DEFAULT_MIN_CONFIDENCE)
+    parser.add_argument(
+        '--rerank_semantic_min_mass',
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_MASS,
+    )
+    parser.add_argument('--rerank_negative_weight', type=float, default=DEFAULT_NEGATIVE_WEIGHT)
+    parser.add_argument(
+        '--rerank_max_negative_mass',
+        type=float,
+        default=DEFAULT_MAX_NEGATIVE_MASS,
+    )
+    parser.add_argument(
+        '--paper_type_backend',
+        choices=['s2', 'qwen'],
+        default='s2',
+        help='Candidate paper-type evidence provider used by dynamic rerank',
+    )
+    parser.add_argument(
+        '--paper_type_cache',
+        default=None,
+        help='Backend-specific append-only cache; defaults to onepass_paper_types_<backend>.jsonl',
+    )
+    parser.add_argument('--paper_type_rate_limit_rps', type=float, default=1.0)
+    parser.add_argument('--paper_type_qwen_model', default=None)
+    parser.add_argument(
+        '--paper_type_qwen_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--paper_type_qwen_batch_size', type=int, default=16)
+    parser.add_argument(
+        '--paper_type_offline_cache_only',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument('--embedding_base_url', default=None, help='Ollama URL for baseline dense retrieval/reranking')
     parser.add_argument('--qdrant_url', default=None)
     parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
@@ -762,6 +826,10 @@ def main():
     parser.add_argument('--allow_resume_compatible_code_change', action='store_true', help='Resume an audited result-preserving implementation upgrade when all recorded semantic settings match')
 
     args = parser.parse_args()
+    if args.paper_type_qwen_batch_size <= 0:
+        parser.error('--paper_type_qwen_batch_size must be positive')
+    if args.dynamic_rerank and args.postprocess_stage != 'full':
+        parser.error('--dynamic_rerank requires --postprocess_stage full')
     
     # Load config from custom path if specified
     cfg = config
@@ -826,11 +894,12 @@ def main():
     config.DEBUG = False
     any_shadow = (
         args.run_per_subquery_postprocess
-        or args.run_deep_event_postprocess
         or args.run_deep_merged_postprocess
     )
-    if (args.run_deep_event_postprocess or args.run_deep_merged_postprocess) and not args.run_per_subquery_postprocess:
+    if args.run_deep_merged_postprocess and not args.run_per_subquery_postprocess:
         raise ValueError('Deep shadows require --run_per_subquery_postprocess because graph local-pool sizes define their budgets')
+    if args.dynamic_rerank and not args.run_per_subquery_postprocess:
+        raise ValueError('--dynamic_rerank requires --run_per_subquery_postprocess')
     if any_shadow and browser_mode != 'NONE':
         raise ValueError('One-pass replay postprocessors currently require --browser_mode NONE')
     if any_shadow and getattr(cfg, 'ENABLE_SUMMARIZATION', False):
@@ -843,7 +912,12 @@ def main():
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
     label_suffix = f"_{args.run_label}" if args.run_label else ''
     stage_suffix = '_stage-materialize' if args.postprocess_stage == 'materialize' else ''
-    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{stage_suffix}{label_suffix}")
+    rerank_suffix = (
+        f'_dynamic-rerank-v1_type-{args.paper_type_backend}'
+        if args.dynamic_rerank
+        else '_static-rerank'
+    )
+    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{stage_suffix}{rerank_suffix}{label_suffix}")
     os.makedirs(current_output_dir, exist_ok=True)
 
     source_config = args.config if args.config else config.__file__
@@ -869,10 +943,40 @@ def main():
         if search_method == 'vector'
         else None
     )
+    rerank_policy_model = (
+        args.rerank_policy_model
+        or os.environ.get('SCHOLARGYM_MODEL')
+        or llm_model
+    )
+    rerank_policy_is_local = (
+        args.rerank_policy_is_local
+        if args.rerank_policy_is_local is not None
+        else is_local
+    )
+    paper_type_offline = (
+        args.paper_type_offline_cache_only
+        if args.paper_type_offline_cache_only is not None
+        else args.graph_offline_cache_only
+    )
+    paper_type_cache = args.paper_type_cache or (
+        f'cache/dynamic_rerank/onepass_paper_types_{args.paper_type_backend}.jsonl'
+    )
+    paper_type_qwen_model = (
+        args.paper_type_qwen_model
+        or os.environ.get('SCHOLARGYM_MODEL')
+        or llm_model
+    )
+    paper_type_qwen_is_local = (
+        args.paper_type_qwen_is_local
+        if args.paper_type_qwen_is_local is not None
+        else is_local
+    )
     package_source_files = [
-        'api.py', 'config.py', 'deeprag.py', 'eval.py', 'graph_methods.py',
-        'metrics.py', 'deep_retrieval.py', 'onepass_postprocess.py', 'prompt.py',
-        'rag.py', 'simplerag.py', 'structures.py', 'utils.py',
+        'api.py', 'config.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
+        'graph_methods.py', 'metrics.py', 'deep_retrieval.py',
+        'online_paper_type.py', 'onepass_postprocess.py', 'paper_type.py',
+        'prompt.py', 'rag.py', 'rerank_skill.py', 'simplerag.py',
+        'structures.py', 'utils.py',
         os.path.join('agent', 'browser.py'),
         os.path.join('agent', 'planner.py'),
         os.path.join('agent', 'selector.py'),
@@ -882,7 +986,7 @@ def main():
     package_hash = package_source_sha256(package_source_files)
     run_signature_payload = {
         'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
-        'artifact_schema_version': '1.3',
+        'artifact_schema_version': '1.4',
         'package_source_sha256': package_hash,
         'config': file_identity(source_config, include_sha256=True),
         'benchmark': file_identity(benchmark_jsonl, include_sha256=True),
@@ -922,25 +1026,85 @@ def main():
             else 'skip_query_before_workflow'
         ),
         'run_per_subquery_postprocess': args.run_per_subquery_postprocess,
-        'run_deep_event_postprocess': args.run_deep_event_postprocess,
         'run_deep_merged_postprocess': args.run_deep_merged_postprocess,
         'graph_method': args.graph_method,
         'graph_expansion_limit': args.graph_expansion_limit,
+        'graph_rate_limit_rps': args.graph_rate_limit_rps,
         'graph_cache_dir': os.path.realpath(args.graph_cache_dir),
         'graph_offline_cache_only': args.graph_offline_cache_only,
+        'dynamic_rerank_requested': args.dynamic_rerank,
+        'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+        'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+        'rerank_policy_cache': (
+            os.path.realpath(args.rerank_policy_cache)
+            if args.dynamic_rerank
+            else None
+        ),
+        'rerank_retry_cached_fallbacks': (
+            args.rerank_retry_cached_fallbacks if args.dynamic_rerank else None
+        ),
+        'rerank_min_confidence': (
+            args.rerank_min_confidence if args.dynamic_rerank else None
+        ),
+        'rerank_semantic_min_mass': (
+            args.rerank_semantic_min_mass if args.dynamic_rerank else None
+        ),
+        'rerank_negative_weight': (
+            args.rerank_negative_weight if args.dynamic_rerank else None
+        ),
+        'rerank_max_negative_mass': (
+            args.rerank_max_negative_mass if args.dynamic_rerank else None
+        ),
+        'paper_type_backend': (
+            args.paper_type_backend if args.dynamic_rerank else None
+        ),
+        'paper_type_cache': (
+            os.path.realpath(paper_type_cache) if args.dynamic_rerank else None
+        ),
+        'paper_type_offline_cache_only': (
+            paper_type_offline if args.dynamic_rerank else None
+        ),
+        'paper_type_rate_limit_rps': (
+            args.paper_type_rate_limit_rps
+            if args.dynamic_rerank and args.paper_type_backend == 's2'
+            else None
+        ),
+        'paper_type_qwen_model': (
+            paper_type_qwen_model
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'paper_type_qwen_is_local': (
+            paper_type_qwen_is_local
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'paper_type_qwen_batch_size': (
+            args.paper_type_qwen_batch_size
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+        'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
         'feature_weights_applied': (
             dict(DEFAULT_FEATURE_WEIGHTS)
-            if args.postprocess_stage == 'full'
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
             else None
         ),
         'rerank_formula_id': (
-            RERANK_FORMULA_ID if args.postprocess_stage == 'full' else None
+            (
+                POLICY_VERSION
+                if args.dynamic_rerank
+                else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
         ),
         'materialized_feature_names': {
             'graph': [
                 'query_score_raw', 'query_score_normalized', 'query_component_rank',
                 'subquery_score_raw', 'subquery_score_normalized', 'subquery_component_rank',
-                'intent_score', 'path_count', 'path_count_normalized',
+                'intent_labels', 'intent_score', 'path_count', 'path_count_normalized',
             ],
             'deep': [
                 'deep_retrieval_score_raw', 'deep_retrieval_rank_global_date_valid',
@@ -1046,6 +1210,36 @@ def main():
         offline=args.graph_offline_cache_only,
     )
     scoring_backend = 'embedding' if search_method == 'vector' else 'bm25'
+    rerank_skill = None
+    paper_type_resolver = None
+    if args.dynamic_rerank:
+        if args.paper_type_backend == 's2':
+            paper_type_resolver = S2PublicationTypeResolver(
+                paper_type_cache,
+                requests_per_second=args.paper_type_rate_limit_rps,
+                offline=paper_type_offline,
+            )
+        else:
+            paper_type_resolver = QwenPaperTypeResolver(
+                paper_type_cache,
+                paper_db_index,
+                paper_type_qwen_model,
+                is_local=paper_type_qwen_is_local,
+                batch_size=args.paper_type_qwen_batch_size,
+                offline=paper_type_offline,
+            )
+        rerank_skill = RerankSkill(
+            rerank_policy_model,
+            is_local=rerank_policy_is_local,
+            policy_cache_path=args.rerank_policy_cache,
+            retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
+            paper_type_cache=paper_type_resolver.snapshot_cache(),
+            paper_type_backend=args.paper_type_backend,
+            min_confidence=args.rerank_min_confidence,
+            semantic_min_mass=args.rerank_semantic_min_mass,
+            negative_weight=args.rerank_negative_weight,
+            max_negative_mass=args.rerank_max_negative_mass,
+        )
     per_subquery_processor = PerSubqueryProcessor(
         paper_db_index,
         s2_client,
@@ -1053,6 +1247,8 @@ def main():
         embedding_provider=postprocess_embedding_provider,
         expansion_method=args.graph_method,
         expansion_limit=args.graph_expansion_limit,
+        rerank_skill=rerank_skill,
+        paper_type_resolver=paper_type_resolver,
     )
     deep_retrieval_processor = DeepRetrievalProcessor(
         rag_system,
@@ -1070,7 +1266,6 @@ def main():
         scoring_backend=scoring_backend,
         embedding_provider=postprocess_embedding_provider,
         run_per_subquery=args.run_per_subquery_postprocess,
-        run_deep_event=args.run_deep_event_postprocess,
         run_deep_merged=args.run_deep_merged_postprocess,
         postprocess_stage=args.postprocess_stage,
         run_id=os.path.basename(current_output_dir),
@@ -1081,7 +1276,7 @@ def main():
         'upstream_repository': 'https://github.com/shenhao-stu/ScholarGym.git',
         'baseline_commit_mirror': 'https://github.com/qyx687/ScholarGym.git@baseline-repro',
         'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
-        'artifact_schema_version': '1.3',
+        'artifact_schema_version': '1.4',
         'artifact_write_mode': 'query_staging_then_flat_jsonl_commit',
         'artifact_checkpoint_source': 'detailed_results.jsonl',
         'package_source_sha256': package_hash,
@@ -1101,9 +1296,16 @@ def main():
             if args.postprocess_stage == 'materialize'
             else 'skip_query_before_workflow'
         ),
-        'legacy_rerank_applied': args.postprocess_stage == 'full',
+        'legacy_rerank_applied': (
+            args.postprocess_stage == 'full' and not args.dynamic_rerank
+        ),
+        'dynamic_rerank_requested': args.dynamic_rerank,
         'rerank_formula_id': (
-            RERANK_FORMULA_ID if args.postprocess_stage == 'full' else None
+            (
+                POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
         ),
         'shadow_selector_applied': args.postprocess_stage == 'full',
         'config_path': args.config,
@@ -1140,16 +1342,75 @@ def main():
         'graph_expansion_limit': args.graph_expansion_limit,
         'graph_rate_limit_rps': args.graph_rate_limit_rps,
         'graph_offline_cache_only': args.graph_offline_cache_only,
+        'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+        'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+        'rerank_policy_cache': (
+            args.rerank_policy_cache if args.dynamic_rerank else None
+        ),
+        'rerank_min_confidence': (
+            args.rerank_min_confidence if args.dynamic_rerank else None
+        ),
+        'rerank_semantic_min_mass': (
+            args.rerank_semantic_min_mass if args.dynamic_rerank else None
+        ),
+        'rerank_negative_weight': (
+            args.rerank_negative_weight if args.dynamic_rerank else None
+        ),
+        'rerank_max_negative_mass': (
+            args.rerank_max_negative_mass if args.dynamic_rerank else None
+        ),
+        'paper_type_backend': (
+            args.paper_type_backend if args.dynamic_rerank else None
+        ),
+        'paper_type_evidence_source': getattr(
+            paper_type_resolver, 'evidence_source', None
+        ),
+        'paper_type_classifier_version': getattr(
+            paper_type_resolver, 'classifier_version', None
+        ),
+        'paper_type_supported_types': list(
+            getattr(paper_type_resolver, 'supported_types', ()) or ()
+        ),
+        'paper_type_cache': paper_type_cache if args.dynamic_rerank else None,
+        'paper_type_offline_cache_only': (
+            paper_type_offline if args.dynamic_rerank else None
+        ),
+        'paper_type_qwen_model': (
+            paper_type_qwen_model
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'paper_type_qwen_is_local': (
+            paper_type_qwen_is_local
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'paper_type_qwen_batch_size': (
+            args.paper_type_qwen_batch_size
+            if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+            else None
+        ),
+        'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+        'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
         'date_policy': 'seeds_trust_retriever_expanded_require_db_date_lte_cutoff',
-        'deep_date_policy': 'retrieved_papers_require_nonmissing_date_lte_subquery_cutoff',
+        'deep_date_policy': (
+            'retrieved_papers_require_nonmissing_date_lte_subquery_cutoff'
+            if args.run_deep_merged_postprocess
+            else None
+        ),
         'run_per_subquery_postprocess': args.run_per_subquery_postprocess,
-        'run_deep_event_postprocess': args.run_deep_event_postprocess,
         'run_deep_merged_postprocess': args.run_deep_merged_postprocess,
-        'deep_event_budget': 'matching per-subquery graph local-pool size per retrieval event',
-        'deep_merged_budget': 'sum of matching graph local-pool sizes for stable subquery_id',
+        'deep_merged_budget': (
+            'sum of matching graph local-pool sizes for stable subquery_id'
+            if args.run_deep_merged_postprocess
+            else None
+        ),
         'deep_rerank_graph_features': (
             {'intent_score': 0.0, 'path_count_normalized': 0.0}
-            if args.postprocess_stage == 'full'
+            if (
+                args.postprocess_stage == 'full'
+                and args.run_deep_merged_postprocess
+            )
             else None
         ),
         'results_per_query': results_per_query,
@@ -1157,7 +1418,7 @@ def main():
         'limit': args.limit,
         'feature_weights_applied': (
             per_subquery_processor.weights
-            if args.postprocess_stage == 'full'
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
             else None
         ),
         'materialized_feature_names': run_signature_payload['materialized_feature_names'],
@@ -1196,28 +1457,54 @@ def main():
         'PACKAGE_METHOD': (
             'onepass_stage_a_pool_feature_materialization'
             if args.postprocess_stage == 'materialize'
-            else 'onepass_baseline_q030_sq040_intent015_path015_graph_rerank_with_two_deep_controls'
+            else (
+                (
+                    'onepass_query_conditioned_graph_rerank_with_deep_merged_control'
+                    if args.run_deep_merged_postprocess
+                    else 'onepass_query_conditioned_graph_rerank'
+                )
+                if args.dynamic_rerank
+                else (
+                    'onepass_static_graph_rerank_with_deep_merged_control'
+                    if args.run_deep_merged_postprocess
+                    else 'onepass_static_graph_rerank'
+                )
+            )
         ),
         'POSTPROCESS_STAGE': args.postprocess_stage,
         'ARTIFACT_WRITE_MODE': 'query_staging_then_flat_jsonl_commit',
         'SAVE_LEVEL': args.save_level,
         'RUN_PER_SUBQUERY_POSTPROCESS': args.run_per_subquery_postprocess,
-        'RUN_DEEP_EVENT_POSTPROCESS': args.run_deep_event_postprocess,
         'RUN_DEEP_MERGED_POSTPROCESS': args.run_deep_merged_postprocess,
+        'DYNAMIC_RERANK': args.dynamic_rerank,
+        'PAPER_TYPE_BACKEND': (
+            args.paper_type_backend if args.dynamic_rerank else None
+        ),
+        'PAPER_TYPE_CACHE': paper_type_cache if args.dynamic_rerank else None,
+        'RERANK_POLICY_CACHE': (
+            args.rerank_policy_cache if args.dynamic_rerank else None
+        ),
         'GRAPH_METHOD': args.graph_method,
         'GRAPH_EXPANSION_LIMIT': args.graph_expansion_limit,
         'GRAPH_RATE_LIMIT_RPS': args.graph_rate_limit_rps,
         'RERANK_FORMULA_ID': (
-            RERANK_FORMULA_ID if args.postprocess_stage == 'full' else None
+            (
+                POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
         ),
         'DEEP_RERANK_FEATURE_WEIGHTS': (
             deep_retrieval_processor.weights
-            if args.postprocess_stage == 'full'
+            if (
+                args.postprocess_stage == 'full'
+                and args.run_deep_merged_postprocess
+            )
             else None
         ),
         'RERANK_FEATURE_WEIGHTS': (
             per_subquery_processor.weights
-            if args.postprocess_stage == 'full'
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
             else None
         ),
         'MATERIALIZED_FEATURE_NAMES': run_signature_payload['materialized_feature_names'],

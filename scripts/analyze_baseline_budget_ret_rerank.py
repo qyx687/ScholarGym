@@ -1846,7 +1846,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             f"path override events do not match replayed Graph events: "
             f"overrides={len(path_overrides)}, graph={len(graph_events)}"
         )
-    deep_events = replay_deep_merged(
+    merged_events = replay_deep_merged(
         artifact_dir / "deep_merged" / "pool_records.jsonl",
         budgets,
         selections,
@@ -1864,10 +1864,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             f"Graph event coverage mismatch: missing={len(budget_events - graph_events)} "
             f"extra={len(graph_events - budget_events)}"
         )
-    if deep_events != budget_events:
+    if merged_events != budget_events:
         raise ValueError(
-            f"Deep merged event coverage mismatch: missing={len(budget_events - deep_events)} "
-            f"extra={len(deep_events - budget_events)}"
+            f"Deep merged event coverage mismatch: missing={len(budget_events - merged_events)} "
+            f"extra={len(merged_events - budget_events)}"
         )
     validate_stored_query_results(artifact_dir, selections)
 

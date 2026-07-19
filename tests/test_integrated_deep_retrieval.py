@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from deep_retrieval import DeepRetrievalProcessor
+from deep_retrieval import DEEP_MERGED_METHOD, DeepRetrievalProcessor
 
 
 class FakeDocument:
@@ -120,6 +120,64 @@ def test_bm25_deep_retrieval_matches_baseline_exclusion_before_offset_order():
 
     assert [row["paper_arxiv_id"] for row in pools["first"]] == ids[:3]
     assert [row["paper_arxiv_id"] for row in pools["continue"]] == ids[3:5]
+
+
+def test_prepare_pools_builds_only_one_sum_budget_pool_per_stable_subquery():
+    ids = [f"2001.0000{index}" for index in range(1, 6)]
+    rag = SimpleNamespace(
+        bm25_index=FixedScores(range(len(ids), 0, -1)),
+        bm25_index_to_id=dict(enumerate(ids)),
+        paper_metadata={
+            paper_id: {
+                "arxiv_id": paper_id,
+                "date": "2001-01",
+                "title": paper_id,
+                "abstract": "body",
+            }
+            for paper_id in ids
+        },
+        _preprocess_text_for_bm25=lambda _text: ["query"],
+    )
+    processor = DeepRetrievalProcessor(
+        rag, {}, scoring_backend="bm25", embedding_provider=None
+    )
+    graph_events = [
+        {
+            "event": {
+                "subquery_id": 7,
+                "subquery": "stable subquery",
+                "subquery_before_date": "2001-12",
+                "retrieval_event_id": "event-1",
+                "retrieval_exclusion_arxiv_ids": [ids[0]],
+            },
+            "rows": [
+                {"paper_arxiv_id": "graph-a"},
+                {"paper_arxiv_id": "graph-b"},
+            ],
+            "top_rows": [],
+        },
+        {
+            "event": {
+                "subquery_id": 7,
+                "subquery": "stable subquery",
+                "subquery_before_date": "2001-12",
+                "retrieval_event_id": "event-2",
+                "retrieval_offset": 99,
+                "retrieval_exclusion_arxiv_ids": [ids[1]],
+            },
+            "rows": [{"paper_arxiv_id": "graph-c"}],
+            "top_rows": [],
+        },
+    ]
+
+    prepared = processor.prepare_pools(graph_events)
+
+    merged_key = (DEEP_MERGED_METHOD, "7")
+    assert set(prepared["pools"]) == {merged_key}
+    assert [row["paper_arxiv_id"] for row in prepared["pools"][merged_key]] == ids[1:4]
+    assert prepared["diagnostics"][merged_key]["requested_count"] == 3
+    assert prepared["groups"][0]["source_graph_pool_occurrence_budget"] == 3
+    assert prepared["groups"][0]["frozen_first_event_exclusion_arxiv_ids"] == [ids[0]]
 
 
 def test_integrated_deep_rerank_uses_four_factor_formula_with_zero_graph_features():

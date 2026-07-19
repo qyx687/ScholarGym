@@ -58,4 +58,3 @@ def test_provenance_retention_uses_original_pool_sources_not_ret_membership(tmp_
     assert by_partition["graph_only"]["retained_gt_count"] == 1
     assert by_partition["deep_merged_only"]["retained_candidate_count"] == 1
     assert by_partition["deep_merged_only"]["retained_gt_count"] == 1
-

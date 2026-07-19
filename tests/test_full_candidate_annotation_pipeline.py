@@ -79,13 +79,6 @@ def _prepare_fixture(tmp_path):
         ],
     )
     _write_jsonl(
-        run_dir / MODULE.SOURCE_PATHS["deep_event"],
-        [
-            _base_row("p-deep", source_fields={"deep_retrieval_rank_after_exclusion": 1}),
-            _base_row("p-overlap", source_fields={"deep_retrieval_rank_after_exclusion": 2}),
-        ],
-    )
-    _write_jsonl(
         run_dir / MODULE.SOURCE_PATHS["deep_merged"],
         [_base_row("p-deep", source_fields={"deep_retrieval_rank_after_exclusion": 1})],
     )
@@ -182,8 +175,7 @@ def test_prepare_deduplicates_sources_and_blinds_codex_inputs(tmp_path):
 
     assert summary["candidate_count"] == 4
     assert summary["partition_counts"] == {
-        "graph_only": 2,
-        "graph_and_deep": 1,
+        "graph_only": 3,
         "deep_only": 1,
     }
     assert summary["metadata_missing_count"] == 1
@@ -192,8 +184,8 @@ def test_prepare_deduplicates_sources_and_blinds_codex_inputs(tmp_path):
 
     candidates = list(MODULE._iter_jsonl(work_dir / "manifest" / "candidates.jsonl"))
     overlap = next(row for row in candidates if row["paper_id"] == "p-overlap")
-    assert overlap["sources"] == ["baseline", "deep_event", "graph"]
-    assert overlap["source_partition"] == "graph_and_deep"
+    assert overlap["sources"] == ["baseline", "graph"]
+    assert overlap["source_partition"] == "graph_only"
 
     jobs = list(MODULE._iter_jsonl(work_dir / "manifest" / "candidate_jobs.jsonl"))
     blinded = MODULE._load_json(work_dir / jobs[0]["input_path"])
@@ -204,7 +196,7 @@ def test_prepare_deduplicates_sources_and_blinds_codex_inputs(tmp_path):
     assert "p-graph" not in serialized
 
     occurrences = list(MODULE._iter_jsonl(work_dir / "manifest" / "occurrences.jsonl"))
-    assert len(occurrences) == 7
+    assert len(occurrences) == 5
     assert {row["source"] for row in occurrences} == set(MODULE.DEFAULT_SOURCES)
 
 
@@ -291,7 +283,7 @@ def test_aggregate_reconnects_blind_labels_to_source_groups(tmp_path):
     assert result["automatic_insufficient_metadata_count"] == 1
     by_group = {row["group"]: row for row in result["source_comparison"]}
     assert by_group["source:graph"]["candidate_count"] == 3
-    assert by_group["source:deep_any"]["candidate_count"] == 2
+    assert by_group["source:deep_any"]["candidate_count"] == 1
     assert by_group["partition:graph_only"]["ground_truth_count"] == 1
     assert (work_dir / "analysis" / "annotations.jsonl").exists()
     annotations = list(MODULE._iter_jsonl(work_dir / "analysis" / "annotations.jsonl"))

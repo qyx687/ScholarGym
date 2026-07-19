@@ -505,6 +505,9 @@ class PaperTypeClassifier:
             f"Allowed types: {', '.join(PAPER_TYPES)}\n"
             "Return one JSON array only. Each item must contain exactly "
             "paper_arxiv_id, type_probs, confidence, and classifier_version. "
+            "type_probs must contain every allowed type exactly once; do not "
+            "omit types with probability 0. "
+            f"classifier_version must be {self.classifier_version}. "
             "All probabilities and confidence values must be in [0, 1].\n\n"
             "Papers:\n"
             + json.dumps(payload, ensure_ascii=False)
@@ -518,7 +521,41 @@ class PaperTypeClassifier:
             value = single.get("papers") if isinstance(single, Mapping) else None
         if not isinstance(value, list):
             raise ValueError("paper-type response must be a JSON array")
-        records = [validate_type_record(item) for item in value if isinstance(item, Mapping)]
+        records = []
+        model_keys = {
+            "paper_arxiv_id",
+            "type_probs",
+            "confidence",
+            "classifier_version",
+        }
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            if set(item) != model_keys:
+                raise ValueError(
+                    "paper-type response items must contain exactly "
+                    f"{sorted(model_keys)}"
+                )
+            raw_probs = item.get("type_probs")
+            if not isinstance(raw_probs, Mapping) or set(raw_probs) != set(PAPER_TYPES):
+                raise ValueError(
+                    "Qwen type_probs must contain exactly every canonical paper type"
+                )
+            # Provider provenance is controlled by the caller, never trusted
+            # from model-generated text. Qwen is a closed-world classifier over
+            # the full canonical taxonomy, so it supplies both positive and
+            # negative evidence for every catalog type.
+            normalized = dict(item)
+            normalized.update(
+                {
+                    "classifier_version": self.classifier_version,
+                    "evidence_source": QWEN_EVIDENCE_SOURCE,
+                    "publication_types": [],
+                    "supported_types": list(PAPER_TYPES),
+                    "negative_evidence_types": list(PAPER_TYPES),
+                }
+            )
+            records.append(validate_type_record(normalized))
         expected = set(expected_ids)
         actual = {record["paper_arxiv_id"] for record in records}
         if actual != expected or len(actual) != len(records):
@@ -526,8 +563,6 @@ class PaperTypeClassifier:
                 f"paper-type response IDs mismatch: missing={sorted(expected - actual)}, "
                 f"extra={sorted(actual - expected)}"
             )
-        for record in records:
-            record["classifier_version"] = self.classifier_version
         return records
 
     def classify_batch(self, papers: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:

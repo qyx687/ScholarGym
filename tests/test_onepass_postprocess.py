@@ -19,6 +19,7 @@ from graph_methods import (
     QueryScopedEmbeddingCache,
 )
 from onepass_postprocess import OnePassPostprocessor, aggregate_postprocess_metrics
+from rerank_skill import RerankSkill
 
 
 class FakeS2:
@@ -232,6 +233,114 @@ def test_graph_events_and_selectors_are_bounded_concurrent_with_stable_artifact_
     assert [row["retrieval_event_id"] for row in selector_records] == expected_order
 
 
+def test_onepass_dynamic_policy_is_built_once_and_recorded_for_all_events(tmp_path):
+    calls = []
+
+    def policy_llm(prompt, *args, **kwargs):
+        calls.append(prompt)
+        return json.dumps(
+            {
+                "policy_version": "dynamic_rerank_v1",
+                "query_intent": "method_search",
+                "weight_levels": {
+                    "query_similarity": "high",
+                    "subquery_similarity": "very_high",
+                    "intent_background": "off",
+                    "intent_method": "medium",
+                    "intent_result": "off",
+                    "path_count": "low",
+                    "paper_type_alignment": "off",
+                },
+                "paper_type_rules": [],
+                "confidence": 0.95,
+            }
+        )
+
+    paper_db = {
+        "2001.00001": {
+            "title": "seed",
+            "abstract": "graph retrieval",
+            "date": "2001-01",
+        },
+        "2001.00003": {
+            "title": "expanded",
+            "abstract": "method graph",
+            "date": "2001-03",
+        },
+    }
+    processor = PerSubqueryProcessor(
+        paper_db,
+        FakeS2(),
+        scoring_backend="bm25",
+        embedding_provider=None,
+        rerank_skill=RerankSkill("qwen-test", llm_call=policy_llm),
+    )
+    event_base = {
+        "query_id": "q-dynamic",
+        "benchmark_idx": 0,
+        "query": "find graph retrieval methods",
+        "query_date": "2002-01",
+        "subquery_id": 1,
+        "subquery": "graph method",
+        "subquery_before_date": "2002-01",
+        "subquery_target_k": 1,
+        "retrieval_page_idx": 1,
+        "retrieval_offset": 0,
+        "selector_top_k": 1,
+        "planner_checklist": "find methods",
+        "retrieval_exclusion_arxiv_ids": [],
+        "seed_papers": [
+            {
+                "paper_arxiv_id": "2001.00001",
+                "observed_retrieval_score": 1.0,
+                "observed_retrieval_rank": 1,
+            }
+        ],
+        "baseline_selected_arxiv_ids": [],
+    }
+    events = [
+        {**event_base, "retrieval_event_id": "q-dynamic:event-1"},
+        {
+            **event_base,
+            "retrieval_event_id": "q-dynamic:event-2",
+            "retrieval_page_idx": 2,
+        },
+    ]
+    manager = OnePassPostprocessor(
+        selector=FakeSelector(),
+        paper_db=paper_db,
+        writer=ArtifactWriter(str(tmp_path), "full"),
+        s2_client=processor.s2,
+        per_subquery_processor=processor,
+        deep_retrieval_processor=None,
+        scoring_backend="bm25",
+        embedding_provider=None,
+        run_per_subquery=True,
+        event_workers=2,
+    )
+
+    result = manager.process_query(
+        {"query": "find graph retrieval methods", "date": "2002-01"},
+        [],
+        events,
+        set(),
+    )
+
+    assert len(calls) == 1
+    assert result["per_subquery"]["dynamic_rerank_enabled"] is True
+    policy_rows = _read_jsonl(tmp_path / "query_rerank_policies.jsonl")
+    assert len(policy_rows) == 1
+    assert policy_rows[0]["dynamic_rerank_enabled"] is True
+    assert policy_rows[0]["formula_scope"] == (
+        "one_policy_per_original_query_all_events"
+    )
+    pool_rows = _read_jsonl(tmp_path / "per_subquery/pool_records.jsonl")
+    assert {row["rerank_policy_id"] for row in pool_rows} == {
+        policy_rows[0]["rerank_policy_id"]
+    }
+    assert all(row["dynamic_rerank_enabled"] for row in pool_rows)
+
+
 def test_dense_graph_concurrency_keeps_postprocess_embedding_calls_serial(tmp_path):
     class TrackingEmbeddingProvider:
         def __init__(self):
@@ -396,7 +505,7 @@ def test_graph_shadow_uses_frozen_baseline_exclusion_for_expanded_candidates():
         assert stats["previously_selected_count"] == 1
 
 
-def test_per_subquery_selector_failure_does_not_block_independent_deep_arms():
+def test_per_subquery_selector_failure_does_not_block_deep_merged_arm():
     paper_db = {
         "2001.00001": {"title": "seed", "abstract": "graph query", "date": "2001-01"},
         "2001.00003": {"title": "expanded", "abstract": "graph query", "date": "2001-03"},
@@ -444,7 +553,6 @@ def test_per_subquery_selector_failure_does_not_block_independent_deep_arms():
             scoring_backend="bm25",
             embedding_provider=None,
             run_per_subquery=True,
-            run_deep_event=True,
             run_deep_merged=True,
         )
         result = manager.process_query(
@@ -453,11 +561,10 @@ def test_per_subquery_selector_failure_does_not_block_independent_deep_arms():
 
     assert result["per_subquery"]["selector_failed_events"] == 1
     assert result["per_subquery"]["error"]
-    assert "error" not in result["deep_event"]
     assert "error" not in result["deep_merged"]
 
 
-def test_one_query_reuses_baseline_and_runs_graph_plus_both_deep_controls():
+def test_one_query_reuses_baseline_and_runs_graph_plus_deep_merged_control():
     paper_db = {
         "2001.00001": {"title": "seed one", "abstract": "graph query", "date": "2001-01"},
         "2001.00002": {"title": "seed two", "abstract": "retrieval", "date": "2001-02"},
@@ -484,7 +591,6 @@ def test_one_query_reuses_baseline_and_runs_graph_plus_both_deep_controls():
             scoring_backend="bm25",
             embedding_provider=None,
             run_per_subquery=True,
-            run_deep_event=True,
             run_deep_merged=True,
         )
         base = {
@@ -534,17 +640,15 @@ def test_one_query_reuses_baseline_and_runs_graph_plus_both_deep_controls():
             },
         ]
         result = manager.process_query({"query": "graph query", "date": "2002-01"}, [], events, {"2001.00003"})
-        assert set(result) >= {"baseline", "per_subquery", "deep_event", "deep_merged"}
+        assert set(result) >= {"baseline", "per_subquery", "deep_merged"}
         assert "global" not in result
-        assert result["deep_event"]["event_count"] == 2
+        assert result["deep_merged"]["event_count"] == 2
         assert result["deep_merged"]["subquery_group_count"] == 2
         assert deep_processor.max_active >= 2
         assert [(sq.target_k, sq.link_type) for sq in fake_selector.subqueries[:2]] == [(7, "derive"), (8, "expand")]
-        pool_records = _read_jsonl(Path(tmp) / "deep_event/pool_records.jsonl")
+        pool_records = _read_jsonl(Path(tmp) / "deep_merged/pool_records.jsonl")
         assert len(pool_records) == 2
-        assert [row["retrieval_event_id"] for row in pool_records] == [
-            event["retrieval_event_id"] for event in events
-        ]
+        assert [row["subquery_id"] for row in pool_records] == [1, 2]
         for record in pool_records:
             assert record["deep_pool_rows"]
             assert {
@@ -553,11 +657,13 @@ def test_one_query_reuses_baseline_and_runs_graph_plus_both_deep_controls():
                 "deep_retrieval_rank_in_local_pool",
                 "rerank_score",
                 "rerank_rank",
-                "source_graph_rerank_score",
-                "source_graph_rerank_rank",
+                "source_graph_event_features",
             } <= set(record["deep_pool_rows"][0])
-        comparisons = _read_jsonl(Path(tmp) / "deep_event/comparisons.jsonl")
-        assert all("pool_comparison" in row and "topk_comparison" in row for row in comparisons)
+        comparisons = _read_jsonl(Path(tmp) / "deep_merged/comparisons.jsonl")
+        assert all(
+            "pool_comparison" in row and "all_slices_topk_comparison" in row
+            for row in comparisons
+        )
         assert not (Path(tmp) / "global").exists()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -571,18 +677,15 @@ def test_one_query_reuses_baseline_and_runs_graph_plus_both_deep_controls():
             scoring_backend="bm25",
             embedding_provider=None,
             run_per_subquery=True,
-            run_deep_event=True,
             run_deep_merged=True,
         )
         minimal_manager.process_query(
             {"query": "graph query", "date": "2002-01"}, [], events, {"2001.00003"}
         )
         assert (Path(tmp) / "per_subquery/pool_records.jsonl").exists()
-        assert (Path(tmp) / "deep_event/pool_records.jsonl").exists()
         assert (Path(tmp) / "deep_merged/pool_records.jsonl").exists()
-        assert (Path(tmp) / "deep_event/comparisons.jsonl").exists()
+        assert (Path(tmp) / "deep_merged/comparisons.jsonl").exists()
         assert not (Path(tmp) / "per_subquery/paper_rows.jsonl").exists()
-        assert not (Path(tmp) / "deep_event/paper_rows.jsonl").exists()
         assert not (Path(tmp) / "deep_merged/paper_rows.jsonl").exists()
 
 
@@ -658,7 +761,6 @@ def test_merged_deep_control_sends_continue_topk_as_sequential_disjoint_slices()
             scoring_backend="bm25",
             embedding_provider=None,
             run_per_subquery=True,
-            run_deep_event=True,
             run_deep_merged=True,
         )
         result = manager.process_query(
@@ -689,7 +791,7 @@ def test_merged_deep_control_sends_continue_topk_as_sequential_disjoint_slices()
         assert any(row["source_graph_event_features"] for row in merged_rows)
 
 
-def test_postprocess_metrics_aggregate_unique_queries_and_three_methods():
+def test_postprocess_metrics_aggregate_unique_queries_and_two_methods():
     stale = {
         "idx": 0,
         "postprocess_results": {
@@ -716,7 +818,7 @@ def test_postprocess_metrics_aggregate_unique_queries_and_three_methods():
                 "selection_recall": 0.5,
                 "selection_precision": 0.5,
             },
-            "deep_event": {"error": "selector failed"},
+            "deep_merged": {"error": "selector failed"},
         },
     }
     query_one = {
@@ -733,7 +835,7 @@ def test_postprocess_metrics_aggregate_unique_queries_and_three_methods():
                 "selection_recall": 1.0,
                 "selection_precision": 1.0,
             },
-            "deep_event": {
+            "deep_merged": {
                 "gt_count": 1,
                 "candidate_count": 3,
                 "selected_count": 1,
@@ -757,12 +859,11 @@ def test_postprocess_metrics_aggregate_unique_queries_and_three_methods():
     assert per_subquery["avg_candidate_precision"] == 0.375
     assert per_subquery["micro_candidate_recall"] == 2.0 / 3.0
     assert per_subquery["micro_selection_precision"] == 2.0 / 3.0
-    assert metrics["deep_event"]["evaluated_query_count"] == 1
-    assert metrics["deep_event"]["failed_query_count"] == 1
-    assert metrics["deep_merged"]["missing_query_count"] == 2
+    assert metrics["deep_merged"]["evaluated_query_count"] == 1
+    assert metrics["deep_merged"]["failed_query_count"] == 1
 
 
-def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(tmp_path):
+def test_stage_a_materializes_both_pools_without_legacy_rerank_or_selector(tmp_path):
     paper_db = {
         "2001.00001": {
             "title": "seed graph query",
@@ -832,7 +933,6 @@ def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(
         scoring_backend="bm25",
         embedding_provider=None,
         run_per_subquery=True,
-        run_deep_event=True,
         run_deep_merged=True,
         postprocess_stage="materialize",
     )
@@ -845,7 +945,7 @@ def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(
     )
 
     assert result["postprocess_stage"] == "materialize"
-    for method in ("per_subquery", "deep_event", "deep_merged"):
+    for method in ("per_subquery", "deep_merged"):
         assert result[method]["materialization_complete"] is True
         assert result[method]["legacy_rerank_applied"] is False
         assert result[method]["shadow_selector_applied"] is False
@@ -872,31 +972,24 @@ def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(
     } <= set(graph_row)
     assert not {"feature_weights", "rerank_score", "rerank_rank"} & set(graph_row)
 
-    deep_event_record = _read_jsonl(
-        tmp_path / "deep_event/pool_records.jsonl"
-    )[0]
-    deep_row = deep_event_record["deep_pool_rows"][0]
-    assert deep_event_record["deep_retrieval_order_arxiv_ids"] == [
-        row["paper_arxiv_id"] for row in deep_event_record["deep_pool_rows"]
-    ]
-    assert "deep_rerank_order_arxiv_ids" not in deep_event_record
-    assert "deep_selector_topk_arxiv_ids" not in deep_event_record
-    assert "deep_selected_arxiv_ids" not in deep_event_record
-    assert "feature_scorable" in deep_row
-    assert not {"feature_weights", "rerank_score", "rerank_rank"} & set(deep_row)
-
     merged_record = _read_jsonl(
         tmp_path / "deep_merged/pool_records.jsonl"
     )[0]
+    deep_row = merged_record["deep_pool_rows"][0]
+    assert merged_record["deep_retrieval_order_arxiv_ids"] == [
+        row["paper_arxiv_id"] for row in merged_record["deep_pool_rows"]
+    ]
     assert "selector_slices" not in merged_record
     assert "deep_rerank_order_arxiv_ids" not in merged_record
+    assert "feature_scorable" in deep_row
+    assert not {"feature_weights", "rerank_score", "rerank_rank"} & set(deep_row)
     assert merged_record["source_event_budgets"][0]["planner_checklist"] == (
         "retain methods"
     )
     assert merged_record["source_event_budgets"][0]["selector_top_k"] == 1
     assert merged_record["source_graph_pool_occurrence_budget"] == 2
 
-    for method in ("per_subquery", "deep_event", "deep_merged"):
+    for method in ("per_subquery", "deep_merged"):
         assert not (tmp_path / method / "selector_decisions.jsonl").exists()
 
     aggregate = aggregate_postprocess_metrics(
@@ -906,7 +999,7 @@ def test_stage_a_materializes_all_three_pools_without_legacy_rerank_or_selector(
     assert aggregate["per_subquery"]["materialized_query_count"] == 1
     assert aggregate["per_subquery"]["avg_pool_recall"] == 1.0
     assert aggregate["per_subquery"]["avg_candidate_recall"] is None
-    assert aggregate["deep_event"]["micro_selection_recall"] is None
+    assert aggregate["deep_merged"]["micro_selection_recall"] is None
 
 
 def test_stage_a_pool_aggregates_exclude_zero_gt_queries_without_dropping_artifacts():

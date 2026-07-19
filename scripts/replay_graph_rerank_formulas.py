@@ -138,7 +138,7 @@ def load_query_contexts(path: Path) -> Dict[str, QueryContext]:
         postprocess = row.get("postprocess_results") or {}
         baseline = postprocess.get("baseline") or {}
         graph = postprocess.get("per_subquery") or {}
-        deep = postprocess.get("deep_event") or {}
+        deep = postprocess.get("deep_merged") or {}
         required = {
             "baseline candidate IDs": baseline.get("candidate_arxiv_ids"),
             "graph candidate IDs": graph.get("candidate_arxiv_ids"),

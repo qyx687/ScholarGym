@@ -13,6 +13,8 @@ assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
+from dimension_catalog import PAPER_TYPES  # noqa: E402
+
 BUILD_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "build_paper_type_cache.py"
 BUILD_SPEC = importlib.util.spec_from_file_location("build_paper_type_cache", BUILD_SCRIPT_PATH)
 BUILD_MODULE = importlib.util.module_from_spec(BUILD_SPEC)
@@ -307,7 +309,10 @@ def test_paper_type_cache_builder_is_unique_batched_query_independent_and_resuma
             [
                 {
                     "paper_arxiv_id": paper["paper_arxiv_id"],
-                    "type_probs": {"primary_method": 0.9},
+                    "type_probs": {
+                        type_name: 0.9 if type_name == "primary_method" else 0.0
+                        for type_name in PAPER_TYPES
+                    },
                     "confidence": 0.95,
                     "classifier_version": "qwen30b_paper_type_v1",
                 }
@@ -452,7 +457,10 @@ def test_paper_type_cache_shards_exclude_base_and_merge_without_duplicates(tmp_p
             [
                 {
                     "paper_arxiv_id": paper["paper_arxiv_id"],
-                    "type_probs": {"primary_method": 0.9},
+                    "type_probs": {
+                        type_name: 0.9 if type_name == "primary_method" else 0.0
+                        for type_name in PAPER_TYPES
+                    },
                     "confidence": 0.95,
                     "classifier_version": "qwen30b_paper_type_v1",
                 }

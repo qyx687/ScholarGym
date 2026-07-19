@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
-"""Replay two BM25 deep-retrieval shadows on a completed legacy OnePass run.
+"""Replay the merged BM25 deep-retrieval shadow on a completed legacy OnePass run.
 
 Equivalent controls are now integrated into ``code/eval.py``; this standalone
 script remains useful for replaying already completed full-artifact runs.
-It freezes the committed baseline trajectory, uses the per-retrieval-event graph
-pool sizes only as retrieval budgets, and never calls Planner or Semantic
-Scholar.  The two independently selectable arms are:
-
-* event-offset matched: one deep pool and one rerank per baseline retrieval
-  event, using that event's exclusion snapshot and saved offset;
-* merged-subquery sum budget: one deep pool and one rerank per stable subquery
-  id, followed by chronological, disjoint top-k Selector slices.
+It freezes the committed baseline trajectory, sums the per-retrieval-event graph
+pool sizes into each stable-subquery retrieval budget, and never calls Planner
+or Semantic Scholar. One deep pool is reranked per stable subquery id, followed
+by chronological, disjoint top-k Selector slices.
 
 Paper text is used in memory for BM25 and Selector calls but is never emitted.
 """
@@ -42,11 +38,10 @@ from graph_methods import CandidateIndex, normalize_arxiv_id  # noqa: E402
 from structures import Paper, SubQuery  # noqa: E402
 
 
-EVENT_METHOD = "event_offset_matched_text_deep_retrieval"
 MERGED_METHOD = "merged_subquery_sum_budget_text_deep_retrieval"
-METHODS = (EVENT_METHOD, MERGED_METHOD)
+METHODS = (MERGED_METHOD,)
 SCHEMA_VERSION = "1.0-experimental"
-IMPLEMENTATION_VERSION = "1.3"
+IMPLEMENTATION_VERSION = "1.4"
 RERANK_FORMULA_ID = "q030_sq040_intent015_path015_closed_pool_minmax_v1"
 RERANK_FEATURE_WEIGHTS = {
     "query_score_normalized": 0.30,
@@ -1051,154 +1046,6 @@ def build_query_summary(
     return result
 
 
-async def build_event_method_output(
-    *,
-    context: Mapping[str, Any],
-    pools: Mapping[Any, Sequence[Mapping[str, Any]]],
-    retrieval_diagnostics: Mapping[Any, Mapping[str, Any]],
-    selector: Optional[Selector],
-    save_level: str,
-    run_signature: str,
-) -> Dict[str, Any]:
-    event_outputs: List[Dict[str, Any]] = []
-    paper_rows: List[Dict[str, Any]] = []
-    all_deep: List[str] = []
-    all_inputs: List[str] = []
-    all_selected: List[str] = []
-    all_source_graph: List[str] = []
-    deep_requested_occurrences = 0
-    deep_actual_occurrences = 0
-    rerankable_occurrences = 0
-    selector_calls = 0
-    for event in context["events"]:
-        event_id = event["retrieval_event_id"]
-        pool = list(pools[(EVENT_METHOD, event_id)])
-        ordered, features, unscorable = rerank_text_pool(
-            pool,
-            query=context["query"],
-            subquery=event["subquery"],
-        )
-        input_ids = ordered[: event["selector_top_k"]]
-        decision = await run_selector_for_event(
-            selector,
-            context=context,
-            event=event,
-            input_ids=input_ids,
-            features=features,
-            metadata=_metadata_for_pool(pool),
-        )
-        if decision["selector_executed"]:
-            selector_calls += 1
-        deep_ids = [normalize_arxiv_id(hit.get("paper_arxiv_id")) for hit in pool]
-        deep_ids = [paper_id for paper_id in deep_ids if paper_id]
-        all_deep.extend(deep_ids)
-        all_inputs.extend(input_ids)
-        all_selected.extend(decision["selector_selected_arxiv_ids"])
-        all_source_graph.extend(event["source_local_graph_pool_arxiv_ids"])
-        deep_requested_occurrences += event["source_local_graph_pool_size"]
-        deep_actual_occurrences += len(deep_ids)
-        rerankable_occurrences += len(ordered)
-        selected_set = set(decision["selector_selected_arxiv_ids"])
-        input_rank = {paper_id: rank for rank, paper_id in enumerate(input_ids, start=1)}
-        event_output = {
-            **dict(event),
-            "method": EVENT_METHOD,
-            "deep_retrieval_pagination": "exclude event snapshot, then apply saved baseline offset",
-            "deep_retrieval_requested_count": event["source_local_graph_pool_size"],
-            "deep_retrieval_actual_count": len(pool),
-            "rerankable_count": len(ordered),
-            "unscorable_arxiv_ids": unscorable,
-            "deep_retrieval_arxiv_ids": [hit["paper_arxiv_id"] for hit in pool],
-            "reranked_arxiv_ids": ordered,
-            "selector_input_arxiv_ids": input_ids,
-            "selector_selected_arxiv_ids": decision["selector_selected_arxiv_ids"],
-            "selector_reasons": decision["selector_reasons"],
-            "selector_overview": decision["selector_overview"],
-            "selector_executed": decision["selector_executed"],
-            "selector_old_overview": "",
-            "retrieval_diagnostics": dict(
-                retrieval_diagnostics.get((EVENT_METHOD, event_id)) or {}
-            ),
-        }
-        event_outputs.append(event_output)
-        if save_level == "full":
-            source_seed_set = set(event["baseline_seed_arxiv_ids"])
-            source_local_set = set(event["source_local_graph_pool_arxiv_ids"])
-            hit_by_id = {
-                normalize_arxiv_id(hit.get("paper_arxiv_id")): hit
-                for hit in pool
-                if normalize_arxiv_id(hit.get("paper_arxiv_id"))
-            }
-            for paper_id in deep_ids:
-                feature = deep_paper_scoring_fields(
-                    paper_id,
-                    features=features,
-                    hit=hit_by_id[paper_id],
-                )
-                paper_rows.append(
-                    {
-                        "schema_version": SCHEMA_VERSION,
-                        "method": EVENT_METHOD,
-                        "query_id": context["query_id"],
-                        "benchmark_idx": context["benchmark_idx"],
-                        "query": context["query"],
-                        "subquery_id": event["subquery_id"],
-                        "subquery": event["subquery"],
-                        "subquery_before_date": event["subquery_before_date"],
-                        "retrieval_event_id": event_id,
-                        "iteration_idx": event["iteration_idx"],
-                        "retrieval_page_idx": event["retrieval_page_idx"],
-                        "retrieval_offset": event["retrieval_offset"],
-                        "source_local_graph_pool_size": event["source_local_graph_pool_size"],
-                        "paper_arxiv_id": paper_id,
-                        "candidate_type": "deep_retrieved",
-                        "retrieval_backend": "bm25",
-                        "passed_date_cutoff": True,
-                        "date_cutoff_month": str(event.get("subquery_before_date") or "")[:7],
-                        "is_ground_truth": paper_id in set(context.get("gt_ids") or set()),
-                        "deep_retrieval_rank_scope": "full_corpus_positive_date_valid_canonical_arxiv",
-                        "component_rank_scope": "closed_event_deep_pool",
-                        "normalization_scope": event_id,
-                        "in_source_baseline_seed_page": paper_id in source_seed_set,
-                        "in_source_local_graph_pool": paper_id in source_local_set,
-                        **feature,
-                        "in_selector_input": paper_id in input_rank,
-                        "selector_input_rank": input_rank.get(paper_id),
-                        "selector_selected": paper_id in selected_set,
-                        "selector_reason": decision["selector_reasons"].get(paper_id, ""),
-                    }
-                )
-    summary = build_query_summary(
-        context=context,
-        method=EVENT_METHOD,
-        deep_pool_ids=all_deep,
-        selector_input_ids=all_inputs,
-        selected_ids=all_selected,
-        selector_enabled=selector is not None,
-        selector_call_count=selector_calls,
-        deep_requested_occurrences=deep_requested_occurrences,
-        deep_actual_occurrences=deep_actual_occurrences,
-        rerankable_occurrences=rerankable_occurrences,
-        source_graph_pool_ids=all_source_graph,
-    )
-    output: Dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
-        "run_signature": run_signature,
-        "method": EVENT_METHOD,
-        "llm_model": config.LLM_MODEL_NAME if selector is not None else None,
-        "selector_enabled": selector is not None,
-        "query_id": context["query_id"],
-        "benchmark_idx": context["benchmark_idx"],
-        "query": context["query"],
-        "source_artifact_canonicalization": context["canonicalization"],
-        "summary": summary,
-        "events": event_outputs,
-    }
-    if save_level == "full":
-        output["paper_rows"] = paper_rows
-    return output
-
-
 async def build_merged_method_output(
     *,
     context: Mapping[str, Any],
@@ -1397,13 +1244,6 @@ def prepare_deep_pools(
     diagnostics: Dict[Any, Dict[str, Any]] = {}
     for group in context["groups"]:
         requests: Dict[Any, Dict[str, Any]] = {}
-        if EVENT_METHOD in pending_methods:
-            for event in group["events"]:
-                requests[(EVENT_METHOD, event["retrieval_event_id"])] = {
-                    "offset": event["retrieval_offset"],
-                    "count": event["source_local_graph_pool_size"],
-                    "exclude_arxiv_ids": event["retrieval_exclusion_arxiv_ids"],
-                }
         if MERGED_METHOD in pending_methods:
             requests[(MERGED_METHOD, group["subquery_id"])] = {
                 "offset": 0,
@@ -1773,7 +1613,6 @@ def main() -> None:
         "selector": selector_config,
         "rerank_formula_id": RERANK_FORMULA_ID,
         "formula_weights": RERANK_FEATURE_WEIGHTS,
-        "event_pagination": "event exclusion snapshot -> saved event offset -> N_i",
         "merged_pagination": "first-event exclusion snapshot -> offset 0 -> sum_i N_i",
         "merged_selector_slicing": "one rerank, chronological disjoint slices by actual event selector_top_k",
         "source_canonicalization": "newest contiguous Planner trajectory matching committed baseline and per-subquery candidate/selected IDs; last matching contiguous event block",
@@ -1858,18 +1697,7 @@ def main() -> None:
             if method not in pending:
                 continue
             print(f"[{position}/{len(indices)}] idx={idx} method={method}", flush=True)
-            if method == EVENT_METHOD:
-                output = asyncio.run(
-                    build_event_method_output(
-                        context=context,
-                        pools=pools,
-                        retrieval_diagnostics=retrieval_diagnostics,
-                        selector=selector,
-                        save_level=args.save_level,
-                        run_signature=run_signature,
-                    )
-                )
-            elif method == MERGED_METHOD:
+            if method == MERGED_METHOD:
                 output = asyncio.run(
                     build_merged_method_output(
                         context=context,

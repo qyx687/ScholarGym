@@ -10,7 +10,6 @@ The default universe is the query-paper union of:
 
 - `onepass_artifacts/baseline/paper_rows.jsonl`
 - `onepass_artifacts/per_subquery/paper_rows.jsonl` (`graph`)
-- `onepass_artifacts/deep_event/paper_rows.jsonl`
 - `onepass_artifacts/deep_merged/paper_rows.jsonl`
 
 Rows are deduplicated by `(query_id, paper_arxiv_id)`. A paper that appears for
@@ -34,7 +33,7 @@ For the dense PaSa RealScholar full run prepared on 2026-07-15, this produces:
 | Missing title and abstract | 0 |
 | Codex batches at 20 papers per batch | 8,982 |
 
-Here `deep` means membership in either `deep_event` or `deep_merged`.
+Here `deep` means membership in `deep_merged`.
 
 ## Annotation blinding
 
@@ -219,7 +218,7 @@ membership and GT flags.
 `source_comparison.csv` reports both micro and query-macro properties for:
 
 - all candidates;
-- graph, deep-event, deep-merged, deep-any, and baseline source membership;
+- graph, deep-merged, deep-any, and baseline source membership;
 - graph-only, deep-only, and graph-and-deep partitions.
 
 The primary comparison is graph-only versus deep-only:

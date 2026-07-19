@@ -18,6 +18,7 @@ from graph_methods import (
     RERANK_FORMULA_ID,
     S2GraphClient,
 )
+from rerank_skill import RerankSkill
 
 
 class FakeS2:
@@ -245,6 +246,129 @@ def test_graph_runtime_rerank_uses_requested_four_factor_formula():
     assert expanded["path_count_normalized"] > 0.0
 
 
+def test_graph_runtime_dynamic_policy_reuses_query_policy_and_hard_filters_type():
+    policy_calls = []
+
+    def policy_llm(prompt, *args, **kwargs):
+        policy_calls.append(prompt)
+        return json.dumps(
+            {
+                "policy_version": "dynamic_rerank_v1",
+                "query_intent": "method_search_excluding_surveys",
+                "weight_levels": {
+                    "query_similarity": "high",
+                    "subquery_similarity": "high",
+                    "intent_background": "off",
+                    "intent_method": "off",
+                    "intent_result": "off",
+                    "path_count": "off",
+                    "paper_type_alignment": "off",
+                },
+                "paper_type_rules": [
+                    {
+                        "types": ["survey_review"],
+                        "action": "exclude",
+                        "logic": "any",
+                        "threshold": 0.8,
+                    }
+                ],
+                "confidence": 0.95,
+            }
+        )
+
+    class FakeTypeResolver:
+        backend = "qwen"
+        evidence_source = "qwen"
+        classifier_version = "qwen30b_paper_type_v1"
+        supported_types = ("survey_review",)
+        model = "qwen-test"
+
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, paper_ids):
+            ids = list(paper_ids)
+            self.calls.append(ids)
+            return {
+                "2001.00003": {
+                    "paper_arxiv_id": "2001.00003",
+                    "type_probs": {"survey_review": 0.99},
+                    "confidence": 0.96,
+                    "classifier_version": self.classifier_version,
+                    "evidence_source": self.evidence_source,
+                    "publication_types": [],
+                    "supported_types": ["survey_review"],
+                    "negative_evidence_types": ["survey_review"],
+                }
+            }
+
+        def snapshot_stats(self):
+            return {"resolve_calls": len(self.calls)}
+
+        def snapshot_cache(self):
+            return {}
+
+    paper_db = {
+        "2001.00001": {
+            "title": "alpha seed",
+            "abstract": "paper",
+            "date": "2001-01",
+        },
+        "2001.00002": {
+            "title": "beta seed",
+            "abstract": "paper",
+            "date": "2001-02",
+        },
+        "2001.00003": {
+            "title": "survey expanded",
+            "abstract": "review",
+            "date": "2001-03",
+        },
+    }
+    resolver = FakeTypeResolver()
+    processor = PerSubqueryProcessor(
+        paper_db,
+        FakeS2(),
+        scoring_backend="embedding",
+        embedding_provider=FakeOllamaEmbeddings(),
+        rerank_skill=RerankSkill("qwen-test", llm_call=policy_llm),
+        paper_type_resolver=resolver,
+    )
+    event = {
+        "query_id": "dynamic-full",
+        "query": "find methods; exclude survey papers",
+        "query_date": "2002-01",
+        "subquery_id": 1,
+        "subquery": "alpha beta methods",
+        "subquery_before_date": "2002-01",
+        "retrieval_event_id": "dynamic-full:event-1",
+        "retrieval_offset": 0,
+        "selector_top_k": 3,
+        "seed_papers": [
+            {"paper_arxiv_id": "2001.00001", "observed_retrieval_rank": 1},
+            {"paper_arxiv_id": "2001.00002", "observed_retrieval_rank": 2},
+        ],
+    }
+
+    first = processor.process(event)
+    second = processor.process({**event, "retrieval_event_id": "dynamic-full:event-2"})
+
+    survey = next(
+        row for row in first["rows"] if row["paper_arxiv_id"] == "2001.00003"
+    )
+    assert survey["hard_filtered"] is True
+    assert survey["rerank_rank"] is None
+    assert "2001.00003" not in {
+        row["paper_arxiv_id"] for row in first["top_rows"]
+    }
+    assert first["legacy_rerank_applied"] is False
+    assert first["rerank_formula_id"] == "dynamic_rerank_v1"
+    assert all(paper.score is not None for paper in first["papers"])
+    assert len(policy_calls) == 1
+    assert len(resolver.calls) == 2
+    assert second["rerank_policy_id"] == first["rerank_policy_id"]
+
+
 def test_postprocess_embedding_wrapper_enforces_bound():
     class TrackingProvider:
         def __init__(self):
@@ -470,7 +594,7 @@ def test_aborted_artifact_query_never_reaches_canonical_jsonl():
     with tempfile.TemporaryDirectory() as tmp:
         writer = ArtifactWriter(tmp, "full")
         writer.begin_query("q-abort", 4)
-        writer.append("deep_event/paper_rows.jsonl", {"query_id": "q-abort", "benchmark_idx": 4})
+        writer.append("deep_merged/paper_rows.jsonl", {"query_id": "q-abort", "benchmark_idx": 4})
         writer.abort_query()
 
-        assert not (Path(tmp) / "deep_event/paper_rows.jsonl").exists()
+        assert not (Path(tmp) / "deep_merged/paper_rows.jsonl").exists()

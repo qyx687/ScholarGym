@@ -13,13 +13,12 @@ f426fd15e3ff28ee11ddeafc253dffd73ef88500
 ~~~text
 baseline Planner / Retriever / Selector
   -> 可选 per-subquery 图扩展与 shadow Selector
-  -> 可选 event/offset 对齐的 deep 检索与 shadow Selector（deep event，可不考虑）
-  -> 可选稳定 subquery 合并预算的 deep 检索与 shadow Selector（deep merge，我们目前选中其作为deep深检索）
+  -> 可选稳定 subquery 合并预算的 deep 检索与 shadow Selector（deep_merged）
   -> 下一个 benchmark query
 ~~~
 
-三个 shadow 分支不会写回 baseline memory，因此不会改变 baseline 的后续
-Planner 轨迹。deep 分支的候选预算来自已经生成的 graph local pool，不会再次
+两个 shadow 分支不会写回 baseline memory，因此不会改变 baseline 的后续
+Planner 轨迹。deep_merged 的候选预算来自已经生成的 graph local pool，不会再次
 调用 Semantic Scholar 来决定预算。
 
 ### 1.1 主表指标聚合口径
@@ -66,11 +65,10 @@ macro R/P 字段重算。
 
 Stage A 仍完整运行一次 baseline，因为 retrieval event、continue offset、
 冻结 exclusion、checklist 和 Selector budget 都由 baseline 轨迹决定。
-三个后处理分支只生成：
+两个后处理分支只生成：
 
 ~~~text
 per_subquery: 图扩展/过滤 + 闭池 Q/SQ + intent/path 特征
-deep_event:   event-offset 对齐的 deep pool + 检索排名 + 闭池 Q/SQ 特征
 deep_merged:  sum-budget deep pool + 检索排名 + 闭池 Q/SQ 特征
 ~~~
 
@@ -96,9 +94,9 @@ Stage A 采用 query 级原子提交。某个 query 的图扩展、embedding 或
 现有 scripts/replay_graph_rerank_formulas.py 面向历史 full-run schema，
 不是 Stage A 的正式动态权重 Stage B 实现。
 
-### 2.2 Full：固定公式加 shadow Selector
+### 2.2 Full：静态/动态 rerank 加 shadow Selector
 
-full 模式的 graph、deep_event 和 deep_merged 统一记录公式 ID：
+默认 `--no-dynamic_rerank` 使用固定公式：
 
 ~~~text
 q030_sq040_intent015_path015_closed_pool_minmax_v1
@@ -116,6 +114,21 @@ score = 0.30 * query_score_normalized
 graph 分支使用全部四项。deep 分支没有图边，因此 intent_score 和
 path_count_normalized 明确保存为 0；其有效排序分数为 0.30Q + 0.40SQ，
 但 manifest 和候选行仍使用同一个四项公式 ID 与完整权重表。
+
+启用 `--dynamic_rerank` 后，每个原始 query 只生成一次 policy，所有 graph
+event 共用该 policy。policy 可以按 query 选择/关闭 citation intent、path count、
+语义相似度和 paper-type alignment，并可用负权重表达排除倾向。动态模式只改变
+`per_subquery` graph arm；`deep_merged` 继续作为固定 text-only control。
+
+候选类型证据用明确开关选择：
+
+~~~bash
+--paper_type_backend s2    # 保守的 S2 publicationTypes 映射
+--paper_type_backend qwen  # title+abstract 的九类 Qwen 分类
+~~~
+
+这与 policy LLM 是两个职责：即使候选类型使用 S2，动态组仍需 policy LLM 阅读
+原始 query 并生成权重/类型规则。
 
 ## 3. 特征定义
 
@@ -163,7 +176,7 @@ qwen3-embedding:0.6b
 检索与 rerank 必须使用同一个 embedding 模型和同一种论文序列化。严格复现时，
 优先恢复原始 Qdrant collection，而不是重新建库。
 
-## 5. 三个后处理分支
+## 5. 两个后处理分支
 
 ### per_subquery
 
@@ -173,12 +186,6 @@ qwen3-embedding:0.6b
 - 具有有效月份；
 - 不晚于 query/subquery cutoff；
 - 不在该事件冻结的已选 exclusion 中。
-
-### deep_event
-
-每个 baseline retrieval event 单独运行。预算 N_i 等于对应 graph local pool
-大小；先应用事件冻结 exclusion，再应用保存的 offset，取 N_i 条，闭池重排后
-按照该事件真实 selector_top_k 交给 shadow Selector。
 
 ### deep_merged
 
@@ -202,8 +209,9 @@ export DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 export S2_API_KEY="..."
 ~~~
 
-DASHSCOPE 只用于 Planner/Selector LLM。默认 dense embedding 由本地 Ollama
-提供。
+DASHSCOPE 用于 Planner/Selector；动态模式下也用于 query policy，选择 Qwen
+候选类型 backend 时还用于 title+abstract 类型分类。默认 dense embedding 由
+本地 Ollama 提供。
 
 运行前需要自行提供大文件：
 
@@ -230,8 +238,8 @@ python code/eval.py \
   --browser_mode NONE \
   --save_level full \
   --postprocess_stage full \
+  --no-dynamic_rerank \
   --run_per_subquery_postprocess \
-  --run_deep_event_postprocess \
   --run_deep_merged_postprocess \
   --graph_method citations_references \
   --graph_expansion_limit 100 \
@@ -242,15 +250,38 @@ python code/eval.py \
   --postprocess_embedding_concurrency 1
 ~~~
 
-可单独关闭 deep 对照：
+可关闭 deep_merged 对照：
 
 ~~~bash
---no-run_deep_event_postprocess
 --no-run_deep_merged_postprocess
 ~~~
 
-deep 分支依赖 graph pool 提供预算，所以启用任何 deep 分支时必须启用
+deep_merged 依赖 graph pool 提供预算，所以启用时必须启用
 --run_per_subquery_postprocess。
+
+动态 S2 类型组在上面的数据/检索参数不变时替换为：
+
+~~~bash
+--dynamic_rerank \
+--rerank_policy_cache cache/dynamic_rerank/onepass_query_policies_pasa_v1.jsonl \
+--paper_type_backend s2 \
+--paper_type_cache cache/dynamic_rerank/onepass_paper_types_s2_pasa_v1.jsonl
+~~~
+
+动态 Qwen 类型组复用同一个 policy cache，只替换候选类型 backend 和独立 cache：
+
+~~~bash
+--dynamic_rerank \
+--rerank_policy_cache cache/dynamic_rerank/onepass_query_policies_pasa_v1.jsonl \
+--paper_type_backend qwen \
+--paper_type_qwen_model qwen3-30b-a3b-instruct-2507 \
+--paper_type_qwen_batch_size 16 \
+--paper_type_cache cache/dynamic_rerank/onepass_paper_types_qwen_pasa_v1.jsonl
+~~~
+
+不要让 S2 与 Qwen 组共用候选类型 cache；loader 会按 provenance 拒绝另一
+backend 的记录。Qwen cache 还绑定 `--paper_type_qwen_model`：更换模型后旧记录
+不会被复用。Qwen miss/失败按 unknown 处理，绝不隐式回退到候选自带的 S2 类型。
 
 ## 8. Dense 运行示例
 
@@ -288,6 +319,7 @@ python code/eval.py \
   --browser_mode NONE \
   --save_level full \
   --postprocess_stage full \
+  --no-dynamic_rerank \
   --embedding_base_url http://localhost:11434 \
   --qdrant_url http://localhost:6433 \
   --qdrant_collection paper_knowledge_base \
@@ -317,12 +349,12 @@ run_manifest.json 的签名包含：
 
 - 代码、配置与 benchmark 内容；
 - paper DB、BM25/Qdrant/Ollama 定位信息；
-- baseline 参数和三个后处理开关；
-- 公式 ID 与精确权重；
+- baseline 参数和两个后处理开关；
+- static/dynamic、policy、候选类型 backend、公式 ID 与精确权重；
 - embedding、并发和缓存策略。
 
-公式发生变化后不能续跑旧目录。本次四项公式必须使用新的 run_label 和输出目录，
-不能在历史 q040_sq060 checkpoint 上继续。
+公式、dynamic 开关或候选类型 backend 发生变化后不能续跑旧目录。静态、动态
+S2、动态 Qwen 必须使用各自的输出目录；程序也会把 rerank/backend 写入目录名。
 
 --allow_resume_compatible_code_change 只允许经过审计且不改变实验结果的代码升级，
 不能用于公式、模型、prompt、数据集或检索参数变化。
@@ -340,14 +372,11 @@ full 模式的主要文件位于：
   per_subquery/pool_records.jsonl
   per_subquery/expansion_edges.jsonl
   per_subquery/selector_decisions.jsonl
-  deep_event/pool_records.jsonl
-  deep_event/paper_rows.jsonl
-  deep_event/comparisons.jsonl
-  deep_event/selector_decisions.jsonl
   deep_merged/pool_records.jsonl
   deep_merged/paper_rows.jsonl
   deep_merged/comparisons.jsonl
   deep_merged/selector_decisions.jsonl
+  query_rerank_policies.jsonl
   query_results.jsonl
   run_manifest.json
   resume_reconciliation.json
@@ -370,8 +399,16 @@ rerank Top-K 和 shadow selection，candidate/selection 指标会明确保存为
 --limit N
 --results_per_query N
 --run_per_subquery_postprocess / --no-run_per_subquery_postprocess
---run_deep_event_postprocess / --no-run_deep_event_postprocess
 --run_deep_merged_postprocess / --no-run_deep_merged_postprocess
+--dynamic_rerank / --no-dynamic_rerank
+--rerank_policy_model MODEL
+--rerank_policy_cache PATH
+--paper_type_backend s2|qwen
+--paper_type_cache PATH
+--paper_type_offline_cache_only / --no-paper_type_offline_cache_only
+--paper_type_qwen_model MODEL
+--paper_type_qwen_is_local / --no-paper_type_qwen_is_local
+--paper_type_qwen_batch_size N
 --graph_method citations|references|citations_references
 --graph_expansion_limit N
 --graph_cache_dir PATH

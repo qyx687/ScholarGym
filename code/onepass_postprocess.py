@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Per-query graph rerank and matched text-only deep-retrieval shadows."""
+"""Per-query graph rerank and the merged text-only deep-retrieval shadow."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from agent.selector import Selector
 from deep_retrieval import (
-    DEEP_EVENT_METHOD,
     DEEP_MERGED_METHOD,
     DeepRetrievalProcessor,
     compact_deep_rows,
@@ -26,7 +25,7 @@ from graph_methods import (
 from structures import Paper, SubQuery
 
 
-POSTPROCESS_METHODS = ("per_subquery", "deep_event", "deep_merged")
+POSTPROCESS_METHODS = ("per_subquery", "deep_merged")
 EVENT_FIELDS = (
     "schema_version",
     "run_id",
@@ -82,6 +81,27 @@ GRAPH_COMPACT_FIELDS = (
     "materialization_order_rank",
     "materialization_order_scope",
     "rerank_formula_id",
+    "rerank_policy_id",
+    "dynamic_rerank_enabled",
+    "rerank_used_fallback",
+    "feature_weights",
+    "compiled_feature_weights",
+    "intent_background",
+    "intent_method",
+    "intent_result",
+    "paper_type_probs",
+    "paper_type_backend",
+    "paper_type_classifier_confidence",
+    "paper_type_evidence_source",
+    "paper_type_publication_types",
+    "paper_type_supported_types",
+    "paper_type_negative_evidence_types",
+    "paper_type_alignment",
+    "paper_type_soft_penalty",
+    "paper_type_filter_action",
+    "paper_type_filter_reason",
+    "hard_filtered",
+    "component_contributions",
     "rerank_score",
     "rerank_rank",
     "in_selector_topk",
@@ -418,7 +438,6 @@ class OnePassPostprocessor:
         scoring_backend: str,
         embedding_provider: Any,
         run_per_subquery: bool,
-        run_deep_event: bool = False,
         run_deep_merged: bool = False,
         postprocess_stage: str = "full",
         run_id: str = "",
@@ -434,7 +453,6 @@ class OnePassPostprocessor:
         self.backend = scoring_backend
         self.embedding_provider = embedding_provider
         self.run_per_subquery = run_per_subquery
-        self.run_deep_event = run_deep_event
         self.run_deep_merged = run_deep_merged
         if postprocess_stage not in {"full", "materialize"}:
             raise ValueError("postprocess_stage must be full or materialize")
@@ -447,7 +465,7 @@ class OnePassPostprocessor:
             raise ValueError("event_workers must be >= 1")
         if self.selector_concurrency < 1:
             raise ValueError("selector_concurrency must be >= 1")
-        if (run_deep_event or run_deep_merged) and deep_retrieval_processor is None:
+        if run_deep_merged and deep_retrieval_processor is None:
             raise ValueError("deep_retrieval_processor is required when a deep shadow is enabled")
 
     def process_query(
@@ -496,6 +514,8 @@ class OnePassPostprocessor:
         gt_ids: Set[str],
     ) -> Dict[str, Any]:
         s2_before = self.s2.snapshot_stats()
+        resolver = self.per_subquery.paper_type_resolver
+        paper_type_before = resolver.snapshot_stats() if resolver else {}
         for event in list(planner_events) + list(retrieval_events):
             if isinstance(event, dict):
                 event.setdefault("run_id", self.run_id)
@@ -508,6 +528,71 @@ class OnePassPostprocessor:
             "postprocess_stage": self.postprocess_stage,
             "baseline": self._baseline_summary(retrieval_events, gt_ids),
         }
+
+        original_query = str(
+            query.get("query")
+            or (retrieval_events[0].get("query") if retrieval_events else "")
+            or ""
+        )
+        query_id = str(result.get("query_id") or "")
+        benchmark_idx = result.get("benchmark_idx")
+        policy = compiled_policy = None
+        if not self.materialize_only:
+            policy, compiled_policy = self.per_subquery.configure_query(original_query)
+        paper_type_provenance = {
+            "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_evidence_source": getattr(
+                resolver, "evidence_source", None
+            ),
+            "paper_type_classifier_version": getattr(
+                resolver, "classifier_version", None
+            ),
+            "paper_type_model": getattr(resolver, "model", None),
+            "paper_type_supported_types": list(
+                getattr(resolver, "supported_types", ()) or ()
+            ),
+        }
+        if policy is not None and compiled_policy is not None:
+            assert self.per_subquery.rerank_skill is not None
+            policy_record = self.per_subquery.rerank_skill.artifact_record(
+                query_id=query_id,
+                original_query=original_query,
+                policy=policy,
+                compiled=compiled_policy,
+            )
+            policy_record.update(
+                {
+                    "schema_version": "1.0",
+                    "run_id": self.run_id,
+                    "benchmark_idx": benchmark_idx,
+                    "formula_scope": "one_policy_per_original_query_all_events",
+                    "affects_next_iteration": False,
+                    "dynamic_rerank_enabled": not compiled_policy.used_fallback,
+                    "rerank_formula_id": (
+                        "q030_sq040_intent015_path015_closed_pool_minmax_v1"
+                        if compiled_policy.used_fallback
+                        else "dynamic_rerank_v1"
+                    ),
+                    **paper_type_provenance,
+                }
+            )
+        else:
+            policy_record = {
+                "schema_version": "1.0",
+                "run_id": self.run_id,
+                "query_id": query_id,
+                "benchmark_idx": benchmark_idx,
+                "original_query": original_query,
+                "rerank_policy_id": "legacy-static",
+                "rerank_formula_id": "q030_sq040_intent015_path015_closed_pool_minmax_v1",
+                "compiled_weights": dict(self.per_subquery.weights),
+                "dynamic_rerank_enabled": False,
+                "formula_scope": "one_static_formula_all_queries",
+                "affects_next_iteration": False,
+                **paper_type_provenance,
+            }
+        result["rerank_policy"] = policy_record
+        self.writer.append("query_rerank_policies.jsonl", policy_record)
 
         graph_events: List[Dict[str, Any]] = []
         if self.run_per_subquery:
@@ -526,7 +611,7 @@ class OnePassPostprocessor:
                     {"query_id": result["query_id"], "error": str(exc)},
                 )
 
-        if self.run_deep_event or self.run_deep_merged:
+        if self.run_deep_merged:
             try:
                 per_subquery_result = result.get("per_subquery") or {}
                 graph_failed_events = int(
@@ -540,60 +625,36 @@ class OnePassPostprocessor:
                     raise ValueError(
                         "deep shadows require successful per-subquery graph pools for this query"
                     )
-                prepared = self.deep.prepare_pools(
-                    graph_events,
-                    include_event=self.run_deep_event,
-                    include_merged=self.run_deep_merged,
-                )
+                prepared = self.deep.prepare_pools(graph_events)
             except Exception as exc:
-                for name, enabled in (
-                    ("deep_event", self.run_deep_event),
-                    ("deep_merged", self.run_deep_merged),
-                ):
-                    if enabled:
-                        result[name] = {
-                            "postprocess_stage": self.postprocess_stage,
-                            "materialization_complete": False,
-                            "error": str(exc),
-                        }
-                        self.writer.append(
-                            f"{name}/errors.jsonl",
-                            {"query_id": result["query_id"], "error": str(exc)},
-                        )
+                result["deep_merged"] = {
+                    "postprocess_stage": self.postprocess_stage,
+                    "materialization_complete": False,
+                    "error": str(exc),
+                }
+                self.writer.append(
+                    "deep_merged/errors.jsonl",
+                    {"query_id": result["query_id"], "error": str(exc)},
+                )
             else:
-                if self.run_deep_event:
-                    try:
-                        result["deep_event"] = self._process_deep_event(prepared, gt_ids)
-                    except Exception as exc:
-                        result["deep_event"] = {
-                            "postprocess_stage": self.postprocess_stage,
-                            "materialization_complete": False,
-                            "error": str(exc),
-                        }
-                        self.writer.append(
-                            "deep_event/errors.jsonl",
-                            {"query_id": result["query_id"], "error": str(exc)},
-                        )
-                if self.run_deep_merged:
-                    try:
-                        result["deep_merged"] = self._process_deep_merged(prepared, gt_ids)
-                    except Exception as exc:
-                        result["deep_merged"] = {
-                            "postprocess_stage": self.postprocess_stage,
-                            "materialization_complete": False,
-                            "error": str(exc),
-                        }
-                        self.writer.append(
-                            "deep_merged/errors.jsonl",
-                            {"query_id": result["query_id"], "error": str(exc)},
-                        )
+                try:
+                    result["deep_merged"] = self._process_deep_merged(prepared, gt_ids)
+                except Exception as exc:
+                    result["deep_merged"] = {
+                        "postprocess_stage": self.postprocess_stage,
+                        "materialization_complete": False,
+                        "error": str(exc),
+                    }
+                    self.writer.append(
+                        "deep_merged/errors.jsonl",
+                        {"query_id": result["query_id"], "error": str(exc)},
+                    )
 
         if self.materialize_only:
             enabled_methods = [
                 name
                 for name, enabled in (
                     ("per_subquery", self.run_per_subquery),
-                    ("deep_event", self.run_deep_event),
                     ("deep_merged", self.run_deep_merged),
                 )
                 if enabled
@@ -617,6 +678,14 @@ class OnePassPostprocessor:
             for key in set(s2_before) | set(s2_after)
         }
         result["s2_stats_cumulative"] = s2_after
+        paper_type_after = resolver.snapshot_stats() if resolver else {}
+        result["paper_type_stats_delta"] = {
+            key: int(paper_type_after.get(key, 0))
+            - int(paper_type_before.get(key, 0))
+            for key in set(paper_type_before) | set(paper_type_after)
+        }
+        result["paper_type_stats_cumulative"] = paper_type_after
+        result.update(paper_type_provenance)
         snapshot_embedding_cache = getattr(
             self.embedding_provider, "snapshot_query_stats", None
         )
@@ -787,7 +856,11 @@ class OnePassPostprocessor:
         method_name = (
             "per_subquery_pool_feature_materialization"
             if self.materialize_only
-            else "per_subquery_new_formula_shadow"
+            else (
+                "per_subquery_dynamic_rerank_shadow"
+                if self.per_subquery.dynamic_rerank_enabled
+                else "per_subquery_static_rerank_shadow"
+            )
         )
         all_pool: List[str] = []
         all_candidates: List[str] = []
@@ -890,7 +963,9 @@ class OnePassPostprocessor:
                 paper_id = row["paper_arxiv_id"]
                 row["postprocess_stage"] = self.postprocess_stage
                 row["features_materialized"] = True
-                row["legacy_rerank_applied"] = not self.materialize_only
+                row["legacy_rerank_applied"] = bool(
+                    processed.get("legacy_rerank_applied")
+                )
                 row["shadow_selector_applied"] = not self.materialize_only
                 if not self.materialize_only:
                     row["in_selector_topk"] = paper_id in top_set
@@ -919,7 +994,19 @@ class OnePassPostprocessor:
                 "method": method_name,
                 "postprocess_stage": self.postprocess_stage,
                 "features_materialized": True,
-                "legacy_rerank_applied": not self.materialize_only,
+                "legacy_rerank_applied": bool(
+                    processed.get("legacy_rerank_applied")
+                ),
+                "dynamic_rerank_enabled": bool(
+                    (processed.get("compiled_rerank_policy") or {}).get(
+                        "used_fallback"
+                    )
+                    is False
+                ),
+                "rerank_policy_id": processed.get("rerank_policy_id"),
+                "compiled_rerank_policy": processed.get(
+                    "compiled_rerank_policy"
+                ),
                 "shadow_selector_applied": not self.materialize_only,
                 "local_pool_size": len(processed["rows"]),
                 "local_pool_arxiv_ids": ordered_unique(
@@ -970,9 +1057,37 @@ class OnePassPostprocessor:
                 "failed_events": graph_failures + selector_failures,
                 "graph_failed_events": graph_failures,
                 "selector_failed_events": selector_failures,
-                "selector_call_count": 0 if self.materialize_only else len(successful_positions),
+                "selector_call_count": (
+                    0
+                    if self.materialize_only
+                    else sum(
+                        bool(graph_outcomes[index][1].get("papers"))
+                        for index in successful_positions
+                    )
+                ),
                 "features_materialized": graph_failures == 0,
-                "legacy_rerank_applied": not self.materialize_only,
+                "legacy_rerank_applied": bool(
+                    not self.materialize_only
+                    and (
+                        self.per_subquery.active_compiled_policy is None
+                        or self.per_subquery.active_compiled_policy.used_fallback
+                    )
+                ),
+                "dynamic_rerank_enabled": bool(
+                    not self.materialize_only
+                    and self.per_subquery.active_compiled_policy is not None
+                    and not self.per_subquery.active_compiled_policy.used_fallback
+                ),
+                "rerank_policy_id": (
+                    self.per_subquery.active_compiled_policy.policy_id
+                    if self.per_subquery.active_compiled_policy is not None
+                    else None
+                ),
+                "compiled_rerank_policy": (
+                    self.per_subquery.active_compiled_policy.to_dict()
+                    if self.per_subquery.active_compiled_policy is not None
+                    else None
+                ),
                 "shadow_selector_applied": not self.materialize_only,
                 "materialization_complete": graph_failures == 0,
                 "candidate_metrics_available": not self.materialize_only,
@@ -1094,150 +1209,6 @@ class OnePassPostprocessor:
                 "selection_metrics_valid": False,
             }
         )
-        return summary
-
-    def _materialize_deep_event(
-        self,
-        prepared: Mapping[str, Any],
-        gt_ids: Set[str],
-    ) -> Dict[str, Any]:
-        """Persist event-matched deep pools and features without reranking."""
-        all_deep_pool: List[str] = []
-        all_source_graph: List[str] = []
-        requested_occurrences = actual_occurrences = scorable_occurrences = 0
-        sources = [
-            source for group in prepared["groups"] for source in group["events"]
-        ]
-        first_event: Optional[Mapping[str, Any]] = (
-            sources[0]["event"] if sources else None
-        )
-
-        def materialize_source(source):
-            event = source["event"]
-            key = (DEEP_EVENT_METHOD, source["retrieval_event_id"])
-            pool = prepared["pools"].get(key) or []
-            return {
-                "source": source,
-                "event": event,
-                "diagnostics": prepared["diagnostics"].get(key) or {},
-                "materialized": self.deep.materialize_pool_features(
-                    pool,
-                    query=str(event.get("query") or ""),
-                    subquery=str(event.get("subquery") or ""),
-                    cutoff=(
-                        event.get("subquery_before_date")
-                        or event.get("query_date")
-                    ),
-                ),
-            }
-
-        contexts = _stable_thread_map(
-            materialize_source, sources, self.event_workers
-        )
-        for context in contexts:
-            event = context["event"]
-            source = context["source"]
-            diagnostics = context["diagnostics"]
-            materialized = context["materialized"]
-            graph_pool = source["graph_local_pool_arxiv_ids"]
-            graph_pool_set = set(graph_pool)
-            graph_row_by_id = {
-                row["paper_arxiv_id"]: row for row in source.get("rows") or []
-            }
-            enriched_rows: List[Dict[str, Any]] = []
-            for row in materialized["rows"]:
-                paper_id = row["paper_arxiv_id"]
-                graph_row = graph_row_by_id.get(paper_id) or {}
-                enriched = {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    **dict(row),
-                    "method": DEEP_EVENT_METHOD,
-                    "postprocess_stage": "materialize",
-                    "features_materialized": True,
-                    "legacy_rerank_applied": False,
-                    "shadow_selector_applied": False,
-                    "source_graph_local_pool_size": len(graph_pool),
-                    "in_source_graph_local_pool": paper_id in graph_pool_set,
-                    "source_graph_query_score_normalized": graph_row.get(
-                        "query_score_normalized"
-                    ),
-                    "source_graph_subquery_score_normalized": graph_row.get(
-                        "subquery_score_normalized"
-                    ),
-                    "source_graph_intent_score": graph_row.get("intent_score"),
-                    "source_graph_path_count_normalized": graph_row.get(
-                        "path_count_normalized"
-                    ),
-                    "is_ground_truth": paper_id in gt_ids,
-                    "affects_next_iteration": False,
-                }
-                enriched_rows.append(enriched)
-                self.writer.append(
-                    "deep_event/paper_rows.jsonl", enriched, full_only=True
-                )
-
-            self.writer.append(
-                "deep_event/comparisons.jsonl",
-                {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    "method": DEEP_EVENT_METHOD,
-                    "postprocess_stage": "materialize",
-                    "comparison_scope": "complete_candidate_pools_only",
-                    "pool_comparison": id_set_comparison(
-                        graph_pool, materialized["retrieval_order_arxiv_ids"]
-                    ),
-                },
-            )
-            self.writer.append(
-                "deep_event/pool_records.jsonl",
-                {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    "method": DEEP_EVENT_METHOD,
-                    "postprocess_stage": "materialize",
-                    "features_materialized": True,
-                    "legacy_rerank_applied": False,
-                    "shadow_selector_applied": False,
-                    "source_graph_local_pool_arxiv_ids": graph_pool,
-                    "source_graph_local_pool_size": len(graph_pool),
-                    "deep_retrieval_order_arxiv_ids": materialized[
-                        "retrieval_order_arxiv_ids"
-                    ],
-                    "deep_pool_size": len(
-                        materialized["retrieval_order_arxiv_ids"]
-                    ),
-                    "deep_feature_scorable_arxiv_ids": materialized[
-                        "scorable_arxiv_ids"
-                    ],
-                    "deep_feature_scorable_count": len(
-                        materialized["scorable_arxiv_ids"]
-                    ),
-                    "deep_feature_unscorable_arxiv_ids": materialized[
-                        "unscorable_arxiv_ids"
-                    ],
-                    "retrieval_diagnostics": diagnostics,
-                    "deep_pool_rows": compact_deep_rows(enriched_rows),
-                },
-            )
-
-            requested_occurrences += int(diagnostics.get("requested_count") or 0)
-            actual_occurrences += len(materialized["retrieval_order_arxiv_ids"])
-            scorable_occurrences += len(materialized["scorable_arxiv_ids"])
-            all_deep_pool.extend(materialized["retrieval_order_arxiv_ids"])
-            all_source_graph.extend(graph_pool)
-
-        summary = self._deep_materialization_summary(
-            method=DEEP_EVENT_METHOD,
-            first_event=first_event,
-            gt_ids=gt_ids,
-            deep_pool_ids=all_deep_pool,
-            source_graph_ids=all_source_graph,
-            requested_occurrences=requested_occurrences,
-            actual_occurrences=actual_occurrences,
-            feature_scorable_occurrences=scorable_occurrences,
-            event_count=len(sources),
-            group_count=len(prepared["groups"]),
-        )
-        self.writer.append("deep_event/query_results.jsonl", summary)
         return summary
 
     def _materialize_deep_merged(
@@ -1453,161 +1424,6 @@ class OnePassPostprocessor:
             group_count=len(groups),
         )
         self.writer.append("deep_merged/query_results.jsonl", summary)
-        return summary
-
-    def _process_deep_event(self, prepared: Mapping[str, Any], gt_ids: Set[str]) -> Dict[str, Any]:
-        if self.materialize_only:
-            return self._materialize_deep_event(prepared, gt_ids)
-        all_deep_pool: List[str] = []
-        all_selector_input: List[str] = []
-        all_selected: List[str] = []
-        all_source_graph: List[str] = []
-        requested_occurrences = actual_occurrences = rerankable_occurrences = selector_calls = 0
-        sources = [source for group in prepared["groups"] for source in group["events"]]
-        first_event: Optional[Mapping[str, Any]] = sources[0]["event"] if sources else None
-
-        def rerank_source(source):
-            event = source["event"]
-            key = (DEEP_EVENT_METHOD, source["retrieval_event_id"])
-            pool = prepared["pools"].get(key) or []
-            diagnostics = prepared["diagnostics"].get(key) or {}
-            reranked = self.deep.rerank_pool(
-                pool,
-                query=str(event.get("query") or ""),
-                subquery=str(event.get("subquery") or ""),
-                cutoff=event.get("subquery_before_date") or event.get("query_date"),
-            )
-            target_k = max(0, int(event.get("selector_top_k") or 0))
-            input_ids = reranked["rerank_order_arxiv_ids"][:target_k]
-            papers = self.deep.papers_for_ids(
-                input_ids, reranked["rows"], reranked["metadata"]
-            )
-            return {
-                "source": source,
-                "event": event,
-                "diagnostics": diagnostics,
-                "reranked": reranked,
-                "input_ids": input_ids,
-                "papers": papers,
-            }
-
-        contexts = _stable_thread_map(rerank_source, sources, self.event_workers)
-        selector_outcomes = self._call_selectors(
-            [
-                (context["event"], context["papers"], str(context["event"].get("planner_checklist") or ""))
-                for context in contexts
-            ]
-        )
-        context_outcomes = list(zip(contexts, selector_outcomes))
-        for context, (_, selector_error) in context_outcomes:
-            event = context["event"]
-            if selector_error is not None:
-                raise RuntimeError(
-                    f"deep-event Selector failed for {event.get('retrieval_event_id')}: {selector_error}"
-                ) from selector_error
-
-        for context, (selector_result, _) in context_outcomes:
-            event = context["event"]
-            selected, overview, reasons = selector_result
-            source = context["source"]
-            diagnostics = context["diagnostics"]
-            reranked = context["reranked"]
-            input_ids = context["input_ids"]
-            selector_calls += int(bool(input_ids))
-            selected_set = set(selected)
-            input_rank = {paper_id: rank for rank, paper_id in enumerate(input_ids, start=1)}
-            graph_pool = source["graph_local_pool_arxiv_ids"]
-            graph_topk = source["graph_topk_arxiv_ids"]
-            graph_pool_set, graph_topk_set = set(graph_pool), set(graph_topk)
-            graph_row_by_id = {
-                row["paper_arxiv_id"]: row for row in source.get("rows") or []
-            }
-            enriched_rows: List[Dict[str, Any]] = []
-            for row in reranked["rows"]:
-                paper_id = row["paper_arxiv_id"]
-                graph_row = graph_row_by_id.get(paper_id) or {}
-                enriched = {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    **dict(row),
-                    "method": DEEP_EVENT_METHOD,
-                    "source_graph_local_pool_size": len(graph_pool),
-                    "source_graph_topk_size": len(graph_topk),
-                    "in_source_graph_local_pool": paper_id in graph_pool_set,
-                    "in_source_graph_topk": paper_id in graph_topk_set,
-                    "source_graph_query_score_normalized": graph_row.get("query_score_normalized"),
-                    "source_graph_subquery_score_normalized": graph_row.get("subquery_score_normalized"),
-                    "source_graph_intent_score": graph_row.get("intent_score"),
-                    "source_graph_path_count_normalized": graph_row.get("path_count_normalized"),
-                    "source_graph_rerank_score": graph_row.get("rerank_score"),
-                    "source_graph_rerank_rank": graph_row.get("rerank_rank"),
-                    "in_selector_topk": paper_id in input_rank,
-                    "selector_input_rank": input_rank.get(paper_id),
-                    "selector_selected": paper_id in selected_set,
-                    "selector_reason": reasons.get(paper_id, ""),
-                    "is_ground_truth": paper_id in gt_ids,
-                    "affects_next_iteration": False,
-                }
-                enriched_rows.append(enriched)
-                self.writer.append("deep_event/paper_rows.jsonl", enriched, full_only=True)
-
-            self.writer.append(
-                "deep_event/comparisons.jsonl",
-                {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    "method": DEEP_EVENT_METHOD,
-                    "pool_comparison": id_set_comparison(
-                        graph_pool, reranked["retrieval_order_arxiv_ids"]
-                    ),
-                    "topk_comparison": id_set_comparison(graph_topk, input_ids),
-                },
-            )
-            self.writer.append(
-                "deep_event/pool_records.jsonl",
-                {
-                    **{field: event.get(field) for field in EVENT_FIELDS},
-                    "method": DEEP_EVENT_METHOD,
-                    "source_graph_local_pool_arxiv_ids": graph_pool,
-                    "source_graph_topk_arxiv_ids": graph_topk,
-                    "deep_retrieval_order_arxiv_ids": reranked["retrieval_order_arxiv_ids"],
-                    "deep_rerank_order_arxiv_ids": reranked["rerank_order_arxiv_ids"],
-                    "deep_selector_topk_arxiv_ids": input_ids,
-                    "deep_selected_arxiv_ids": selected,
-                    "retrieval_diagnostics": diagnostics,
-                    "deep_pool_rows": compact_deep_rows(enriched_rows),
-                },
-            )
-            top_rows = [row for row in enriched_rows if row["paper_arxiv_id"] in input_rank]
-            top_rows.sort(key=lambda row: row["selector_input_rank"])
-            self.writer.append(
-                "deep_event/selector_decisions.jsonl",
-                selector_decision_record(event, top_rows, selected, overview, reasons),
-                full_only=True,
-            )
-
-            requested_occurrences += int(diagnostics.get("requested_count") or 0)
-            actual_occurrences += len(reranked["retrieval_order_arxiv_ids"])
-            rerankable_occurrences += len(reranked["rerank_order_arxiv_ids"])
-            all_deep_pool.extend(reranked["retrieval_order_arxiv_ids"])
-            all_selector_input.extend(input_ids)
-            all_selected.extend(selected)
-            all_source_graph.extend(graph_pool)
-
-        summary = self._deep_summary(
-            method=DEEP_EVENT_METHOD,
-            first_event=first_event,
-            gt_ids=gt_ids,
-            deep_pool_ids=all_deep_pool,
-            selector_input_ids=all_selector_input,
-            selected_ids=all_selected,
-            source_graph_ids=all_source_graph,
-            requested_occurrences=requested_occurrences,
-            actual_occurrences=actual_occurrences,
-            rerankable_occurrences=rerankable_occurrences,
-            event_count=len(sources),
-            group_count=len(prepared["groups"]),
-            selector_call_count=selector_calls,
-        )
-        self.writer.append("deep_event/query_results.jsonl", summary)
         return summary
 
     def _process_deep_merged(self, prepared: Mapping[str, Any], gt_ids: Set[str]) -> Dict[str, Any]:

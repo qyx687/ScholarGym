@@ -122,7 +122,7 @@ def test_replay_reconstructs_stored_candidates_and_recovers_novel_gt(tmp_path):
             "query_id": "q0",
             "baseline": {"candidate_arxiv_ids": ["seed"]},
             "per_subquery": {"candidate_arxiv_ids": ["seed", "common"]},
-            "deep_event": {
+            "deep_merged": {
                 "query_id": "q0",
                 "source_graph_pool_arxiv_ids": ["seed", "common", "novel-gt"],
                 "deep_pool_arxiv_ids": ["seed", "common"],

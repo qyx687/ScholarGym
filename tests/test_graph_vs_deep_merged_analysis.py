@@ -240,7 +240,6 @@ def test_deep_merged_primary_analysis_excludes_other_sources_and_tracks_novelty(
     }
     report = (output_dir / "report.md").read_text(encoding="utf-8")
     assert "Deep event" not in report
-    assert "deep_event" not in report
     assert not {"�", "鈥", "鈭"}.intersection(report)
 
 

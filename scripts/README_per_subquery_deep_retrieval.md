@@ -1,6 +1,6 @@
 # Per-subquery BM25 deep-retrieval replay
 
-这是保留给既有 full 运行的离线 replay 脚本；同等的两个实验臂现已接入
+这是保留给既有 full 运行的离线 replay 脚本；同等的 deep_merged 实验臂现已接入
 `code/eval.py`，新实验优先使用 `README_PACKAGE.md` 的单次运行方式。此脚本读取一次已经完成的
 OnePass `full` 运行，冻结 baseline 2nd 的 Planner、subquery、continue、
 checklist、offset 和 exclusion 轨迹；不重跑 Planner、baseline Selector 或
@@ -8,28 +8,7 @@ Semantic Scholar 图拓展。
 
 脚本：`scripts/replay_per_subquery_deep_retrieval.py`
 
-## 两个实验臂
-
-默认同时运行，彼此独立，也可用 `--methods` 只运行其中一个。
-
-### 1. `event_offset_matched_text_deep_retrieval`
-
-逐 baseline retrieval event 运行：
-
-1. 令 `N_i` 为代码 1 对应该 event 的 date-valid、可打分、按 arXiv ID
-   去重后的 per-subquery graph 局部库大小（seed ∪ expanded）。
-2. 使用该 event 的 baseline exclusion snapshot。
-3. 严格复现 baseline 分页顺序：先 exclusion，再应用该 event 已保存的
-   `retrieval_offset`，取 `N_i` 篇 BM25 论文。
-4. 在这 `N_i` 篇的闭集上计算 Q/SQ 分数、min-max、重排。
-5. 取该 event 实际 `selector_top_k`，使用该 event 的 checklist 调用一次
-   Selector。
-
-该臂是最接近原 baseline continue 语义的受控对照。需要注意：baseline
-本身是“排除历轮已选论文后再 offset”；因此上一页只选了部分论文时，下一页
-可能跳过一些从未展示的论文。此处有意保留该行为。
-
-### 2. `merged_subquery_sum_budget_text_deep_retrieval`
+## `merged_subquery_sum_budget_text_deep_retrieval`
 
 按稳定的 `(query_id, subquery_id)` 分组；相同文本但新 `subquery_id` 不合并。
 
@@ -44,7 +23,7 @@ Semantic Scholar 图拓展。
 5. 每个 slice 使用对应 event 的 checklist 独立调用 Selector；
    `old_overview=""`，选择结果不反馈到下一 slice 或 Planner。
 
-方案 2 不继承 continue 的跳页问题，但它改变了归一化范围和候选分配，因此是
+该方案不继承 continue 的跳页问题，但它改变了归一化范围和候选分配，因此是
 完整方法对照，不应把最终差异只归因于候选生成。
 
 ## 重排公式
@@ -59,7 +38,7 @@ Semantic Scholar 图拓展。
 + 0.15 * path_count_normalized
 ```
 
-保存的 score 尺度为 `[0, 1]`。Q/SQ 都在当前 event 池或 merged subquery 池内
+保存的 score 尺度为 `[0, 1]`。Q/SQ 都在当前 merged subquery 池内
 用 BM25 重新计算并 min-max。
 
 ## 输入要求与历史重复处理
@@ -101,8 +80,8 @@ python scripts/replay_per_subquery_deep_retrieval.py \
 ```
 
 Selector 使用 `configs/config_qwen30b_api.py` 的 Qwen 30B API 且 no-thinking。
-两臂都跑时，每个 baseline retrieval event 在每个臂各产生一次 Selector 调用；
-当前完整 PaSa 源运行预计为 `894 × 2 = 1788` 次。
+每个 baseline retrieval event 对应 merged pool 中的一个 Selector slice；
+当前完整 PaSa 源运行预计为 `894` 次 Selector 调用。
 
 正式付费运行前，建议先做不调用 Selector 的一条 query smoke test：
 
@@ -117,18 +96,6 @@ python scripts/replay_per_subquery_deep_retrieval.py \
 ```
 
 `--skip_selector` 的输出明确把 selection 指标写为 `null`，不会误记为 0。
-
-只运行一个实验臂：
-
-```bash
---methods event_offset_matched_text_deep_retrieval
-```
-
-或：
-
-```bash
---methods merged_subquery_sum_budget_text_deep_retrieval
-```
 
 ## LitSearch
 
@@ -148,8 +115,8 @@ evaluation_summary.json
 ```
 
 中断后原样重输命令即可。已存在且 `run_signature` 一致的 method/query 文件会
-跳过；如果方案 1 已完成而方案 2 中断，只会重做方案 2 的当前 query。不会生成
-边计算边追加的重复局部 artifact。若中断发生在一个 method/query 的多次
+跳过；未完成的当前 query 会整体重做，不会生成边计算边追加的重复局部
+artifact。若中断发生在一个 method/query 的多次
 Selector 调用中间，该 method/query 尚未 commit，续跑会重新执行它此前已完成的
 Selector 调用。`--force` 只用于同一签名下主动覆盖重算。
 
@@ -194,4 +161,4 @@ paper DB。正式 pickle 本身约 2 GB，但其中包含 Python token corpus、
 metadata 和 mappings；在当前 12 GB WSL 上实测反序列化阶段 RSS 可接近 10 GB。
 建议至少 16 GB RAM（12 GB 机器应保留足够 swap 且会明显更慢）。加载完成后，
 脚本每次只保留一个 benchmark query 的 artifact 和 compact deep pools；同一
-subquery 的 full-corpus BM25 score 只计算一次，并同时服务两个实验臂。
+subquery 的 full-corpus BM25 score 只计算一次。
