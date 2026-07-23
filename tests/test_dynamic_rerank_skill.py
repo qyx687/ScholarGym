@@ -7,16 +7,16 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 
-from dimension_catalog import DIMENSION_NAMES, PAPER_TYPES, intent_dimension_values
+from dimension_catalog import DIMENSION_NAMES, intent_dimension_values
 from paper_type import (
-    CLASSIFIER_VERSION,
-    PaperTypeClassifier,
-    S2_SUPPORTED_CANONICAL_TYPES,
+    S2_PUBLICATION_TYPES,
     evaluate_paper_type_rules,
     s2_publication_types_to_record,
+    validate_type_record,
 )
 from rerank_skill import (
     LEGACY_FEATURE_WEIGHTS,
+    S2_NATIVE_PAPER_TYPE_NAMESPACE,
     PolicyValidationError,
     RerankSkill,
     validate_policy_object,
@@ -38,7 +38,7 @@ def valid_policy(**overrides):
         },
         "paper_type_rules": [
             {
-                "types": ["primary_method"],
+                "types": ["Conference"],
                 "action": "prefer",
                 "logic": "any",
                 "strength": "high",
@@ -48,6 +48,13 @@ def valid_policy(**overrides):
     }
     value.update(overrides)
     return value
+
+
+def weight_levels_with_type_alignment(level):
+    return {
+        **valid_policy()["weight_levels"],
+        "paper_type_alignment": level,
+    }
 
 
 class FakeLLM:
@@ -63,63 +70,6 @@ class FakeLLM:
         if isinstance(output, Exception):
             raise output
         return output
-
-
-def test_qwen_paper_type_classifier_controls_provenance_and_full_taxonomy():
-    type_probs = {type_name: 0.0 for type_name in PAPER_TYPES}
-    type_probs["dataset_benchmark"] = 0.95
-    raw = json.dumps(
-        [
-            {
-                "paper_arxiv_id": "2001.00001",
-                "type_probs": type_probs,
-                "confidence": 0.96,
-                "classifier_version": "model-invented-version",
-            }
-        ]
-    )
-    fake = FakeLLM([raw])
-    classifier = PaperTypeClassifier("qwen-test", llm_call=fake)
-
-    records = classifier.classify_batch(
-        [
-            {
-                "paper_arxiv_id": "2001.00001",
-                "title": "A benchmark",
-                "abstract": "A dataset and evaluation benchmark.",
-            }
-        ]
-    )
-
-    assert records[0]["classifier_version"] == CLASSIFIER_VERSION
-    assert records[0]["evidence_source"] == "qwen"
-    assert set(records[0]["supported_types"]) == set(PAPER_TYPES)
-    assert set(records[0]["negative_evidence_types"]) == set(PAPER_TYPES)
-
-
-def test_qwen_paper_type_classifier_rejects_sparse_probabilities():
-    raw = json.dumps(
-        [
-            {
-                "paper_arxiv_id": "2001.00001",
-                "type_probs": {"dataset_benchmark": 0.95},
-                "confidence": 0.96,
-                "classifier_version": CLASSIFIER_VERSION,
-            }
-        ]
-    )
-    classifier = PaperTypeClassifier("qwen-test", llm_call=FakeLLM([raw, raw]))
-
-    with pytest.raises(ValueError, match="every canonical paper type"):
-        classifier.classify_batch(
-            [
-                {
-                    "paper_arxiv_id": "2001.00001",
-                    "title": "A benchmark",
-                    "abstract": "A dataset and evaluation benchmark.",
-                }
-            ]
-        )
 
 
 def test_markdown_wrapped_policy_is_parsed_and_cached_once(tmp_path):
@@ -157,6 +107,8 @@ def test_invalid_json_gets_exactly_one_repair_attempt():
         lambda value: value["weight_levels"].update({"made_up_dimension": "high"}),
         lambda value: value["paper_type_rules"][0].update({"types": ["survey_magic"]}),
         lambda value: value["paper_type_rules"][0].update({"action": "boost"}),
+        lambda value: value["paper_type_rules"][0].update({"action": "require"}),
+        lambda value: value["paper_type_rules"][0].update({"threshold": 0.8}),
     ],
 )
 def test_illegal_dimension_type_and_action_are_rejected(mutate):
@@ -167,16 +119,84 @@ def test_illegal_dimension_type_and_action_are_rejected(mutate):
         validate_policy_object(value, policy_id="p")
 
 
-def test_unambiguous_paper_type_alias_is_canonicalized():
+def test_native_paper_type_case_is_normalized():
     value = valid_policy(
+        weight_levels=weight_levels_with_type_alignment("off"),
         paper_type_rules=[
-            {"types": ["survey"], "action": "exclude", "logic": "any"}
+            {"types": ["review"], "action": "exclude", "logic": "any"}
         ]
     )
 
     policy = validate_policy_object(value, policy_id="p")
 
-    assert policy.paper_type_rules[0].types == ("survey_review",)
+    assert policy.paper_type_rules[0].types == ("Review",)
+
+
+def test_canonical_functional_type_is_rejected():
+    canonical_invalid = valid_policy(
+        paper_type_rules=[
+            {
+                "types": ["primary_method"],
+                "action": "prefer",
+                "logic": "any",
+                "strength": "low",
+            }
+        ]
+    )
+    with pytest.raises(PolicyValidationError, match="unknown types"):
+        validate_policy_object(canonical_invalid, policy_id="native-only")
+
+
+def test_type_alignment_is_enabled_exactly_for_soft_type_rules():
+    hard_only = [
+        {"types": ["Review"], "action": "exclude", "logic": "any"}
+    ]
+    soft = [
+        {
+            "types": ["Review"],
+            "action": "avoid",
+            "logic": "any",
+            "strength": "high",
+        }
+    ]
+
+    validate_policy_object(
+        valid_policy(
+            weight_levels=weight_levels_with_type_alignment("off"),
+            paper_type_rules=hard_only,
+        ),
+        policy_id="hard-only",
+    )
+    with pytest.raises(PolicyValidationError, match="must be non-off exactly"):
+        validate_policy_object(
+            valid_policy(paper_type_rules=hard_only), policy_id="hard-with-weight"
+        )
+    with pytest.raises(PolicyValidationError, match="must be non-off exactly"):
+        validate_policy_object(
+            valid_policy(
+                weight_levels=weight_levels_with_type_alignment("off"),
+                paper_type_rules=soft,
+            ),
+            policy_id="soft-without-weight",
+        )
+
+
+def test_s2_native_prompt_exposes_only_native_s2_vocabulary():
+    skill = RerankSkill("qwen-test")
+
+    prompt = skill.build_prompt("Exclude survey papers")
+
+    assert "Semantic Scholar's native publicationTypes" in prompt
+    assert "Review, JournalArticle" in prompt
+    assert "survey_review" not in prompt
+    assert "Dataset is a dataset record, not a paper" in prompt
+    assert "never use Dataset for a query asking for papers" in prompt
+    assert "subject-matter mention" in prompt
+    assert "Paper type actions: prefer, avoid, exclude" in prompt
+    assert "represented as prefer" in prompt
+    assert "threshold" not in prompt
+    assert skill.paper_type_backend == "s2"
+    assert skill.paper_type_namespace == S2_NATIVE_PAPER_TYPE_NAMESPACE
 
 
 def test_low_confidence_automatically_falls_back_to_legacy():
@@ -274,45 +294,63 @@ def test_methodology_maps_to_intent_method():
     }
 
 
-def test_require_prefer_avoid_exclude_and_hard_filter_confidence():
+def test_prefer_avoid_and_exclude_use_direct_native_s2_membership():
+    def native_record(*publication_types, confidence=1.0):
+        return {
+            "type_probs": {type_name: 1.0 for type_name in publication_types},
+            "confidence": confidence,
+            "evidence_source": "semantic_scholar",
+            "publication_types": list(publication_types),
+            "supported_types": list(S2_PUBLICATION_TYPES),
+            "negative_evidence_types": [],
+        }
+
     rules = [
-        {"types": ["primary_method"], "action": "require", "logic": "any"},
         {
-            "types": ["primary_method"],
+            "types": ["Conference"],
             "action": "prefer",
             "logic": "any",
             "strength": "high",
         },
         {
-            "types": ["survey_review"],
+            "types": ["Review"],
             "action": "avoid",
             "logic": "any",
             "strength": "medium",
         },
         {
-            "types": ["survey_review", "taxonomy_tutorial"],
+            "types": ["Review", "MetaAnalysis"],
             "action": "exclude",
             "logic": "any",
-            "threshold": 0.8,
         },
     ]
 
-    primary = evaluate_paper_type_rules(
-        {"type_probs": {"primary_method": 0.9, "survey_review": 0.1}, "confidence": 0.95},
-        rules,
-    )
-    survey = evaluate_paper_type_rules(
-        {"type_probs": {"primary_method": 0.1, "survey_review": 0.9}, "confidence": 0.95},
-        rules,
-    )
+    primary = evaluate_paper_type_rules(native_record("Conference"), rules)
+    survey = evaluate_paper_type_rules(native_record("Review"), rules)
     unknown = evaluate_paper_type_rules(None, rules)
-    medium_confidence_require = evaluate_paper_type_rules(
-        {"type_probs": {"primary_method": 0.0}, "confidence": 0.90},
-        [{"types": ["primary_method"], "action": "require", "logic": "any"}],
+    low_confidence_exclude = evaluate_paper_type_rules(
+        native_record("Review", confidence=0.01),
+        [{"types": ["Review"], "action": "exclude", "logic": "any"}],
     )
-    medium_confidence_exclude = evaluate_paper_type_rules(
-        {"type_probs": {"survey_review": 0.9}, "confidence": 0.90},
-        [{"types": ["survey_review"], "action": "exclude", "logic": "any"}],
+    review_only_all = evaluate_paper_type_rules(
+        native_record("Review"),
+        [
+            {
+                "types": ["Review", "MetaAnalysis"],
+                "action": "exclude",
+                "logic": "all",
+            }
+        ],
+    )
+    review_and_meta_all = evaluate_paper_type_rules(
+        native_record("Review", "MetaAnalysis"),
+        [
+            {
+                "types": ["Review", "MetaAnalysis"],
+                "action": "exclude",
+                "logic": "all",
+            }
+        ],
     )
 
     assert primary["paper_type_alignment"] > 0
@@ -321,139 +359,168 @@ def test_require_prefer_avoid_exclude_and_hard_filter_confidence():
     assert survey["hard_filtered"]
     assert survey["paper_type_filter_action"] == "exclude"
     assert not unknown["hard_filtered"]
-    assert -0.10 <= unknown["paper_type_soft_penalty"] < 0
-    assert not medium_confidence_require["hard_filtered"]
-    assert medium_confidence_require["paper_type_soft_penalty"] < 0
-    assert medium_confidence_exclude["hard_filtered"]
+    assert "paper_type_soft_penalty" not in unknown
+    assert low_confidence_exclude["hard_filtered"]
+    assert not review_only_all["hard_filtered"]
+    assert review_and_meta_all["hard_filtered"]
 
 
-def test_s2_publication_types_are_positive_only_canonical_evidence():
+def test_s2_publication_types_preserve_raw_positive_only_metadata():
     review = s2_publication_types_to_record(
         "2307.13721", ["Journal Article", "Review"]
     )
     assert review["publication_types"] == ["JournalArticle", "Review"]
-    assert review["type_probs"]["survey_review"] == pytest.approx(1.0)
+    assert review["type_probs"] == {"JournalArticle": 1.0, "Review": 1.0}
+    assert set(review["supported_types"]) == set(S2_PUBLICATION_TYPES)
     assert review["negative_evidence_types"] == []
+    projected = RerankSkill(
+        "qwen-test", paper_type_cache={"2307.13721": review}
+    )._type_record_for_candidate({"paper_arxiv_id": "2307.13721"})
+    assert projected["type_probs"] == {"JournalArticle": 1.0, "Review": 1.0}
+    assert projected["negative_evidence_types"] == []
 
-    excluded = evaluate_paper_type_rules(
-        review,
-        [{"types": ["survey_review"], "action": "exclude", "logic": "any"}],
+
+def test_legacy_mapped_s2_cache_record_is_upgraded_to_native_in_memory():
+    upgraded = validate_type_record(
+        {
+            "paper_arxiv_id": "2307.13721",
+            "type_probs": {"survey_review": 1.0},
+            "confidence": 1.0,
+            "classifier_version": "s2_publication_types_v1",
+            "evidence_source": "semantic_scholar",
+            "publication_types": ["JournalArticle", "Review"],
+            "supported_types": ["survey_review"],
+            "negative_evidence_types": [],
+        }
     )
-    assert excluded["hard_filtered"]
-    assert excluded["paper_type_evidence_source"] == "semantic_scholar"
-    assert "source=semantic_scholar" in excluded["paper_type_filter_reason"]
 
-    untagged = s2_publication_types_to_record(
-        "2000.00001", ["JournalArticle"]
-    )
-    required = evaluate_paper_type_rules(
-        untagged,
-        [{"types": ["survey_review"], "action": "require", "logic": "any"}],
-    )
-    assert not required["hard_filtered"]
-    assert not required["paper_type_known_for_require_filter"]
-    assert required["paper_type_soft_penalty"] < 0
+    assert upgraded["type_probs"] == {"JournalArticle": 1.0, "Review": 1.0}
+    assert set(upgraded["supported_types"]) == set(S2_PUBLICATION_TYPES)
 
 
-def test_s2_capabilities_disable_only_unsupported_soft_type_alignment():
-    s2_cache = {
-        "paper": s2_publication_types_to_record(
-            "paper", ["JournalArticle", "Review"]
-        )
+def test_native_catalog_is_fixed_even_before_cache_is_populated():
+    skill = RerankSkill("qwen-test")
+    policy = validate_policy_object(valid_policy(), policy_id="native-supported")
+
+    available = skill.compile_weights(policy, paper_type_available=True)
+    unavailable = skill.compile_weights(policy, paper_type_available=False)
+
+    assert skill.paper_type_supported_types == set(S2_PUBLICATION_TYPES)
+    assert available.paper_type_alignment_enabled
+    assert not unavailable.paper_type_alignment_enabled
+    assert unavailable.feature_weights["paper_type_alignment"] == 0.0
+
+
+def test_s2_native_scoring_uses_raw_publication_types_without_mapping():
+    cache = {
+        "review": s2_publication_types_to_record(
+            "review", ["JournalArticle", "Review"]
+        ),
+        "journal": s2_publication_types_to_record(
+            "journal", ["JournalArticle"]
+        ),
     }
-    skill = RerankSkill("qwen-test", paper_type_cache=s2_cache)
-    unsupported_value = valid_policy(
-        paper_type_rules=[
-            {
-                "types": ["dataset_benchmark"],
-                "action": "prefer",
-                "logic": "any",
-                "strength": "high",
-            }
-        ]
-    )
-    unsupported = skill.compile_weights(
-        validate_policy_object(unsupported_value, policy_id="unsupported")
-    )
-    assert not unsupported.paper_type_alignment_enabled
-    assert unsupported.feature_weights["paper_type_alignment"] == 0.0
-    assert "paper_type_alignment_forced_off_unsupported_rules" in unsupported.adjustments
-
-    supported_value = valid_policy(
-        paper_type_rules=[
-            {
-                "types": ["survey_review"],
-                "action": "prefer",
-                "logic": "any",
-                "strength": "high",
-            }
-        ]
-    )
-    supported = skill.compile_weights(
-        validate_policy_object(supported_value, policy_id="supported")
-    )
-    assert supported.paper_type_alignment_enabled
-
-
-def test_qwen_backend_never_falls_back_to_candidate_s2_types():
+    skill = RerankSkill("qwen-test", paper_type_cache=cache)
     policy = validate_policy_object(
         valid_policy(
+            weight_levels=weight_levels_with_type_alignment("off"),
             paper_type_rules=[
                 {
-                    "types": ["survey_review"],
+                    "types": ["Review"],
                     "action": "exclude",
                     "logic": "any",
-                    "threshold": 0.8,
-                }
+                },
             ]
         ),
-        policy_id="p",
+        policy_id="native",
     )
-    candidate = {
-        "paper_arxiv_id": "survey",
+    base = {
         "query_score_normalized": 0.5,
         "subquery_score_normalized": 0.5,
         "intent_labels": [],
         "path_count_normalized": 0.0,
-        "s2_publication_types": ["Review"],
     }
-    qwen_skill = RerankSkill("qwen-test", paper_type_backend="qwen")
-    qwen_skill.paper_type_supported_types.update(PAPER_TYPES)
-    qwen_row = qwen_skill.score_candidates(
-        [candidate], qwen_skill.compile_weights(policy)
-    )[0]
-    s2_skill = RerankSkill("qwen-test", paper_type_backend="s2")
-    s2_skill.paper_type_supported_types.update(S2_SUPPORTED_CANONICAL_TYPES)
-    s2_row = s2_skill.score_candidates(
-        [candidate], s2_skill.compile_weights(policy)
-    )[0]
+    rows = skill.score_candidates(
+        [
+            {**base, "paper_arxiv_id": "review"},
+            {**base, "paper_arxiv_id": "journal"},
+        ],
+        skill.compile_weights(policy),
+    )
+    by_id = {row["paper_arxiv_id"]: row for row in rows}
 
-    assert qwen_row["paper_type_backend"] == "qwen"
-    assert qwen_row["paper_type_evidence_source"] is None
-    assert not qwen_row["hard_filtered"]
-    assert s2_row["paper_type_evidence_source"] == "semantic_scholar"
-    assert s2_row["hard_filtered"]
+    assert by_id["review"]["paper_type_probs"] == {
+        "JournalArticle": 1.0,
+        "Review": 1.0,
+    }
+    assert "survey_review" not in by_id["review"]["paper_type_probs"]
+    assert by_id["review"]["hard_filtered"]
+    assert not by_id["journal"]["hard_filtered"]
+    assert "paper_type_soft_penalty" not in by_id["journal"]
+    assert by_id["journal"]["paper_type_namespace"] == "s2_native"
+
+
+def test_s2_native_positive_type_evidence_supports_soft_preference():
+    cache = {
+        "conference": s2_publication_types_to_record(
+            "conference", ["JournalArticle", "Conference"]
+        ),
+        "journal": s2_publication_types_to_record(
+            "journal", ["JournalArticle"]
+        ),
+    }
+    skill = RerankSkill("qwen-test", paper_type_cache=cache)
+    policy = validate_policy_object(
+        valid_policy(
+            paper_type_rules=[
+                {
+                    "types": ["Conference"],
+                    "action": "prefer",
+                    "logic": "any",
+                    "strength": "high",
+                }
+            ]
+        ),
+        policy_id="native-prefer",
+    )
+    base = {
+        "query_score_normalized": 0.5,
+        "subquery_score_normalized": 0.5,
+        "intent_labels": [],
+        "path_count_normalized": 0.0,
+    }
+
+    rows = skill.score_candidates(
+        [
+            {**base, "paper_arxiv_id": "journal"},
+            {**base, "paper_arxiv_id": "conference"},
+        ],
+        skill.compile_weights(policy),
+    )
+
+    assert rows[0]["paper_arxiv_id"] == "conference"
+    assert (
+        rows[0]["component_contributions"]["paper_type_alignment"]
+        > rows[1]["component_contributions"]["paper_type_alignment"]
+    )
 
 
 def test_hard_filtered_rows_do_not_enter_ranking_and_ties_are_reproducible():
     policy_value = valid_policy(
+        weight_levels=weight_levels_with_type_alignment("off"),
         paper_type_rules=[
             {
-                "types": ["survey_review"],
+                "types": ["Review"],
                 "action": "exclude",
                 "logic": "any",
-                "threshold": 0.8,
             }
         ]
     )
     policy = validate_policy_object(policy_value, policy_id="p")
     cache = {
-        "survey": {
-            "type_probs": {"survey_review": 0.95},
-            "confidence": 0.95,
-        },
-        "seed": {"type_probs": {"primary_method": 0.8}, "confidence": 0.9},
-        "other": {"type_probs": {"primary_method": 0.8}, "confidence": 0.9},
+        "survey": s2_publication_types_to_record("survey", ["Review"]),
+        "seed": s2_publication_types_to_record("seed", ["Conference"]),
+        "other": s2_publication_types_to_record("other", ["Conference"]),
     }
     skill = RerankSkill("qwen-test", paper_type_cache=cache)
     compiled = skill.compile_weights(policy)
@@ -482,7 +549,7 @@ def test_hard_filtered_rows_do_not_enter_ranking_and_ties_are_reproducible():
             "paper_type_probs": {},
             "paper_type_classifier_confidence": 0.0,
         }
-    )["type_probs"]["survey_review"] == pytest.approx(0.95)
+    )["type_probs"]["Review"] == pytest.approx(1.0)
 
 
 def test_hard_type_rule_is_independent_of_soft_alignment_weight():
@@ -493,7 +560,7 @@ def test_hard_type_rule_is_independent_of_soft_alignment_weight():
         },
         paper_type_rules=[
             {
-                "types": ["survey_review"],
+                "types": ["Review"],
                 "action": "exclude",
                 "logic": "any",
             }
@@ -503,10 +570,7 @@ def test_hard_type_rule_is_independent_of_soft_alignment_weight():
     skill = RerankSkill(
         "qwen-test",
         paper_type_cache={
-            "survey": {
-                "type_probs": {"survey_review": 0.95},
-                "confidence": 0.95,
-            }
+            "survey": s2_publication_types_to_record("survey", ["Review"])
         },
     )
     compiled = skill.compile_weights(policy)

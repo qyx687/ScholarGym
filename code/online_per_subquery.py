@@ -50,6 +50,9 @@ class OnlinePerSubqueryManager:
         policy, compiled = self.processor.configure_query(original_query)
         paper_type_provenance = {
             "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_namespace": getattr(
+                self.processor.rerank_skill, "paper_type_namespace", None
+            ),
             "paper_type_evidence_source": getattr(
                 resolver, "evidence_source", None
             ),
@@ -318,6 +321,9 @@ class OnlinePerSubqueryManager:
             },
             "paper_type_stats_cumulative": paper_type_after,
             "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_namespace": getattr(
+                self.processor.rerank_skill, "paper_type_namespace", None
+            ),
             "paper_type_evidence_source": getattr(
                 resolver, "evidence_source", None
             ),

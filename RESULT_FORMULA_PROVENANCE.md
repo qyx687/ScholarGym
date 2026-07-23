@@ -48,8 +48,8 @@ rerank_prompt_version = v3
 `comparability.comparable_config=true`。动态 run 中若某个 query 的
 `used_fallback=true`，该 query 实际使用旧四因子公式，不能计作动态 policy 成功。
 
-候选论文类型证据也是正式实验变量。manifest 中的 `paper_type_backend` 必须为
-`s2` 或 `qwen`；前者使用 S2 positive-only publication type，后者使用固定 Qwen
-模型对 title+abstract 做完整 taxonomy 分类。S2/Qwen 对照必须复用相同
-`rerank_policy_cache`，使用独立 type cache，并通过
-`code/compare_online_paper_type_backends.py` 检查 policy ID 和其余配置一致。
+候选论文类型证据固定为 S2 原生 positive-only `publicationTypes`。manifest 中
+应记录 `paper_type_backend=s2` 与 `paper_type_namespace=s2_native`；Qwen 只生成
+query policy，不再判断候选类型。类型规则只有 `prefer`、`avoid`、`exclude`；
+正向强约束使用 `prefer`，`exclude` 直接由原生标签集合命中触发，不经过可配置
+阈值。缺失 S2 标签表示 unknown，不构成负证据。

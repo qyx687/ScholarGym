@@ -9,12 +9,7 @@ f426fd15e3ff28ee11ddeafc253dffd73ef88500。
 
 默认启用 query-conditioned dynamic rerank。Qwen 每个原始 query 只生成一次
 离散 policy，确定性编译器在全部 subquery/iteration 中复用。候选论文类型证据
-默认来自 S2，也可显式切换为 query-independent 的 Qwen title+abstract 分类器：
-
-~~~text
---paper_type_backend s2    # default
---paper_type_backend qwen
-~~~
+固定来自 S2 原生 `publicationTypes`；Qwen 不判断候选论文类型。
 
 静态对照及动态失败时的回退公式为：
 
@@ -53,3 +48,5 @@ Sel F1 = 2 * macro(Sel R) * macro(Sel P)
 
 安装、运行、断点和产物说明见 [中文详细说明](README_PACKAGE.md)。
 历史结果对应的公式见 [结果公式来源说明](RESULT_FORMULA_PROVENANCE.md)。
+最新 S2-native-v4 闭环结果见
+[docs/s2_native_v4_results.md](docs/s2_native_v4_results.md)。

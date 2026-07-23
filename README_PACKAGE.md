@@ -339,12 +339,8 @@ Selector 输入；Selector 的 selected papers、overview 与 checklist 继续�
 --rerank_semantic_min_mass 0.90
 --rerank_negative_weight 0.15
 --rerank_max_negative_mass 0.30
---paper_type_backend s2|qwen
 --paper_type_cache PATH
 --paper_type_rate_limit_rps 1.0
---paper_type_qwen_model MODEL
---paper_type_qwen_is_local / --no-paper_type_qwen_is_local
---paper_type_qwen_batch_size 16
 --paper_type_offline_cache_only / --no-paper_type_offline_cache_only
 ~~~
 
@@ -352,19 +348,15 @@ Selector 输入；Selector 的 selected papers、overview 与 checklist 继续�
 或 confidence 低于阈值，该 query 会安全回退到静态四因子公式，并在
 `query_rerank_policies.jsonl` 中记录原因。policy cache key 包含
 `--rerank_min_confidence`，改变阈值不会复用旧阈值下的接受结果。S2
-`publicationTypes` 只在 policy
-包含论文类型规则时才按需解析候选类型。`--paper_type_backend s2` 是默认值，读取
-S2 `publicationTypes`，属于保守的 positive-only 证据；S2 未解析或无类型时视为
-unknown，不会误触发硬过滤。`--paper_type_backend qwen` 使用 title+abstract 批量
-执行 query-independent 九类多标签分类，并将完整结果写入独立缓存。Qwen 类型
-cache 同时绑定 `--paper_type_qwen_model`；更换模型时旧记录不会被复用。Qwen
-miss/失败保持 unknown，不会回退使用候选自带的 S2 类型。
-分类 prompt 不包含原始 query、subquery、policy 或 GT。
-
-两种 backend 禁止共用同一个 cache 文件。若未显式给出 `--paper_type_cache`，程序
-分别使用 `cache/dynamic_rerank/paper_types_s2.jsonl` 和
-`cache/dynamic_rerank/paper_types_qwen.jsonl`；cache loader 也会拒绝另一 backend
-的记录。
+`publicationTypes` 只在 policy 包含论文类型规则时按需解析。候选类型来源固定为
+S2 原生 `publicationTypes`，规则直接使用 13 个原生标签，不再提供 Qwen/S2
+backend 或 canonical/native namespace 切换。Qwen 仍用于生成 query policy，
+不判断候选论文类型。类型动作只允许 `prefer`、`avoid`、`exclude`：query 中的
+正向“require/must/only”约束生成高强度 `prefer`，`exclude` 则直接按原生标签集合
+是否命中执行，不使用可配置的 confidence/match 阈值。S2 是 positive-only 证据：
+未解析或无类型时视为 unknown，不会误触发硬过滤。若未显式给出
+`--paper_type_cache`，程序使用
+`cache/dynamic_rerank/paper_types_s2_native.jsonl`；loader 会拒绝旧 Qwen 缓存。
 
 PASA-RealScholar 动态运行示例：
 
@@ -386,7 +378,6 @@ python code/eval.py \
   --enable_per_subquery_graph \
   --dynamic_rerank \
   --rerank_policy_cache cache/dynamic_rerank/query_policies_pasa_v1.jsonl \
-  --paper_type_backend s2 \
   --paper_type_cache cache/dynamic_rerank/paper_types_s2_online_pasa_v1.jsonl \
   --graph_method citations_references \
   --graph_expansion_limit 100 \
@@ -425,46 +416,3 @@ python code/compare_online_rerank.py \
 
 比较脚本会检查关键 manifest 配置及 static/dynamic mode；不满足时
 `comparability.comparable_config=false`，不要把这种结果作为正式结论。
-
-### S2 与 Qwen 论文类型 backend 对照
-
-两组必须复用相同 `--rerank_policy_cache`，并保持其余参数一致；只改变 backend、
-backend cache 及 Qwen 分类参数：
-
-~~~bash
-# S2 arm
-python code/eval.py ... \
-  --run_label pasa_dynamic_type_s2_run1 \
-  --dynamic_rerank \
-  --rerank_policy_cache cache/dynamic_rerank/query_policies_pasa_v1.jsonl \
-  --paper_type_backend s2 \
-  --paper_type_cache cache/dynamic_rerank/paper_types_s2_online_pasa_v1.jsonl
-
-# Qwen arm
-python code/eval.py ... \
-  --run_label pasa_dynamic_type_qwen_run1 \
-  --dynamic_rerank \
-  --rerank_policy_cache cache/dynamic_rerank/query_policies_pasa_v1.jsonl \
-  --paper_type_backend qwen \
-  --paper_type_qwen_model qwen3-30b-a3b-instruct-2507 \
-  --paper_type_qwen_batch_size 16 \
-  --paper_type_cache cache/dynamic_rerank/paper_types_qwen_online_pasa_v1.jsonl
-~~~
-
-专用比较器同时输出 candidate/Selector F1、paired bootstrap、两个 backend 的
-hard-filter 数量、type alignment 启用 query 数量，以及共同候选论文上的逐类型
-正证据差异。S2 没有某类型的正证据只能解释为 unknown，脚本不会把它标成
-false negative：
-
-~~~bash
-python code/compare_online_paper_type_backends.py \
-  --s2_run /path/to/s2/run \
-  --qwen_run /path/to/qwen/run \
-  --type_positive_threshold 0.5 \
-  --output /path/to/qwen_vs_s2_types.json
-~~~
-
-若 S2 arm 是显式 backend 开关加入前已经完成、且 manifest 中
-`paper_type_source=semantic_scholar_publicationTypes`，可在审核确认后加入
-`--allow_legacy_s2_manifest`。比较结果会保留两边不同的 source hash 和接受原因，
-不会把这项兼容处理静默隐藏。

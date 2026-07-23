@@ -91,7 +91,6 @@ PAPER_TYPE_ALIASES = {
 }
 
 PAPER_TYPE_ACTIONS: Tuple[str, ...] = (
-    "require",
     "prefer",
     "avoid",
     "exclude",

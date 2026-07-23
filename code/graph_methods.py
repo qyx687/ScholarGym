@@ -522,14 +522,11 @@ class PerSubqueryProcessor:
         self.active_original_query = ""
         if self.rerank_skill is not None and self.paper_type_resolver is not None:
             resolver_backend = str(self.paper_type_resolver.backend).lower()
-            if self.rerank_skill.paper_type_backend not in {None, resolver_backend}:
+            if resolver_backend != "s2":
                 raise ValueError(
-                    "rerank skill paper-type backend does not match resolver backend"
+                    "dynamic reranking requires the native Semantic Scholar "
+                    "publication-type resolver"
                 )
-            self.rerank_skill.paper_type_backend = resolver_backend
-            # The active backend declares its usable taxonomy even when its
-            # persistent cache is initially empty. S2 exposes four positive-only
-            # types; Qwen exposes the full closed-world catalog.
             self.rerank_skill.paper_type_supported_types.update(
                 self.paper_type_resolver.supported_types
             )
@@ -745,6 +742,11 @@ class PerSubqueryProcessor:
                 "paper_type_backend": (
                     self.paper_type_resolver.backend
                     if self.paper_type_resolver is not None
+                    else None
+                ),
+                "paper_type_namespace": (
+                    self.rerank_skill.paper_type_namespace
+                    if self.rerank_skill is not None
                     else None
                 ),
                 "paper_type_classifier_version": (

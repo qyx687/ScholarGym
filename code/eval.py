@@ -25,13 +25,15 @@ from graph_methods import (
     load_paper_db,
 )
 from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
-from online_paper_type import QwenPaperTypeResolver, S2PublicationTypeResolver
+from online_paper_type import S2PublicationTypeResolver
 from online_per_subquery import OnlinePerSubqueryManager
 from rerank_skill import (
     DEFAULT_MAX_NEGATIVE_MASS,
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_NEGATIVE_WEIGHT,
     DEFAULT_SEMANTIC_MIN_MASS,
+    PAPER_TYPE_BACKEND,
+    S2_NATIVE_PAPER_TYPE_NAMESPACE,
     RerankSkill,
 )
 
@@ -666,24 +668,11 @@ def main():
         default=DEFAULT_MAX_NEGATIVE_MASS,
     )
     parser.add_argument(
-        '--paper_type_backend',
-        choices=['s2', 'qwen'],
-        default='s2',
-        help='Candidate paper-type evidence provider (default: s2)',
-    )
-    parser.add_argument(
         '--paper_type_cache',
         default=None,
-        help='Backend-specific append-only cache; defaults to paper_types_<backend>.jsonl',
+        help='Append-only native S2 publicationTypes cache',
     )
     parser.add_argument('--paper_type_rate_limit_rps', type=float, default=1.0)
-    parser.add_argument('--paper_type_qwen_model', default=None)
-    parser.add_argument(
-        '--paper_type_qwen_is_local',
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument('--paper_type_qwen_batch_size', type=int, default=16)
     parser.add_argument(
         '--paper_type_offline_cache_only',
         action=argparse.BooleanOptionalAction,
@@ -698,9 +687,7 @@ def main():
     parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
 
     args = parser.parse_args()
-    if args.paper_type_qwen_batch_size <= 0:
-        parser.error('--paper_type_qwen_batch_size must be positive')
-    
+
     # Load config from custom path if specified
     cfg = config
     config_path = None
@@ -746,10 +733,7 @@ def main():
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
     if args.enable_per_subquery_graph and args.dynamic_rerank:
-        method_suffix = (
-            '_per_subquery_online_dynamic_rerank_v1'
-            f'_type-{args.paper_type_backend}'
-        )
+        method_suffix = '_per_subquery_online_dynamic_rerank_v1_type-s2-native'
     elif args.enable_per_subquery_graph:
         method_suffix = '_per_subquery_online_q030_sq040_intent015_path015'
     else:
@@ -847,43 +831,22 @@ def main():
             else args.graph_offline_cache_only
         )
         paper_type_cache = args.paper_type_cache or (
-            f'cache/dynamic_rerank/paper_types_{args.paper_type_backend}.jsonl'
-        )
-        paper_type_qwen_model = (
-            args.paper_type_qwen_model
-            or os.environ.get('SCHOLARGYM_MODEL')
-            or llm_model
-        )
-        paper_type_qwen_is_local = (
-            args.paper_type_qwen_is_local
-            if args.paper_type_qwen_is_local is not None
-            else is_local
+            'cache/dynamic_rerank/paper_types_s2_native.jsonl'
         )
         rerank_skill = None
         paper_type_resolver = None
         if args.dynamic_rerank:
-            if args.paper_type_backend == 's2':
-                paper_type_resolver = S2PublicationTypeResolver(
-                    paper_type_cache,
-                    requests_per_second=args.paper_type_rate_limit_rps,
-                    offline=paper_type_offline,
-                )
-            else:
-                paper_type_resolver = QwenPaperTypeResolver(
-                    paper_type_cache,
-                    paper_db_index,
-                    paper_type_qwen_model,
-                    is_local=paper_type_qwen_is_local,
-                    batch_size=args.paper_type_qwen_batch_size,
-                    offline=paper_type_offline,
-                )
+            paper_type_resolver = S2PublicationTypeResolver(
+                paper_type_cache,
+                requests_per_second=args.paper_type_rate_limit_rps,
+                offline=paper_type_offline,
+            )
             rerank_skill = RerankSkill(
                 rerank_policy_model,
                 is_local=rerank_policy_is_local,
                 policy_cache_path=args.rerank_policy_cache,
                 retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
                 paper_type_cache=paper_type_resolver.snapshot_cache(),
-                paper_type_backend=args.paper_type_backend,
                 min_confidence=args.rerank_min_confidence,
                 semantic_min_mass=args.rerank_semantic_min_mass,
                 negative_weight=args.rerank_negative_weight,
@@ -947,7 +910,10 @@ def main():
             'rerank_semantic_min_mass': args.rerank_semantic_min_mass if args.dynamic_rerank else None,
             'rerank_negative_weight': args.rerank_negative_weight if args.dynamic_rerank else None,
             'rerank_max_negative_mass': args.rerank_max_negative_mass if args.dynamic_rerank else None,
-            'paper_type_backend': args.paper_type_backend if args.dynamic_rerank else None,
+            'paper_type_backend': PAPER_TYPE_BACKEND if args.dynamic_rerank else None,
+            'paper_type_namespace': (
+                S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+            ),
             'paper_type_source': (
                 paper_type_resolver.evidence_source if paper_type_resolver else None
             ),
@@ -966,17 +932,7 @@ def main():
             'paper_type_offline_cache_only': paper_type_offline if args.dynamic_rerank else None,
             'paper_type_rate_limit_rps': (
                 args.paper_type_rate_limit_rps
-                if args.dynamic_rerank and args.paper_type_backend == 's2'
-                else None
-            ),
-            'paper_type_qwen_batch_size': (
-                args.paper_type_qwen_batch_size
-                if args.dynamic_rerank and args.paper_type_backend == 'qwen'
-                else None
-            ),
-            'paper_type_qwen_is_local': (
-                paper_type_qwen_is_local
-                if args.dynamic_rerank and args.paper_type_backend == 'qwen'
+                if args.dynamic_rerank
                 else None
             ),
             'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
