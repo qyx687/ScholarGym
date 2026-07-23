@@ -7,15 +7,48 @@ from typing import List, Dict
 from tqdm import tqdm
 import numpy as np
 import datetime
+import hashlib
 
 from logger import get_logger
 from rag import CitationRAGSystem
 import config
-from deeprag import DeepResearchWorkflow
+from deeprag import DeepResearchWorkflow, RANK_METRIC_SCHEMA_VERSION
 from simplerag import SimpleWorkflow
 from utils import extract_ground_truth_arxiv_ids, CheckpointManager, calculate_retrieval_metrics, AgentTraceRecorder
+from graph_methods import (
+    ArtifactWriter,
+    EmbeddingProvider,
+    PAPER_EMBEDDING_SERIALIZATION_ID,
+    PerSubqueryProcessor,
+    RERANK_FORMULA_ID,
+    S2GraphClient,
+    load_paper_db,
+)
+from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
+from online_paper_type import S2PublicationTypeResolver
+from online_per_subquery import OnlinePerSubqueryManager
+from rerank_skill import (
+    DEFAULT_MAX_NEGATIVE_MASS,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_NEGATIVE_WEIGHT,
+    DEFAULT_SEMANTIC_MIN_MASS,
+    PAPER_TYPE_BACKEND,
+    S2_NATIVE_PAPER_TYPE_NAMESPACE,
+    RerankSkill,
+)
 
 logger = get_logger(__name__, log_file='./log/eval.log')
+
+
+def package_source_sha256(filenames):
+    digest = hashlib.sha256()
+    base = os.path.dirname(os.path.abspath(__file__))
+    for filename in sorted(filenames):
+        path = os.path.join(base, filename)
+        digest.update(filename.encode('utf-8') + b'\0')
+        with open(path, 'rb') as handle:
+            digest.update(handle.read())
+    return digest.hexdigest()
 
 def load_config_from_path(config_path: str):
     """
@@ -40,7 +73,7 @@ def load_config_from_path(config_path: str):
 class CitationEvaluator:
     def __init__(self, rag_system: CitationRAGSystem, llm_model: str = config.LLM_MODEL_NAME, 
                  is_local: bool = config.IS_LOCAL_LLM, prompt_type: str = config.EVAL_PROMPT_TYPE, 
-                 search_method: str = config.EVAL_SEARCH_METHOD, trace_recorder=None):
+                 search_method: str = config.EVAL_SEARCH_METHOD, trace_recorder=None, online_per_subquery_manager=None):
         self.rag_system = rag_system
         self.llm_model = llm_model
         self.is_local = is_local
@@ -68,7 +101,8 @@ class CitationEvaluator:
             llm_model=self.llm_model,
             gen_params=self.gen_params,
             is_local=self.is_local,
-            trace_recorder=trace_recorder
+            trace_recorder=trace_recorder,
+            online_per_subquery_manager=online_per_subquery_manager,
         )
 
     def load_benchmark_data(self, benchmark_jsonl_path: str) -> List[Dict]:
@@ -131,8 +165,10 @@ class CitationEvaluator:
             retrieved_in_iter = step.get('retrieved_papers') or {}
             selected_in_iter = step.get('selected_papers') or {}
             gt_rank = step.get('gt_rank') or []
+            local_gt_rank = step.get('local_gt_rank') or []
             browsing_arxiv_ids = step.get('browsing_arxiv_ids') or []
-            avg_distance = step.get('avg_distance', 0)
+            avg_distance = step.get('avg_distance', -1)
+            local_avg_distance = step.get('local_avg_distance', -1)
             iteration_metrics = step.get('iteration_metrics') or {}
             subquery_metrics = step.get('subquery_metrics') or {}
             
@@ -194,6 +230,10 @@ class CitationEvaluator:
                 "total_discarded_gt_count": total_discarded_gt_count,
                 "gt_rank": gt_rank,
                 'avg_distance': avg_distance,
+                "gt_rank_scope": step.get('gt_rank_scope', 'baseline_retriever_rank_after_date_and_selection_exclusion'),
+                "local_gt_rank": local_gt_rank,
+                'local_avg_distance': local_avg_distance,
+                "local_gt_rank_scope": step.get('local_gt_rank_scope', 'seed_plus_expanded_closed_pool_rerank'),
                 "total_gt": len(gt_arxiv_ids),
                 "planner_during": step.get('planner_during', -1),
                 "retrieval_during": step.get('retrieval_during', -1),
@@ -219,18 +259,22 @@ class CitationEvaluator:
             )
 
         final_selected_papers = [
-            {"title": p.title, "arxiv_id": p.arxiv_id} 
+            {"arxiv_id": p.arxiv_id}
             for p in workflow_results.get('selected_papers', [])
         ]
 
         return {
             'idx': idx,
+            'rank_metric_schema_version': workflow_results.get(
+                'rank_metric_schema_version', RANK_METRIC_SCHEMA_VERSION
+            ),
             'query': query,
             'ground_truth_arxiv_ids': list(gt_arxiv_ids),
             'iteration_results': iteration_results,
             'final_report': workflow_results.get('final_report', ''),
             'final_selected_papers': final_selected_papers,
-            'executed_queries': workflow_results.get('executed_queries', [])
+            'executed_queries': workflow_results.get('executed_queries', []),
+            'online_per_subquery_summary': workflow_results.get('online_per_subquery_summary', {}),
         }
 
     def evaluate_benchmark(
@@ -263,6 +307,20 @@ class CitationEvaluator:
         if enable_resume and detailed_results_file:
             checkpoint_manager = CheckpointManager(detailed_results_file)
             checkpoint_manager.load_checkpoint()
+            graph_enabled = self.deep_research_workflow.online_per_subquery_manager is not None
+            incompatible_indices = [
+                result.get('idx')
+                for result in checkpoint_manager.cached_results
+                if workflow == 'deep_research'
+                and graph_enabled
+                and result.get('rank_metric_schema_version') != RANK_METRIC_SCHEMA_VERSION
+            ]
+            if incompatible_indices:
+                raise ValueError(
+                    'The existing detailed_results.jsonl predates separate global/local rank metrics '
+                    f'(incompatible query indices: {incompatible_indices[:10]}). Use a new --run_label '
+                    'or output directory; the global retriever ranks cannot be reconstructed from the old checkpoint.'
+                )
 
         results = {
             'total_queries': len(benchmark_data),
@@ -349,15 +407,16 @@ class CitationEvaluator:
                                 if time_val >= 0:
                                     results[phase_key].append(time_val)
                         
-                        # 累积各轮次的 avg_distance 列表，区分轮次
+                        # Accumulate independent global-retriever and local-rerank distances.
                         for res in query_result['iteration_results']:
                             iter_idx = res['iter_idx']
-                            distance_key = f'avg_distance_iter_{iter_idx}'
-                            if distance_key not in results:
-                                results[distance_key] = []
-                            avg_distance = res.get('avg_distance', -1)
-                            if avg_distance >= 0:
-                                results[distance_key].append(avg_distance)
+                            for field_name in ('avg_distance', 'local_avg_distance'):
+                                distance = res.get(field_name, -1)
+                                if distance >= 0:
+                                    distance_key = f'{field_name}_iter_{iter_idx}'
+                                    if distance_key not in results:
+                                        results[distance_key] = []
+                                    results[distance_key].append(distance)
                         
                         # 累积各轮次的 discarded_ratio 列表，区分轮次
                         for res in query_result['iteration_results']:
@@ -440,6 +499,10 @@ class CitationEvaluator:
                 elif key.startswith('avg_distance_iter_'):
                     avg_key = f'avg_{key}'
                     results[avg_key] = np.mean(results[key]) if results[key] else 0.0
+
+                elif key.startswith('local_avg_distance_iter_'):
+                    avg_key = f'avg_{key}'
+                    results[avg_key] = np.mean(results[key]) if results[key] else 0.0
                 
                 # 计算各轮次平均 discarded_ratio
                 elif key.startswith('discarded_ratio_iter_'):
@@ -509,10 +572,11 @@ class CitationEvaluator:
             "BROWSER_MODE": config.BROWSER_MODE,
             "PLANNER_ABLATION": config.PLANNER_ABLATION,
         }
+        record.update(results.get('method_config') or {})
         
         # Flatten the avg_recalls dictionary and clean up the keys
         avg_metrics = {k: v for k, v in results.items() if k.startswith('avg_')}
-        cleaned_metrics = {k.replace('avg_', ''): v for k, v in avg_metrics.items()}
+        cleaned_metrics = {k.replace('avg_', '', 1): v for k, v in avg_metrics.items()}
         record.update(cleaned_metrics)
         
         # Ensure parent directory exists
@@ -555,6 +619,8 @@ def main():
     parser.add_argument('--faiss_path', type=str, default=None, help='Path prefix for FAISS index files')
     parser.add_argument('--bm25_path', type=str, default=None, help='Path for BM25 index file')
     parser.add_argument('--output_dir', type=str, default=None, help='Base directory to save evaluation results')
+    parser.add_argument('--run_label', type=str, default='', help='Optional output-directory label')
+    parser.add_argument('--limit', type=int, default=None, help='Process only the first N benchmark queries')
     parser.add_argument('--rebuild_index', action='store_true', help='Force rebuild of indices')
     parser.add_argument('--top_k', type=int, nargs='+', default=None, help='Top-k values for evaluation')
     parser.add_argument('--device', type=str, default=None, help='Device for embedding model')
@@ -565,9 +631,63 @@ def main():
     parser.add_argument('--max_iterations', type=int, default=None, help='Maximum number of iterations for deep research workflow')
     parser.add_argument('--results_per_query', type=int, default=None, help='Results per query for deep research workflow')
     parser.add_argument('--browser_mode', type=str, default=None, choices=['PRE_ENRICH', 'REFRESH', 'INCREMENTAL', 'NONE'], help='Browser mode for deep research workflow')
+    parser.add_argument('--enable_per_subquery_graph', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--save_level', choices=['minimal', 'full'], default='minimal')
+    parser.add_argument('--graph_method', choices=['citations', 'references', 'citations_references'], default='citations_references')
+    parser.add_argument('--graph_expansion_limit', type=int, default=100)
+    parser.add_argument('--graph_cache_dir', default='cache/s2_graph_oracle')
+    parser.add_argument('--graph_rate_limit_rps', type=float, default=4.0)
+    parser.add_argument('--graph_offline_cache_only', action='store_true')
+    parser.add_argument(
+        '--dynamic_rerank',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Compile one query-conditioned policy and reuse it across all online iterations',
+    )
+    parser.add_argument('--rerank_policy_model', default=None)
+    parser.add_argument(
+        '--rerank_policy_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        '--rerank_policy_cache',
+        default='cache/dynamic_rerank/query_policies.jsonl',
+    )
+    parser.add_argument('--rerank_retry_cached_fallbacks', action='store_true')
+    parser.add_argument('--rerank_min_confidence', type=float, default=DEFAULT_MIN_CONFIDENCE)
+    parser.add_argument(
+        '--rerank_semantic_min_mass',
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_MASS,
+    )
+    parser.add_argument('--rerank_negative_weight', type=float, default=DEFAULT_NEGATIVE_WEIGHT)
+    parser.add_argument(
+        '--rerank_max_negative_mass',
+        type=float,
+        default=DEFAULT_MAX_NEGATIVE_MASS,
+    )
+    parser.add_argument(
+        '--paper_type_cache',
+        default=None,
+        help='Append-only native S2 publicationTypes cache',
+    )
+    parser.add_argument('--paper_type_rate_limit_rps', type=float, default=1.0)
+    parser.add_argument(
+        '--paper_type_offline_cache_only',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--embedding_backend', choices=['ollama', 'api'], default='ollama')
+    parser.add_argument('--embedding_service_model', default='qwen3-embedding:0.6b')
+    parser.add_argument('--embedding_base_url', default=None)
+    parser.add_argument('--embedding_api_key_env', default='EMBEDDING_API_KEY')
+    parser.add_argument('--embedding_batch_size', type=int, default=64)
+    parser.add_argument('--qdrant_url', default=None)
+    parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
 
     args = parser.parse_args()
-    
+
     # Load config from custom path if specified
     cfg = config
     config_path = None
@@ -593,12 +713,33 @@ def main():
     results_per_query = args.results_per_query or cfg.MAX_RESULTS_PER_QUERY
     browser_mode = args.browser_mode or cfg.BROWSER_MODE
 
+    # The workflow modules import the canonical config module, so mirror the
+    # resolved custom-config/CLI values before constructing agents.
+    config.LLM_MODEL_NAME = llm_model
+    config.IS_LOCAL_LLM = is_local
+    config.LLM_GEN_PARAMS = cfg.LLM_GEN_PARAMS
+    config.ENABLE_REASONING = cfg.ENABLE_REASONING
+    config.ENABLE_STRUCTURED_OUTPUT = cfg.ENABLE_STRUCTURED_OUTPUT
+    config.MAX_RESULTS_PER_QUERY = results_per_query
+    config.EVAL_MAX_ITERATIONS = max_iterations
+    config.BROWSER_MODE = browser_mode
+    config.PLANNER_ABLATION = getattr(cfg, 'PLANNER_ABLATION', False)
+    config.SAVE_AGENT_TRACES = False
+    config.DEBUG = False
+
     # Use loaded config (cfg) for flags, not global config
     reasoning_flag = 'reasoning' if cfg.ENABLE_REASONING else 'instruct'
     structured_flag = 'structured' if cfg.ENABLE_STRUCTURED_OUTPUT else 'non-structured'
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}")
+    if args.enable_per_subquery_graph and args.dynamic_rerank:
+        method_suffix = '_per_subquery_online_dynamic_rerank_v1_type-s2-native'
+    elif args.enable_per_subquery_graph:
+        method_suffix = '_per_subquery_online_q030_sq040_intent015_path015'
+    else:
+        method_suffix = '_baseline'
+    label_suffix = f"_{args.run_label}" if args.run_label else ''
+    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{method_suffix}{label_suffix}")
     os.makedirs(current_output_dir, exist_ok=True)
 
     # Save config file for reproduction
@@ -615,10 +756,27 @@ def main():
     # TODO: different workflow should have different output dir, simple workflow use top_k instead of results_per_query
 
     logger.info("[🚀]Initializing RAG system...")
+    embedding_provider = None
+    if search_method in {'vector', 'hybrid'}:
+        embedding_base_url = args.embedding_base_url or (
+            getattr(cfg, 'OLLAMA_URL', 'http://localhost:11434')
+            if args.embedding_backend == 'ollama'
+            else 'https://openrouter.ai/api/v1'
+        )
+        embedding_provider = EmbeddingProvider(
+            backend=args.embedding_backend,
+            model=args.embedding_service_model,
+            base_url=embedding_base_url,
+            api_key=os.environ.get(args.embedding_api_key_env, ''),
+            batch_size=args.embedding_batch_size,
+        )
     rag_system = CitationRAGSystem(
         embedding_model_path=embedding_model,
         device=device,
-        search_method=search_method
+        search_method=search_method,
+        embedding_provider=embedding_provider,
+        qdrant_url=args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
+        qdrant_collection=args.qdrant_collection,
     )
     
     rag_system.load_or_build_indices(
@@ -630,7 +788,7 @@ def main():
     
     # Initialize trace recorder if enabled
     trace_recorder = None
-    if cfg.SAVE_AGENT_TRACES:
+    if config.SAVE_AGENT_TRACES:
         trace_recorder = AgentTraceRecorder(
             output_dir=output_dir,
             model_name=llm_model,
@@ -644,17 +802,166 @@ def main():
         )
     
     logger.info("[🚀]Initializing evaluator...")
+    online_manager = None
+    if args.enable_per_subquery_graph:
+        if search_method == 'hybrid':
+            raise ValueError('Online graph rerank supports matched bm25 or vector modes, not hybrid')
+        artifacts_dir = os.path.join(current_output_dir, 'online_artifacts')
+        artifact_writer = ArtifactWriter(artifacts_dir, args.save_level)
+        paper_db_index = load_paper_db(paper_db)
+        s2_client = S2GraphClient(
+            args.graph_cache_dir,
+            rate_limit_rps=args.graph_rate_limit_rps,
+            offline=args.graph_offline_cache_only,
+        )
+        scoring_backend = 'embedding' if search_method == 'vector' else 'bm25'
+        rerank_policy_model = (
+            args.rerank_policy_model
+            or os.environ.get('SCHOLARGYM_MODEL')
+            or llm_model
+        )
+        rerank_policy_is_local = (
+            args.rerank_policy_is_local
+            if args.rerank_policy_is_local is not None
+            else is_local
+        )
+        paper_type_offline = (
+            args.paper_type_offline_cache_only
+            if args.paper_type_offline_cache_only is not None
+            else args.graph_offline_cache_only
+        )
+        paper_type_cache = args.paper_type_cache or (
+            'cache/dynamic_rerank/paper_types_s2_native.jsonl'
+        )
+        rerank_skill = None
+        paper_type_resolver = None
+        if args.dynamic_rerank:
+            paper_type_resolver = S2PublicationTypeResolver(
+                paper_type_cache,
+                requests_per_second=args.paper_type_rate_limit_rps,
+                offline=paper_type_offline,
+            )
+            rerank_skill = RerankSkill(
+                rerank_policy_model,
+                is_local=rerank_policy_is_local,
+                policy_cache_path=args.rerank_policy_cache,
+                retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
+                paper_type_cache=paper_type_resolver.snapshot_cache(),
+                min_confidence=args.rerank_min_confidence,
+                semantic_min_mass=args.rerank_semantic_min_mass,
+                negative_weight=args.rerank_negative_weight,
+                max_negative_mass=args.rerank_max_negative_mass,
+            )
+        processor = PerSubqueryProcessor(
+            paper_db_index,
+            s2_client,
+            scoring_backend=scoring_backend,
+            embedding_provider=embedding_provider,
+            expansion_method=args.graph_method,
+            expansion_limit=args.graph_expansion_limit,
+            rerank_skill=rerank_skill,
+            paper_type_resolver=paper_type_resolver,
+        )
+        online_manager = OnlinePerSubqueryManager(processor, artifact_writer, os.path.basename(current_output_dir))
+        artifact_writer.write_json('run_manifest.json', {
+            'upstream_repository': 'https://github.com/shenhao-stu/ScholarGym.git',
+            'baseline_commit_mirror': 'https://github.com/qyx687/ScholarGym.git@baseline-repro',
+            'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
+            'artifact_schema_version': '1.0',
+            'rank_metric_schema_version': RANK_METRIC_SCHEMA_VERSION,
+            'package_source_sha256': package_source_sha256([
+                'api.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
+                'graph_methods.py', 'metrics.py', 'online_paper_type.py',
+                'online_per_subquery.py', 'paper_type.py', 'rag.py',
+                'rerank_skill.py', 'utils.py',
+                os.path.join('agent', 'selector.py'),
+                os.path.join('mcp', 'retrieval_mcp.py'),
+            ]),
+            'save_level': args.save_level,
+            'config_path': args.config,
+            'paper_db_path': paper_db,
+            'benchmark_jsonl_path': benchmark_jsonl,
+            'bm25_path': bm25_path if search_method == 'bm25' else None,
+            'llm_model': llm_model,
+            'prompt_type': prompt_type,
+            'max_iterations': max_iterations,
+            'browser_mode': browser_mode,
+            'method': 'online_per_subquery',
+            'search_method': search_method,
+            'scoring_backend': scoring_backend,
+            'embedding_backend': args.embedding_backend if embedding_provider else None,
+            'embedding_model': args.embedding_service_model if embedding_provider else None,
+            'paper_embedding_serialization_id': (
+                PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+            ),
+            'embedding_base_url': embedding_provider.base_url if embedding_provider else None,
+            'qdrant_url': args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
+            'qdrant_collection': args.qdrant_collection,
+            'graph_method': args.graph_method,
+            'graph_cache_dir': args.graph_cache_dir,
+            'graph_expansion_limit': args.graph_expansion_limit,
+            'graph_rate_limit_rps': args.graph_rate_limit_rps,
+            'graph_offline_cache_only': args.graph_offline_cache_only,
+            'dynamic_rerank_requested': args.dynamic_rerank,
+            'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+            'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+            'rerank_policy_cache': args.rerank_policy_cache if args.dynamic_rerank else None,
+            'rerank_min_confidence': args.rerank_min_confidence if args.dynamic_rerank else None,
+            'rerank_semantic_min_mass': args.rerank_semantic_min_mass if args.dynamic_rerank else None,
+            'rerank_negative_weight': args.rerank_negative_weight if args.dynamic_rerank else None,
+            'rerank_max_negative_mass': args.rerank_max_negative_mass if args.dynamic_rerank else None,
+            'paper_type_backend': PAPER_TYPE_BACKEND if args.dynamic_rerank else None,
+            'paper_type_namespace': (
+                S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+            ),
+            'paper_type_source': (
+                paper_type_resolver.evidence_source if paper_type_resolver else None
+            ),
+            'paper_type_classifier_version': (
+                paper_type_resolver.classifier_version if paper_type_resolver else None
+            ),
+            'paper_type_model': (
+                paper_type_resolver.model if paper_type_resolver else None
+            ),
+            'paper_type_supported_types': (
+                list(paper_type_resolver.supported_types)
+                if paper_type_resolver
+                else None
+            ),
+            'paper_type_cache': paper_type_cache if args.dynamic_rerank else None,
+            'paper_type_offline_cache_only': paper_type_offline if args.dynamic_rerank else None,
+            'paper_type_rate_limit_rps': (
+                args.paper_type_rate_limit_rps
+                if args.dynamic_rerank
+                else None
+            ),
+            'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+            'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
+            'date_policy': 'seeds_trust_retriever_expanded_require_db_date_lte_cutoff',
+            'results_per_query': results_per_query,
+            'run_label': args.run_label,
+            'limit': args.limit,
+            'rerank_formula_id': POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID,
+            'feature_weights': None if args.dynamic_rerank else processor.weights,
+            'query_policy_artifact': 'online_artifacts/query_rerank_policies.jsonl',
+            'closed_loop_effect': 'dynamic_topk_to_selector_to_memory_to_next_planner_iteration',
+            'prompts_saved': False,
+            'paper_identity_in_artifacts': 'arxiv_id_only',
+        })
     evaluator = CitationEvaluator(
         rag_system=rag_system,
         llm_model=llm_model,
         is_local=is_local,
         prompt_type=prompt_type,
         search_method=search_method,
-        trace_recorder=trace_recorder
+        trace_recorder=trace_recorder,
+        online_per_subquery_manager=online_manager,
     )
     
     # Load and process benchmark data
     benchmark_data = evaluator.load_benchmark_data(benchmark_jsonl)
+    if args.limit is not None:
+        benchmark_data = benchmark_data[:max(0, args.limit)]
     
     detailed_results_file = os.path.join(current_output_dir, 'detailed_results.jsonl')
     summary_file = os.path.join(output_dir, 'evaluation_summary.jsonl')
@@ -669,6 +976,40 @@ def main():
         detailed_results_file=detailed_results_file,
         enable_resume=True
     )
+    results['method_config'] = {
+        'PACKAGE_METHOD': (
+            'online_per_subquery_dynamic_rerank'
+            if args.enable_per_subquery_graph and args.dynamic_rerank
+            else ('online_per_subquery_graph_rerank' if args.enable_per_subquery_graph else 'baseline')
+        ),
+        'RANK_METRIC_SCHEMA_VERSION': RANK_METRIC_SCHEMA_VERSION,
+        'SAVE_LEVEL': args.save_level,
+        'ENABLE_PER_SUBQUERY_GRAPH': args.enable_per_subquery_graph,
+        'GRAPH_METHOD': args.graph_method,
+        'GRAPH_EXPANSION_LIMIT': args.graph_expansion_limit,
+        'GRAPH_RATE_LIMIT_RPS': args.graph_rate_limit_rps,
+        'DYNAMIC_RERANK': args.dynamic_rerank if args.enable_per_subquery_graph else False,
+        'RERANK_FORMULA_ID': (
+            POLICY_VERSION if args.enable_per_subquery_graph and args.dynamic_rerank
+            else (RERANK_FORMULA_ID if args.enable_per_subquery_graph else None)
+        ),
+        'RERANK_FEATURE_WEIGHTS': (
+            None if args.enable_per_subquery_graph and args.dynamic_rerank
+            else (processor.weights if args.enable_per_subquery_graph else None)
+        ),
+        'RERANK_POLICY_MODEL': (
+            rerank_policy_model
+            if args.enable_per_subquery_graph and args.dynamic_rerank
+            else None
+        ),
+        'EMBEDDING_BACKEND': args.embedding_backend if embedding_provider else None,
+        'EMBEDDING_MODEL': args.embedding_service_model if embedding_provider else None,
+        'PAPER_EMBEDDING_SERIALIZATION_ID': (
+            PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+        ),
+        'QDRANT_COLLECTION': args.qdrant_collection if embedding_provider else None,
+        'RUN_LABEL': args.run_label,
+    }
 
     evaluator.print_summary(results)
     

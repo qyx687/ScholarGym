@@ -43,7 +43,8 @@ class Selector:
         iteration_index: int = 1,
         idx: int = 5,
         old_overview: str = "",
-        is_after_browsing: bool = False
+        is_after_browsing: bool = False,
+        return_details: bool = False,
     ) -> Tuple[List[Paper], str]:
         """
         Decides which papers to maintain for a given subquery.
@@ -61,7 +62,9 @@ class Selector:
             (selected_papers, overview)
         """
         if not config.ENABLE_LLM_FILTERING:
-            return papers, ""
+            if return_details:
+                return papers, "", {}, {"reasons": {}}
+            return papers, "", {}
 
         candidates_text = "\n".join(_candidate_line(p) for p in papers)
 
@@ -177,5 +180,8 @@ class Selector:
         }
         logger.info(f"[🔎 Selector] Selected {len(selected)}/{len(papers)} for sub-query '{sub_query.text}'.")
         
+        if return_details:
+            return selected, overview, to_browse_mapped, {
+                "reasons": data.get("reasons", {}) if isinstance(data, dict) else {},
+            }
         return selected, overview, to_browse_mapped
-

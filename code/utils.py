@@ -585,15 +585,16 @@ class CheckpointManager:
                 if time_val >= 0:
                     results[phase_key].append(time_val)
         
-        # Distance statistics
+        # Independent baseline-retriever and local-rerank distance statistics.
         for res in query_result['iteration_results']:
             iter_idx = res['iter_idx']
-            distance_key = f'avg_distance_iter_{iter_idx}'
-            if distance_key not in results:
-                results[distance_key] = []
-            avg_distance = res.get('avg_distance', -1)
-            if avg_distance >= 0:
-                results[distance_key].append(avg_distance)
+            for field_name in ('avg_distance', 'local_avg_distance'):
+                distance = res.get(field_name, -1)
+                if distance >= 0:
+                    distance_key = f'{field_name}_iter_{iter_idx}'
+                    if distance_key not in results:
+                        results[distance_key] = []
+                    results[distance_key].append(distance)
         
         # Discarded statistics
         for res in query_result['iteration_results']:

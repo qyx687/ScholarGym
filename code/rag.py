@@ -30,7 +30,7 @@ class CitationRAGSystem:
     Handles vector library construction and similarity-based paper retrieval.
     """
     
-    def __init__(self, embedding_model_path: str = config.EMBEDDING_MODEL_PATH, device: str = config.DEVICE, search_method: str = config.DEFAULT_SEARCH_METHOD):
+    def __init__(self, embedding_model_path: str = config.EMBEDDING_MODEL_PATH, device: str = config.DEVICE, search_method: str = config.DEFAULT_SEARCH_METHOD, embedding_provider=None, qdrant_url: str = None, qdrant_collection: str = "paper_knowledge_base"):
         """
         Initialize the citation RAG system with embedding model.
         
@@ -39,11 +39,14 @@ class CitationRAGSystem:
             device: Device to run the model on ('cuda' or 'cpu')
         """
         self.device = device
+        self.embedding_provider = embedding_provider
         self.embedding_model = SentenceTransformer(
             embedding_model_path, 
             trust_remote_code=True,
             device=device
-        ) if search_method != 'bm25' else None
+        ) if search_method != 'bm25' and embedding_provider is None else None
+        self.qdrant_url = qdrant_url or config.QDRANT_URL
+        self.qdrant_collection = qdrant_collection
         self.search_method = search_method
         self.faiss_index = None
         self.bm25_index = None
@@ -527,17 +530,18 @@ class CitationRAGSystem:
         """
         logger.info(f"Loading Qdrant index")
         
-        embedding_model_name = "qwen3-embedding:0.6b"  
-        print(f"Loading Embeddings: {embedding_model_name}...")
-        embeddings = OllamaEmbeddings(model=embedding_model_name, base_url=config.OLLAMA_URL)
-        
-        COLLECTION_NAME = "paper_knowledge_base"
-        
-        client = QdrantClient(url=config.QDRANT_URL)
+        if self.embedding_provider is not None:
+            embeddings = self.embedding_provider
+        else:
+            embedding_model_name = "qwen3-embedding:0.6b"
+            print(f"Loading Embeddings: {embedding_model_name}...")
+            embeddings = OllamaEmbeddings(model=embedding_model_name, base_url=config.OLLAMA_URL)
+
+        client = QdrantClient(url=self.qdrant_url)
         
         self.qdrant_vector_store = QdrantVectorStore(
             client=client,
-            collection_name=COLLECTION_NAME,
+            collection_name=self.qdrant_collection,
             embedding=embeddings,
         )
     

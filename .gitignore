@@ -3,6 +3,7 @@ faiss*
 secret.py
 .DS_Store
 __pycache__/
+cache/
 eval*/
 scholargym_paper_db.json
 scripts/
