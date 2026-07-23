@@ -1,6 +1,8 @@
 # ScholarGym OnePass 后处理实验包
 
 Query-conditioned dynamic rerank: [experiment guide](scripts/README_dynamic_rerank.md).
+The frozen S2-native-v4 results are summarized in
+[docs/s2_native_v4_results.md](docs/s2_native_v4_results.md).
 
 这是 ScholarGym baseline 的独立实验副本，固定在上游提交
 f426fd15e3ff28ee11ddeafc253dffd73ef88500。
@@ -15,9 +17,10 @@ f426fd15e3ff28ee11ddeafc253dffd73ef88500。
 
 ~~~bash
 --no-dynamic_rerank                 # 默认；严格静态 baseline
---dynamic_rerank --paper_type_backend s2
---dynamic_rerank --paper_type_backend qwen
+--dynamic_rerank --paper_type_cache <native-s2-cache.jsonl>
 ~~~
+
+动态模式固定使用 S2 原生 `publicationTypes`；Qwen 只生成 query policy。
 
 静态公式为：
 
@@ -35,9 +38,8 @@ q030_sq040_intent015_path015_closed_pool_minmax_v1
 ~~~
 
 动态模式在每个原始 query 开始时只调用一次 policy LLM，并把同一 policy 用于
-该 query 的全部 OnePass graph event。`paper_type_backend` 只决定“候选论文实际
-是什么类型”的证据来自 S2 还是 Qwen；两组都仍使用 policy LLM 阅读 query。
-候选类型 Qwen 只读取 title+abstract，并使用独立、可续跑的 backend cache。
+该 query 的全部 OnePass graph event。候选论文类型固定由 S2 原生
+`publicationTypes` 提供；policy LLM 只负责读取 query 并生成 rerank policy。
 
 Stage A 使用 --postprocess_stage materialize，只物化候选池和全部公式特征，
 不执行 rerank、Top-K 或 shadow Selector；该阶段不能同时启用

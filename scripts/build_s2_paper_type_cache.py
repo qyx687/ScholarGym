@@ -10,7 +10,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Sequence, Set
 
 import requests
 
@@ -20,16 +20,10 @@ CODE_DIR = REPO_ROOT / "code"
 if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
-from build_paper_type_cache import (  # noqa: E402
-    _append_failure,
-    _append_records,
-    compact_cache,
-    iter_pool_candidate_ids,
-    load_type_rule_query_ids,
-)
 from paper_type import (  # noqa: E402
     S2_CLASSIFIER_VERSION,
     load_paper_type_cache,
+    normalize_paper_id,
     s2_publication_types_to_record,
 )
 from runtime_env import load_env_file  # noqa: E402
@@ -37,6 +31,100 @@ from runtime_env import load_env_file  # noqa: E402
 
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 S2_BATCH_MAX_IDS = 500
+
+
+def iter_pool_candidate_ids(
+    path: Path,
+    allowed_query_ids: Set[str] | None = None,
+) -> Iterator[str]:
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid pool JSONL at line {line_number}: {exc}"
+                ) from exc
+            query_id = str(record.get("query_id") or "")
+            if allowed_query_ids is not None and query_id not in allowed_query_ids:
+                continue
+            rows = record.get("local_pool_rows")
+            if not isinstance(rows, list):
+                raise ValueError(
+                    f"pool line {line_number} has no local_pool_rows array"
+                )
+            for row in rows:
+                paper_id = normalize_paper_id(
+                    row.get("paper_arxiv_id")
+                    if isinstance(row, Mapping)
+                    else None
+                )
+                if paper_id:
+                    yield paper_id
+
+
+def load_type_rule_query_ids(path: Path) -> Set[str]:
+    output: Set[str] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid query policy JSONL at line {line_number}: {exc}"
+                ) from exc
+            policy = record.get("validated_policy") or {}
+            if policy.get("paper_type_rules"):
+                query_id = str(record.get("query_id") or "")
+                if query_id:
+                    output.add(query_id)
+    return output
+
+
+def _append_records(path: Path, records: Iterable[Mapping[str, Any]]) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with path.open("a", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+            count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    return count
+
+
+def compact_cache(path: Path) -> int:
+    """Atomically keep the latest validated native-S2 record per paper ID."""
+
+    if not path.exists():
+        return 0
+    with path.open("r", encoding="utf-8") as handle:
+        line_count = sum(1 for line in handle if line.strip())
+    cache = load_paper_type_cache(path)
+    tmp = path.with_suffix(path.suffix + ".compact.tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        for paper_id in sorted(cache):
+            record = dict(cache[paper_id])
+            record["paper_arxiv_id"] = paper_id
+            handle.write(
+                json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return max(0, line_count - len(cache))
+
+
+def _append_failure(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 class _RateLimiter:
@@ -247,7 +335,7 @@ def build_cache(
             bool(record.get("publication_types"))
             for record in final_candidate_records
         ),
-        "mapped_canonical_type_count": sum(
+        "native_type_evidence_count": sum(
             bool(record.get("type_probs")) for record in final_candidate_records
         ),
         "publication_type_counts": dict(publication_type_counts.most_common()),

@@ -18,6 +18,7 @@ from graph_methods import (
     RERANK_FORMULA_ID,
     S2GraphClient,
 )
+from paper_type import S2_PUBLICATION_TYPES, s2_publication_types_to_record
 from rerank_skill import RerankSkill
 
 
@@ -266,10 +267,9 @@ def test_graph_runtime_dynamic_policy_reuses_query_policy_and_hard_filters_type(
                 },
                 "paper_type_rules": [
                     {
-                        "types": ["survey_review"],
+                        "types": ["Review"],
                         "action": "exclude",
                         "logic": "any",
-                        "threshold": 0.8,
                     }
                 ],
                 "confidence": 0.95,
@@ -277,11 +277,11 @@ def test_graph_runtime_dynamic_policy_reuses_query_policy_and_hard_filters_type(
         )
 
     class FakeTypeResolver:
-        backend = "qwen"
-        evidence_source = "qwen"
-        classifier_version = "qwen30b_paper_type_v1"
-        supported_types = ("survey_review",)
-        model = "qwen-test"
+        backend = "s2"
+        evidence_source = "semantic_scholar"
+        classifier_version = "s2_publication_types_v1"
+        supported_types = S2_PUBLICATION_TYPES
+        model = None
 
         def __init__(self):
             self.calls = []
@@ -290,16 +290,9 @@ def test_graph_runtime_dynamic_policy_reuses_query_policy_and_hard_filters_type(
             ids = list(paper_ids)
             self.calls.append(ids)
             return {
-                "2001.00003": {
-                    "paper_arxiv_id": "2001.00003",
-                    "type_probs": {"survey_review": 0.99},
-                    "confidence": 0.96,
-                    "classifier_version": self.classifier_version,
-                    "evidence_source": self.evidence_source,
-                    "publication_types": [],
-                    "supported_types": ["survey_review"],
-                    "negative_evidence_types": ["survey_review"],
-                }
+                "2001.00003": s2_publication_types_to_record(
+                    "2001.00003", ["Review"]
+                )
             }
 
         def snapshot_stats(self):

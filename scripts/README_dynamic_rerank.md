@@ -5,16 +5,15 @@ full pipeline. Runtime selection is explicit:
 
 ```bash
 --no-dynamic_rerank
---dynamic_rerank --paper_type_backend s2
---dynamic_rerank --paper_type_backend qwen
+--dynamic_rerank --paper_type_cache <native-s2-cache.jsonl>
 ```
 
-The first command is the exact static arm. The latter two use the same
-query-policy generator but differ in how candidate paper type is determined.
-S2 and Qwen must use separate `--paper_type_cache` files. The rest of this
-document describes the saved-pool replay used to tune and validate the method.
-Runtime Qwen cache records are also bound to the configured Qwen model. A Qwen
-miss remains unknown and never falls back to Semantic Scholar evidence.
+The first command is the exact static arm. Dynamic rerank has one candidate
+type contract: the unmapped Semantic Scholar `publicationTypes` catalog. Qwen
+still generates the query policy once per original query, but never classifies
+candidate papers. The S2 cache is positive-only; a miss remains unknown. The
+rest of this document describes the saved-pool replay used to tune and validate
+the method.
 
 This experiment reuses materialized OnePass graph pools. It does not rerun the
 retriever, graph expansion, date filtering, Planner, or Selector.
@@ -70,32 +69,31 @@ the following query-level structure (abridged):
     "paper_type_alignment": "off"
   },
   "paper_type_rules": [
-    {"types": ["survey_review"], "action": "exclude", "logic": "any"}
+    {"types": ["Review"], "action": "exclude", "logic": "any"}
   ],
   "confidence": 0.95
 }
 ```
 
 This compiles the semantic score to `0.571429 * query_similarity +
-0.428571 * subquery_similarity`, with a separate high-confidence survey hard
+0.428571 * subquery_similarity`, with a separate native-tag survey hard
 constraint. There is no query-specific survey branch in code.
 
-Paper-type rules support `require`, `prefer`, `avoid`, and `exclude` over a
-fixed general catalog. Paper type is classified once from title + abstract,
-independently of the query, and cached when the Qwen evidence backend is used.
-Missing or low-confidence cache entries
-never cause a hard drop. Explicit hard rules are enforced even when the policy
-leaves the soft `paper_type_alignment` dimension off. To reduce false-negative
-drops, `exclude` requires classifier confidence at least 0.80 while `require`
-uses the more conservative threshold 0.95.
-The query-policy cache key includes `--rerank_min_confidence`, so changing that
-threshold cannot silently reuse a policy accepted under a different setting.
+Paper-type rules support `prefer`, `avoid`, and `exclude` over the fixed native
+S2 catalog. Positive constraints written as “require”, “must”, or “only” in the
+query compile to a high-strength `prefer` rule; native S2 does not provide the
+negative evidence needed for a hard `require` action. Missing S2 metadata never
+causes a hard drop. An `exclude` rule is enforced by direct membership in the
+paper's discrete `publicationTypes` set, even when the policy leaves the soft
+`paper_type_alignment` dimension off. There is no configurable classifier-
+confidence or match threshold for native S2 exclusion. The query-policy cache
+key includes `--rerank_min_confidence` and the paper-type prompt/schema version,
+so the v4 schema cannot silently reuse a v3 policy.
 
-## S2-first publication types
+## Native S2 publication types
 
-Candidate-level Qwen classification is optional. Semantic Scholar's
-`publicationTypes` metadata can be fetched in batches of at most 500 IDs and
-stored in the same cache schema with explicit provenance:
+Semantic Scholar's `publicationTypes` metadata can be fetched in batches of at
+most 500 IDs and stored with explicit provenance:
 
 ```bash
 python scripts/build_s2_paper_type_cache.py \
@@ -107,27 +105,40 @@ python scripts/build_s2_paper_type_cache.py \
   --rate_limit_rps 1
 ```
 
-The conservative canonical mapping is:
+Policies and scored rows use the 13 S2 labels directly:
 
-| S2 publication type | canonical rerank type |
-| --- | --- |
-| `Review`, `MetaAnalysis` | `survey_review` |
-| `CaseReport` | `application_case_study` |
-| `ClinicalTrial`, `Study` | `empirical_study` |
-| `Editorial`, `LettersAndComments` | `position_perspective` |
+```text
+Review, JournalArticle, CaseReport, ClinicalTrial, Conference, Dataset,
+Editorial, LettersAndComments, MetaAnalysis, News, Study, Book, BookSection
+```
 
-`Dataset` deliberately does not map to `dataset_benchmark`; a data record is
-not necessarily a benchmark paper. `JournalArticle`, `Conference`, `Book`,
-`BookSection`, and `News` remain raw provenance only. S2 mappings are
-positive-only evidence: `Review` can safely trigger an `exclude survey` rule,
-but absence of `Review` is unknown and cannot make a paper fail `require`.
+The three actions (`prefer`, `avoid`, `exclude`) work over those labels. S2 is
+positive-only evidence: a returned label supports a rule, while a missing label
+remains unknown. Therefore the presence of `Review` directly triggers an
+`exclude Review` rule, but absence of `Conference` only means that the paper
+does not receive a `prefer Conference` reward. Native `Dataset` means a dataset
+record, not a paper that introduces or evaluates a dataset/benchmark. The
+native prompt explicitly prevents that subject-matter confusion and also
+prevents a query about a system that writes surveys from becoming a `Review`
+preference.
 
-The compiler is source-capability aware. If a cached source cannot represent
-any type in a soft `prefer`/`avoid` rule, `paper_type_alignment` is forced off
-and its mass returns to the other enabled dimensions. Hard rules remain
-independent of the soft alignment weight. Future graph materialization also
-requests and stores `publicationTypes`; saved pools can use the batch builder
-without rerunning graph expansion.
+Native replay is selected with:
+
+```bash
+python scripts/replay_dynamic_rerank.py \
+  --pool_records "$POOL_RECORDS" \
+  --benchmark "$BENCHMARK" \
+  --paper_type_cache eval_dynamic_rerank/cache/paper_type_s2.jsonl \
+  --policy_cache eval_dynamic_rerank/cache/query_rerank_policy_s2_native_v4.jsonl \
+  --output eval_dynamic_rerank/s2_native/run_sem090 \
+  --model qwen3-30b-a3b-instruct-2507 \
+  --env_file "$ENV_FILE" \
+  --semantic_min_mass 0.90 \
+  --artifact_level selected
+```
+
+The policy cache identity includes the fixed native namespace and prompt-profile
+version, so a legacy mapped policy cannot be silently reused.
 
 ## API environment
 
@@ -182,22 +193,21 @@ python scripts/replay_dynamic_rerank.py \
   --compare_legacy
 ```
 
-Build the query-independent paper-type cache. The command is append-only and
-resumable; it classifies each unique pool paper once:
+Build the native S2 paper-type cache. The command is append-only and resumable;
+it resolves each unique pool paper once:
 
 ```bash
-python scripts/build_paper_type_cache.py \
+python scripts/build_s2_paper_type_cache.py \
   --pool_records "$POOL_RECORDS" \
-  --paper_db "$PAPER_DB" \
   --query_policies eval_dynamic_rerank/tune100_dynamic_prompt_v3_semantic90/query_rerank_policies.jsonl \
-  --output eval_dynamic_rerank/cache/paper_type_cache_tune100_v3.jsonl \
-  --model qwen3-30b-a3b-instruct-2507 \
+  --output eval_dynamic_rerank/cache/paper_type_s2_tune100_v3.jsonl \
   --env_file "$ENV_FILE" \
-  --batch_size 32 \
+  --batch_size 500 \
+  --rate_limit_rps 1 \
   --resume
 ```
 
-`--query_policies` is an exact cost optimization: papers are classified only
+`--query_policies` is an exact cost optimization: papers are resolved only
 for queries whose validated policy contains at least one paper-type rule.
 Queries without such rules cannot consume paper-type features.
 
@@ -207,7 +217,7 @@ Replay with type alignment and hard constraints:
 python scripts/replay_dynamic_rerank.py \
   --pool_records "$POOL_RECORDS" \
   --benchmark "$BENCHMARK" \
-  --paper_type_cache eval_dynamic_rerank/cache/paper_type_cache_tune100_v3.jsonl \
+  --paper_type_cache eval_dynamic_rerank/cache/paper_type_s2_tune100_v3.jsonl \
   --policy_cache eval_dynamic_rerank/cache/query_rerank_policy_tune100_v3.jsonl \
   --output eval_dynamic_rerank/tune100_dynamic_prompt_v3_semantic90_types \
   --model qwen3-30b-a3b-instruct-2507 \
@@ -224,38 +234,23 @@ do not store split intent labels in `pool_records`; the replay automatically
 backfills them from the sibling `paper_rows.jsonl`. It never infers them from
 ground truth or paper text.
 
-For a large query-independent type cache, deterministic hash shards can run in
-parallel. `--exclude_cache` skips IDs already present in a validated base cache,
-and every worker writes to its own output:
+For PASA, build or resume its native S2 cache directly. `--exclude_cache` can
+skip IDs already present in a validated base S2 cache:
 
 ```bash
-for SHARD in 0 1 2; do
-  python scripts/build_paper_type_cache.py \
-    --pool_records "$PASA_POOL_RECORDS" \
-    --paper_db "$PAPER_DB" \
-    --query_policies "$PASA_POLICIES" \
-    --exclude_cache eval_dynamic_rerank/cache/paper_type_global_v3.jsonl \
-    --output "eval_dynamic_rerank/cache/paper_type_pasa_shard${SHARD}_v3.jsonl" \
-    --model qwen3-30b-a3b-instruct-2507 \
-    --env_file "$ENV_FILE" \
-    --batch_size 32 \
-    --shard_count 3 \
-    --shard_index "$SHARD" &
-done
-wait
-
-python scripts/merge_paper_type_caches.py \
-  --input \
-    eval_dynamic_rerank/cache/paper_type_global_v3.jsonl \
-    eval_dynamic_rerank/cache/paper_type_pasa_shard0_v3.jsonl \
-    eval_dynamic_rerank/cache/paper_type_pasa_shard1_v3.jsonl \
-    eval_dynamic_rerank/cache/paper_type_pasa_shard2_v3.jsonl \
-  --output eval_dynamic_rerank/cache/paper_type_global_pasa_v3.jsonl
+python scripts/build_s2_paper_type_cache.py \
+  --pool_records "$PASA_POOL_RECORDS" \
+  --query_policies "$PASA_POLICIES" \
+  --exclude_cache eval_dynamic_rerank/cache/paper_type_s2_tune100_v3.jsonl \
+  --output eval_dynamic_rerank/cache/paper_type_s2_pasa_v3.jsonl \
+  --env_file "$ENV_FILE" \
+  --batch_size 500 \
+  --rate_limit_rps 1 \
+  --resume
 ```
 
 The builder is append-only while running and atomically compacts duplicate IDs
-on completion. The merge command validates every record and atomically writes a
-deduplicated cache.
+on completion.
 
 ## Outputs and F1 definitions
 
@@ -307,9 +302,11 @@ graph dimension for 45/100 queries and left all graph dimensions off for
 For the final S2-type tune100 configuration, a paired query bootstrap with
 20,000 samples gives F1 delta +0.003346, 95% percentile interval
 [+0.000606, +0.006286], and probability 0.9921 that dynamic exceeds static.
-The two frozen tune type rules request functional types for which S2 supplies
-no reliable negative evidence, so they remain unknown rather than causing a
-hard require drop; the result therefore exactly matches the no-type row.
+In the historical v3 run, the two frozen tune type rules requested functional
+types for which S2 supplied no reliable negative evidence, so they did not
+cause a hard drop and the result exactly matched the no-type row. Schema v4
+makes that safeguard explicit by representing positive constraints as
+`prefer`, not `require`; the table above remains the historical v3 result.
 
 The frozen configuration transferred to PASA-realscholar without further
 tuning:
@@ -339,9 +336,8 @@ nDCG@20 rises from 0.249043 without types to 0.288380 with either source.
 On `RealScholarQuery_46`, the policy asks to prefer `dataset_benchmark`.
 Because S2 `Dataset` is not equivalent, capability-aware compilation disables
 the unsupported type weight and exactly recovers the no-type ranking, avoiding
-the small F1 decrease observed with Qwen types. Qwen candidate classification
-remains an optional functional-type ablation, not a requirement for the final
-S2-first method.
+the small F1 decrease observed in the historical Qwen-type ablation. That
+candidate-classifier path is no longer exposed by the current native-S2 method.
 
 Generate the saved report with:
 
@@ -362,7 +358,62 @@ python -m pytest -q \
   tests/test_online_paper_type.py
 ```
 
-The final repository-wide run passes 123 tests.
+The final repository-wide run passes 125 tests.
+
+## Native S2 frozen replay (2026-07-19)
+
+The native prompt was tuned only on tune100. A seven-point semantic-floor
+sweep (`0.80, 0.85, 0.875, 0.90, 0.925, 0.95, 1.00`) selected 0.90 by the
+main-table F1; 0.875 was nearly tied but had lower MRR and nDCG@20. The
+configuration was then frozen before PASA-Realscholar.
+
+| dataset/method | main-table F1 | macro Recall | macro Precision | MRR | nDCG@20 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tune100 static | 0.041725 | 0.569963 | 0.021655 | 0.151284 | 0.184306 |
+| tune100 native S2 | 0.044400 | 0.586844 | 0.023073 | 0.187995 | 0.214929 |
+| PASA static | 0.107194 | 0.367278 | 0.062755 | 0.296560 | 0.150998 |
+| PASA native S2 (frozen) | 0.120038 | 0.417269 | 0.070102 | 0.304484 | 0.168865 |
+
+Tune100 improves by +0.002674 (+6.41%). Its 20,000-sample paired bootstrap
+interval is [+0.000158, +0.005395], with probability 0.9816 that dynamic is
+better. PASA improves by +0.012844 (+11.98%); the frozen-transfer interval is
+[+0.003064, +0.022770], with probability 0.9958 that dynamic is better.
+
+Tune100 generated 100 policies with zero fallback and no type rules. PASA
+generated 50 policies with zero fallback; only `RealScholarQuery_3` had a type
+rule, exactly `Review exclude`. It produced 284 hard-filtered candidate
+occurrences and reduced selected exclusion violations from two to zero.
+`RealScholarQuery_20`, which discusses an LLM that writes surveys, correctly
+kept an empty type-rule list. The prior canonical-mapped S2 run has PASA F1
+0.120657, 0.000620 above the native run, but its independently generated Qwen
+weights differ; that uncontrolled difference must not be attributed to the
+type namespace alone.
+
+The native reranked candidates were also replayed through the frozen OnePass
+Selector. The original query, subquery, iteration, Planner checklist, prompt,
+model, and event Top-K budget were preserved; each arm carried its own rerank
+score.
+
+| dataset/method | candidate F1 | Selector F1 | Selector Recall | Selector Precision | micro Selector F1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tune100 static (previously completed arm) | 0.041725 | 0.274390 | 0.491425 | 0.190331 | 0.139918 |
+| tune100 native S2 | 0.044400 | 0.280528 | 0.516537 | 0.192550 | 0.129360 |
+| PASA static | 0.107194 | 0.219088 | 0.306777 | 0.170385 | 0.201489 |
+| PASA native S2 | 0.120038 | 0.236734 | 0.353740 | 0.177892 | 0.213510 |
+
+Tune100 main-table Selector F1 improves by +0.006138 (+2.24%). Its paired
+bootstrap interval is [-0.023013, +0.039569], with probability 0.6362 that the
+delta is positive. PASA improves by +0.017646 (+8.05%); the 50-query interval
+is [-0.011242, +0.049676], with probability 0.8760 that the delta is positive.
+Both point estimates improve, but neither Selector-level interval excludes
+zero. PASA query win/tie/loss is 24/4/22.
+
+For `RealScholarQuery_3`, native hard filtering successfully removes both S2
+`Review` candidates, but the accompanying semantic reorder reduces candidate
+ground-truth hits from 15 to 11. Selector ground-truth hits fall from 9 to 7,
+so query-level Selector F1 changes from 0.264706 to 0.191781. This confirms
+that satisfying an explicit exclusion is independently valuable but does not
+guarantee higher relevance F1 for that query.
 
 ## Frozen OnePass Selector replay
 

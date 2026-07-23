@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Resumable paper-type backends for online reranking."""
+"""Resumable native Semantic Scholar publication-type resolution."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import threading
@@ -14,14 +13,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Protocol, Seque
 
 import requests
 
-from dimension_catalog import PAPER_TYPES
 from paper_type import (
-    CLASSIFIER_VERSION,
-    QWEN_EVIDENCE_SOURCE,
     S2_CLASSIFIER_VERSION,
     S2_EVIDENCE_SOURCE,
-    S2_SUPPORTED_CANONICAL_TYPES,
-    PaperTypeClassifier,
+    S2_PUBLICATION_TYPES,
     normalize_paper_id,
     s2_publication_types_to_record,
     validate_type_record,
@@ -31,16 +26,8 @@ from paper_type import (
 S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch"
 S2_BATCH_MAX_IDS = 500
 
-
-def qwen_model_classifier_version(model: str, base_version: str) -> str:
-    """Bind append-only Qwen cache records to the exact configured model."""
-
-    model_digest = hashlib.sha256(str(model).strip().encode("utf-8")).hexdigest()[:16]
-    return f"{base_version}.model-{model_digest}"
-
-
 class PaperTypeResolver(Protocol):
-    """Runtime contract shared by S2 and Qwen paper-type providers."""
+    """Runtime contract for native S2 publication-type metadata."""
 
     backend: str
     evidence_source: str
@@ -87,7 +74,7 @@ class S2PublicationTypeResolver:
     backend = "s2"
     evidence_source = S2_EVIDENCE_SOURCE
     classifier_version = S2_CLASSIFIER_VERSION
-    supported_types = S2_SUPPORTED_CANONICAL_TYPES
+    supported_types = S2_PUBLICATION_TYPES
     model = None
 
     def __init__(
@@ -141,13 +128,36 @@ class S2PublicationTypeResolver:
         if not self.cache_path.exists():
             return
         with self.cache_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
                     continue
                 try:
                     value = json.loads(line)
+                    if not isinstance(value, Mapping):
+                        raise TypeError("paper-type cache record must be an object")
+                    raw_source = str(value.get("evidence_source") or "").strip()
+                    raw_version = str(value.get("classifier_version") or "").strip()
+                    if (
+                        raw_source
+                        and raw_source != self.evidence_source
+                    ) or (
+                        not raw_source
+                        and raw_version
+                        and not raw_version.startswith("s2_")
+                    ):
+                        self._stats["cache_backend_mismatch_lines"] += 1
+                        raise ValueError(
+                            "native S2 cache contains non-S2 record at line "
+                            f"{line_number}: source={raw_source or 'missing'}, "
+                            f"classifier_version={raw_version or 'missing'}"
+                        )
                     record = validate_type_record(value)
-                except (json.JSONDecodeError, ValueError, TypeError):
+                except ValueError as exc:
+                    if "native S2 cache contains non-S2 record" in str(exc):
+                        raise
+                    self._stats["cache_invalid_lines"] += 1
+                    continue
+                except TypeError:
                     self._stats["cache_invalid_lines"] += 1
                     continue
                 if (
@@ -261,187 +271,6 @@ class S2PublicationTypeResolver:
                     pending[offset : offset + S2_BATCH_MAX_IDS]
                 )
                 self._append_records(records)
-        with self._lock:
-            return {
-                paper_id: dict(self._cache[paper_id])
-                for paper_id in ids
-                if paper_id in self._cache
-            }
-
-
-class QwenPaperTypeResolver:
-    """Classify candidate title/abstract batches with Qwen and cache results.
-
-    The classifier is query-independent: neither the original query nor the
-    active rerank policy is included in its prompt. Missing metadata, malformed
-    output, and provider failures remain unknown instead of causing hard drops.
-    """
-
-    backend = "qwen"
-    evidence_source = QWEN_EVIDENCE_SOURCE
-    supported_types = PAPER_TYPES
-
-    def __init__(
-        self,
-        cache_path: str | Path,
-        paper_db: Mapping[str, Mapping[str, Any]],
-        model: str,
-        *,
-        is_local: bool = False,
-        batch_size: int = 16,
-        offline: bool = False,
-        classifier: Optional[Any] = None,
-    ) -> None:
-        self.cache_path = Path(cache_path)
-        self.paper_db = {
-            normalize_paper_id(paper_id): dict(metadata)
-            for paper_id, metadata in paper_db.items()
-            if normalize_paper_id(paper_id) and isinstance(metadata, Mapping)
-        }
-        self.model = str(model)
-        self.offline = bool(offline)
-        self.batch_size = max(1, int(batch_size))
-        self.classifier = classifier or PaperTypeClassifier(
-            self.model,
-            is_local=is_local,
-        )
-        self.classifier_version = qwen_model_classifier_version(
-            self.model,
-            str(getattr(self.classifier, "classifier_version", CLASSIFIER_VERSION)),
-        )
-        self._lock = threading.Lock()
-        self._resolve_lock = threading.Lock()
-        self._stats: Dict[str, int] = defaultdict(int)
-        self._cache: Dict[str, Dict[str, Any]] = {}
-        self._deferred_ids = set()
-        self._load_cache()
-
-    def _inc(self, key: str, amount: int = 1) -> None:
-        with self._lock:
-            self._stats[key] += int(amount)
-
-    def snapshot_stats(self) -> Dict[str, int]:
-        with self._lock:
-            return dict(self._stats)
-
-    def snapshot_cache(self) -> Dict[str, Dict[str, Any]]:
-        with self._lock:
-            return {
-                paper_id: dict(record) for paper_id, record in self._cache.items()
-            }
-
-    def _normalize_record(self, value: Mapping[str, Any]) -> Dict[str, Any]:
-        normalized = dict(value)
-        normalized.update(
-            {
-                "classifier_version": self.classifier_version,
-                "evidence_source": self.evidence_source,
-                "publication_types": [],
-                "supported_types": list(self.supported_types),
-                "negative_evidence_types": list(self.supported_types),
-            }
-        )
-        return validate_type_record(normalized)
-
-    def _load_cache(self) -> None:
-        if not self.cache_path.exists():
-            return
-        with self.cache_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
-                    continue
-                try:
-                    record = validate_type_record(json.loads(line))
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    self._stats["cache_invalid_lines"] += 1
-                    continue
-                if (
-                    record.get("evidence_source") != self.evidence_source
-                    or record.get("classifier_version") != self.classifier_version
-                ):
-                    self._stats["cache_backend_mismatch_lines"] += 1
-                    continue
-                self._cache[record["paper_arxiv_id"]] = record
-        self._stats["cache_records_loaded"] = len(self._cache)
-
-    def _append_records(self, records: Sequence[Mapping[str, Any]]) -> None:
-        if not records:
-            return
-        validated = [self._normalize_record(record) for record in records]
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock:
-            with self.cache_path.open("a", encoding="utf-8") as handle:
-                for record in validated:
-                    handle.write(
-                        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
-                    )
-                handle.flush()
-            for record in validated:
-                self._cache[record["paper_arxiv_id"]] = record
-            self._stats["cache_records_written"] += len(validated)
-
-    def resolve(self, paper_ids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
-        # Serialize the miss-to-cache-write path across concurrent OnePass
-        # events. The narrower cache lock below keeps its existing semantics.
-        with self._resolve_lock:
-            return self._resolve_once(paper_ids)
-
-    def _resolve_once(self, paper_ids: Iterable[Any]) -> Dict[str, Dict[str, Any]]:
-        ids = list(
-            dict.fromkeys(
-                paper_id
-                for value in paper_ids
-                if (paper_id := normalize_paper_id(value))
-            )
-        )
-        with self._lock:
-            uncached = [paper_id for paper_id in ids if paper_id not in self._cache]
-            pending = [
-                paper_id for paper_id in uncached if paper_id not in self._deferred_ids
-            ]
-            deferred = len(uncached) - len(pending)
-            self._stats["cache_hits"] += len(ids) - len(uncached)
-            self._stats["cache_misses"] += len(pending)
-            self._stats["deferred_misses"] += deferred
-
-        if pending and self.offline:
-            self._inc("offline_misses", len(pending))
-        elif pending:
-            available = []
-            missing = []
-            for paper_id in pending:
-                metadata = self.paper_db.get(paper_id)
-                if metadata is None:
-                    missing.append(paper_id)
-                    continue
-                available.append(
-                    {
-                        "paper_arxiv_id": paper_id,
-                        "title": str(metadata.get("title") or ""),
-                        "abstract": str(metadata.get("abstract") or ""),
-                    }
-                )
-            if missing:
-                with self._lock:
-                    self._stats["missing_paper_metadata"] += len(missing)
-                    self._deferred_ids.update(missing)
-            for offset in range(0, len(available), self.batch_size):
-                batch = available[offset : offset + self.batch_size]
-                batch_ids = [paper["paper_arxiv_id"] for paper in batch]
-                try:
-                    self._inc("classifier_batches")
-                    records = self.classifier.classify_batch(batch)
-                    self._inc("classifier_papers", len(batch))
-                    self._append_records(records)
-                except Exception:
-                    # A failed online batch remains unknown for this process.
-                    # The classifier already performs one schema-repair call;
-                    # recursive retries here would multiply latency and cost.
-                    with self._lock:
-                        self._stats["failed_batches"] += 1
-                        self._stats["failed_papers"] += len(batch_ids)
-                        self._deferred_ids.update(batch_ids)
-
         with self._lock:
             return {
                 paper_id: dict(self._cache[paper_id])

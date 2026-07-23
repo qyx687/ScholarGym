@@ -25,8 +25,6 @@ if str(CODE_DIR) not in sys.path:
     sys.path.insert(0, str(CODE_DIR))
 
 from paper_type import (  # noqa: E402
-    DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
-    DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
     evaluate_paper_type_rules,
     load_paper_type_cache,
     normalize_paper_id,
@@ -38,14 +36,16 @@ from rerank_skill import (  # noqa: E402
     DEFAULT_MIN_CONFIDENCE,
     DEFAULT_NEGATIVE_WEIGHT,
     DEFAULT_SEMANTIC_MIN_MASS,
+    PAPER_TYPE_BACKEND,
     PROMPT_VERSION,
+    S2_NATIVE_PAPER_TYPE_NAMESPACE,
     CompiledPolicy,
     RerankPolicy,
     RerankSkill,
 )
 
 
-IMPLEMENTATION_VERSION = "dynamic_rerank_replay_v2"
+IMPLEMENTATION_VERSION = "dynamic_rerank_replay_v5_native_s2_rules"
 METHODS = ("legacy_static", "dynamic_policy")
 
 
@@ -315,14 +315,6 @@ def _query_method_metrics(
             type_result = evaluate_paper_type_rules(
                 skill._type_record_for_candidate(row),
                 rules,
-                exclude_hard_filter_min_confidence=(
-                    skill.exclude_hard_filter_min_confidence
-                ),
-                require_hard_filter_min_confidence=(
-                    skill.require_hard_filter_min_confidence
-                ),
-                exclude_threshold=skill.exclude_threshold,
-                require_threshold=skill.require_threshold,
             )
             if type_result.get("paper_type_filter_action") == "exclude":
                 exclusion_violations.append(paper_id)
@@ -430,6 +422,7 @@ def _compact_candidate(row: Mapping[str, Any], selected: bool) -> Dict[str, Any]
         "path_count",
         "path_count_normalized",
         "paper_type_probs",
+        "paper_type_namespace",
         "paper_type_classifier_confidence",
         "paper_type_evidence_source",
         "paper_type_publication_types",
@@ -437,7 +430,6 @@ def _compact_candidate(row: Mapping[str, Any], selected: bool) -> Dict[str, Any]
         "paper_type_negative_evidence_types",
         "s2_publication_types",
         "paper_type_alignment",
-        "paper_type_soft_penalty",
         "paper_type_filter_action",
         "paper_type_filter_reason",
         "hard_filtered",
@@ -465,8 +457,6 @@ def replay(
     semantic_min_mass: float = DEFAULT_SEMANTIC_MIN_MASS,
     negative_weight: float = DEFAULT_NEGATIVE_WEIGHT,
     max_negative_mass: float = DEFAULT_MAX_NEGATIVE_MASS,
-    exclude_hard_filter_min_confidence: float = DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
-    require_hard_filter_min_confidence: float = DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
     catalog_version: str = CATALOG_VERSION,
     prompt_version: str = PROMPT_VERSION,
     is_local: bool = False,
@@ -516,8 +506,6 @@ def replay(
         semantic_min_mass=semantic_min_mass,
         negative_weight=negative_weight,
         max_negative_mass=max_negative_mass,
-        exclude_hard_filter_min_confidence=exclude_hard_filter_min_confidence,
-        require_hard_filter_min_confidence=require_hard_filter_min_confidence,
     )
     static_policy = skill.legacy_compiled_policy()
     policies: Dict[str, Tuple[RerankPolicy, CompiledPolicy]] = {}
@@ -715,6 +703,8 @@ def replay(
         "pool_records": str(pool_records_path),
         "benchmark": str(benchmark_path),
         "paper_type_cache": str(paper_type_cache_path) if paper_type_cache_path else None,
+        "paper_type_backend": PAPER_TYPE_BACKEND,
+        "paper_type_namespace": S2_NATIVE_PAPER_TYPE_NAMESPACE,
         "paper_rows": str(paper_rows_path) if paper_rows_path else None,
         "intent_labels_source": (
             "pool_records"
@@ -733,12 +723,6 @@ def replay(
             "semantic_min_mass": semantic_min_mass,
             "negative_weight": negative_weight,
             "max_negative_mass": max_negative_mass,
-            "exclude_hard_filter_min_confidence": (
-                exclude_hard_filter_min_confidence
-            ),
-            "require_hard_filter_min_confidence": (
-                require_hard_filter_min_confidence
-            ),
         },
         "policy_generation_enabled": generate_policies,
         "retry_cached_fallbacks": retry_cached_fallbacks,
@@ -786,16 +770,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--semantic_min_mass", type=float, default=DEFAULT_SEMANTIC_MIN_MASS)
     parser.add_argument("--negative_weight", type=float, default=DEFAULT_NEGATIVE_WEIGHT)
     parser.add_argument("--max_negative_mass", type=float, default=DEFAULT_MAX_NEGATIVE_MASS)
-    parser.add_argument(
-        "--exclude_hard_filter_min_confidence",
-        type=float,
-        default=DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
-    )
-    parser.add_argument(
-        "--require_hard_filter_min_confidence",
-        type=float,
-        default=DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
-    )
     parser.add_argument("--catalog_version", default=CATALOG_VERSION)
     parser.add_argument("--prompt_version", default=PROMPT_VERSION)
     parser.add_argument("--is_local", action=argparse.BooleanOptionalAction, default=False)
@@ -837,12 +811,6 @@ def main() -> None:
         semantic_min_mass=args.semantic_min_mass,
         negative_weight=args.negative_weight,
         max_negative_mass=args.max_negative_mass,
-        exclude_hard_filter_min_confidence=(
-            args.exclude_hard_filter_min_confidence
-        ),
-        require_hard_filter_min_confidence=(
-            args.require_hard_filter_min_confidence
-        ),
         catalog_version=args.catalog_version,
         prompt_version=args.prompt_version,
         is_local=args.is_local,

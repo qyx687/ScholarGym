@@ -18,10 +18,8 @@ from dimension_catalog import (
     DIMENSION_NAMES,
     NEGATIVE_LEVEL,
     PAPER_TYPE_ACTIONS,
-    PAPER_TYPE_ALIASES,
     PAPER_TYPE_LOGICS,
     PAPER_TYPE_STRENGTHS,
-    PAPER_TYPES,
     POLICY_VERSION,
     POSITIVE_LEVELS,
     PROMPT_VERSION,
@@ -29,15 +27,11 @@ from dimension_catalog import (
     intent_dimension_values,
 )
 from paper_type import (
-    DEFAULT_EXCLUDE_THRESHOLD,
-    DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
-    DEFAULT_REQUIRE_THRESHOLD,
-    DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
-    QWEN_EVIDENCE_SOURCE,
     S2_EVIDENCE_SOURCE,
-    S2_SUPPORTED_CANONICAL_TYPES,
+    S2_PUBLICATION_TYPES,
     evaluate_paper_type_rules,
     normalize_paper_id,
+    normalize_s2_publication_type,
     s2_publication_types_to_record,
 )
 
@@ -50,6 +44,9 @@ LEGACY_FEATURE_WEIGHTS = {
     "path_count_normalized": 0.15,
 }
 DEFAULT_MIN_CONFIDENCE = 0.60
+PAPER_TYPE_BACKEND = "s2"
+S2_NATIVE_PAPER_TYPE_NAMESPACE = "s2_native"
+S2_NATIVE_PAPER_TYPE_PROMPT_VERSION = "s2_native_v4"
 # Tuned only on ScholarGym tune100, then frozen for PASA transfer. This keeps
 # query-conditioned graph/type signals as a conservative residual around the
 # strong semantic baseline.
@@ -68,7 +65,6 @@ class PaperTypeRule:
     action: str
     logic: str
     strength: Optional[str] = None
-    threshold: Optional[float] = None
 
     def to_dict(self) -> Dict[str, Any]:
         output: Dict[str, Any] = {
@@ -78,8 +74,6 @@ class PaperTypeRule:
         }
         if self.strength is not None:
             output["strength"] = self.strength
-        if self.threshold is not None:
-            output["threshold"] = self.threshold
         return output
 
 
@@ -189,11 +183,15 @@ def _finite_number(value: Any, name: str, low: float, high: float) -> float:
     return result
 
 
-def _canonical_paper_type(value: str) -> str:
+def _normalized_policy_paper_type(value: str) -> str:
     key = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-    if key in PAPER_TYPES:
-        return key
-    return PAPER_TYPE_ALIASES.get(key, value)
+    allowed_by_key = {
+        re.sub(r"[^a-z0-9]+", "_", item.lower()).strip("_"): item
+        for item in S2_PUBLICATION_TYPES
+    }
+    if key in allowed_by_key:
+        return allowed_by_key[key]
+    return value
 
 
 def validate_policy_object(
@@ -250,7 +248,7 @@ def validate_policy_object(
     for index, raw_rule in enumerate(raw_rules):
         if not isinstance(raw_rule, Mapping):
             raise PolicyValidationError(f"paper_type_rules[{index}] must be an object")
-        allowed_rule_keys = {"types", "action", "logic", "strength", "threshold"}
+        allowed_rule_keys = {"types", "action", "logic", "strength"}
         extra = set(raw_rule) - allowed_rule_keys
         if extra:
             raise PolicyValidationError(
@@ -261,10 +259,10 @@ def validate_policy_object(
             raise PolicyValidationError(
                 f"paper_type_rules[{index}].types must be a non-empty string array"
             )
-        types = [_canonical_paper_type(item) for item in raw_types]
+        types = [_normalized_policy_paper_type(item) for item in raw_types]
         if len(set(types)) != len(types):
             raise PolicyValidationError(f"paper_type_rules[{index}].types contains duplicates")
-        illegal_types = set(types) - set(PAPER_TYPES)
+        illegal_types = set(types) - set(S2_PUBLICATION_TYPES)
         if illegal_types:
             raise PolicyValidationError(
                 f"paper_type_rules[{index}] has unknown types: {sorted(illegal_types)}"
@@ -280,28 +278,16 @@ def validate_policy_object(
                 f"paper_type_rules[{index}].logic must be one of {PAPER_TYPE_LOGICS}"
             )
         strength = raw_rule.get("strength")
-        threshold = raw_rule.get("threshold")
         if action in {"prefer", "avoid"}:
             if strength not in PAPER_TYPE_STRENGTHS:
                 raise PolicyValidationError(
                     f"paper_type_rules[{index}].strength must be one of "
                     f"{PAPER_TYPE_STRENGTHS} for {action}"
                 )
-            if threshold is not None:
-                raise PolicyValidationError(
-                    f"paper_type_rules[{index}].threshold is not allowed for {action}"
-                )
         else:
             if strength is not None:
                 raise PolicyValidationError(
                     f"paper_type_rules[{index}].strength is not allowed for {action}"
-                )
-            if threshold is not None:
-                threshold = _finite_number(
-                    threshold,
-                    f"paper_type_rules[{index}].threshold",
-                    0.0,
-                    1.0,
                 )
         rules.append(
             PaperTypeRule(
@@ -309,11 +295,17 @@ def validate_policy_object(
                 action=str(action),
                 logic=str(logic),
                 strength=str(strength) if strength is not None else None,
-                threshold=float(threshold) if threshold is not None else None,
             )
         )
 
     confidence = _finite_number(value.get("confidence"), "confidence", 0.0, 1.0)
+    has_soft_type_rules = any(rule.action in {"prefer", "avoid"} for rule in rules)
+    alignment_enabled = levels.get("paper_type_alignment") != "off"
+    if has_soft_type_rules != alignment_enabled:
+        raise PolicyValidationError(
+            "paper_type_alignment must be non-off exactly when prefer/avoid "
+            "paper_type_rules are present"
+        )
     return RerankPolicy(
         policy_version=POLICY_VERSION,
         query_intent=query_intent.strip(),
@@ -337,43 +329,43 @@ class RerankSkill:
         policy_cache_path: str | Path | None = None,
         retry_cached_fallbacks: bool = False,
         paper_type_cache: Optional[Mapping[str, Mapping[str, Any]]] = None,
-        paper_type_backend: Optional[str] = None,
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         catalog_version: str = CATALOG_VERSION,
         prompt_version: str = PROMPT_VERSION,
         semantic_min_mass: float = DEFAULT_SEMANTIC_MIN_MASS,
         negative_weight: float = DEFAULT_NEGATIVE_WEIGHT,
         max_negative_mass: float = DEFAULT_MAX_NEGATIVE_MASS,
-        hard_filter_min_confidence: Optional[float] = None,
-        exclude_hard_filter_min_confidence: float = DEFAULT_EXCLUDE_HARD_FILTER_MIN_CONFIDENCE,
-        require_hard_filter_min_confidence: float = DEFAULT_REQUIRE_HARD_FILTER_MIN_CONFIDENCE,
-        exclude_threshold: float = DEFAULT_EXCLUDE_THRESHOLD,
-        require_threshold: float = DEFAULT_REQUIRE_THRESHOLD,
     ) -> None:
         self.model = model
         self.is_local = is_local
         self.llm_call = llm_call
         self.policy_cache_path = Path(policy_cache_path) if policy_cache_path else None
         self.retry_cached_fallbacks = bool(retry_cached_fallbacks)
-        normalized_paper_type_backend = str(paper_type_backend or "").strip().lower()
-        if normalized_paper_type_backend not in {"", "s2", "qwen"}:
-            raise ValueError("paper_type_backend must be one of: s2, qwen")
-        self.paper_type_backend = normalized_paper_type_backend or None
+        # Candidate type evidence has one deliberately fixed contract: the raw
+        # Semantic Scholar publicationTypes taxonomy.  Qwen still generates the
+        # query-conditioned rerank policy, but never classifies candidates.
+        self.paper_type_backend = PAPER_TYPE_BACKEND
+        self.paper_type_namespace = S2_NATIVE_PAPER_TYPE_NAMESPACE
+        self.allowed_paper_types = tuple(S2_PUBLICATION_TYPES)
+        self.paper_type_prompt_version = S2_NATIVE_PAPER_TYPE_PROMPT_VERSION
         self.paper_type_cache = {
             normalize_paper_id(paper_id): dict(record)
             for paper_id, record in (paper_type_cache or {}).items()
             if normalize_paper_id(paper_id)
         }
-        self.paper_type_supported_types = set()
-        for record in self.paper_type_cache.values():
-            explicit_supported = record.get("supported_types")
-            if explicit_supported is not None:
-                self.paper_type_supported_types.update(explicit_supported or [])
-            elif str(record.get("classifier_version") or "").startswith("s2_"):
-                self.paper_type_supported_types.update(S2_SUPPORTED_CANONICAL_TYPES)
-            else:
-                # Legacy/Qwen records predate explicit provenance metadata.
-                self.paper_type_supported_types.update(PAPER_TYPES)
+        invalid_sources = {
+            str(record.get("evidence_source") or "")
+            for record in self.paper_type_cache.values()
+            if str(record.get("evidence_source") or "") != S2_EVIDENCE_SOURCE
+        }
+        if invalid_sources:
+            raise ValueError(
+                "native S2 paper types require an S2-only paper-type cache; "
+                f"found sources={sorted(invalid_sources)}"
+            )
+        # The resolver supports the full native catalog even before a cache is
+        # populated.  Individual records remain positive-only evidence.
+        self.paper_type_supported_types = set(S2_PUBLICATION_TYPES)
         self.min_confidence = _finite_number(min_confidence, "min_confidence", 0.0, 1.0)
         self.catalog_version = catalog_version
         self.prompt_version = prompt_version
@@ -384,45 +376,21 @@ class RerankSkill:
         self.max_negative_mass = _finite_number(
             max_negative_mass, "max_negative_mass", 0.0, 1.0
         )
-        if hard_filter_min_confidence is not None:
-            shared_hard_filter_confidence = _finite_number(
-                hard_filter_min_confidence,
-                "hard_filter_min_confidence",
-                0.0,
-                1.0,
-            )
-            exclude_hard_filter_min_confidence = shared_hard_filter_confidence
-            require_hard_filter_min_confidence = shared_hard_filter_confidence
-        self.exclude_hard_filter_min_confidence = _finite_number(
-            exclude_hard_filter_min_confidence,
-            "exclude_hard_filter_min_confidence",
-            0.0,
-            1.0,
-        )
-        self.require_hard_filter_min_confidence = _finite_number(
-            require_hard_filter_min_confidence,
-            "require_hard_filter_min_confidence",
-            0.0,
-            1.0,
-        )
-        self.exclude_threshold = _finite_number(
-            exclude_threshold, "exclude_threshold", 0.0, 1.0
-        )
-        self.require_threshold = _finite_number(
-            require_threshold, "require_threshold", 0.0, 1.0
-        )
         self._memory_cache: Dict[str, RerankPolicy] = {}
         self._load_cache()
 
     def _cache_key(self, query: str) -> str:
+        cache_identity = {
+            "query": str(query),
+            "model": self.model,
+            "catalog_version": self.catalog_version,
+            "prompt_version": self.prompt_version,
+            "min_confidence": self.min_confidence,
+            "paper_type_namespace": self.paper_type_namespace,
+            "paper_type_prompt_version": self.paper_type_prompt_version,
+        }
         payload = json.dumps(
-            {
-                "query": str(query),
-                "model": self.model,
-                "catalog_version": self.catalog_version,
-                "prompt_version": self.prompt_version,
-                "min_confidence": self.min_confidence,
-            },
+            cache_identity,
             ensure_ascii=False,
             sort_keys=True,
         ).encode("utf-8")
@@ -464,6 +432,10 @@ class RerankSkill:
                         or record.get("catalog_version") != self.catalog_version
                         or record.get("prompt_version") != self.prompt_version
                         or record.get("min_confidence") != self.min_confidence
+                        or record.get("paper_type_namespace")
+                        != self.paper_type_namespace
+                        or record.get("paper_type_prompt_version")
+                        != self.paper_type_prompt_version
                     ):
                         continue
                     policy_id = str(record.get("policy_id") or record.get("cache_key") or "")
@@ -503,6 +475,8 @@ class RerankSkill:
             "catalog_version": self.catalog_version,
             "prompt_version": self.prompt_version,
             "min_confidence": self.min_confidence,
+            "paper_type_namespace": self.paper_type_namespace,
+            "paper_type_prompt_version": self.paper_type_prompt_version,
             "raw_model_output": policy.raw_model_output,
             "validated_policy": policy.to_dict(),
             "used_fallback": policy.used_fallback,
@@ -520,8 +494,39 @@ class RerankSkill:
             "- intent_method: candidate method is used or extended",
             "- intent_result: candidate result is compared, supported, or discussed",
             "- path_count: structural support from multiple seed-to-paper paths",
-            "- paper_type_alignment: alignment with required or excluded paper types",
+            "- paper_type_alignment: alignment with preferred or avoided paper types",
         ]
+        paper_type_guidance = (
+            "Paper types use Semantic Scholar's native publicationTypes field. "
+            f"Allowed values: {', '.join(S2_PUBLICATION_TYPES)}. Use these exact "
+            "case-sensitive values and do not invent functional paper roles. "
+            "Review means a review/survey publication; MetaAnalysis is a "
+            "quantitative evidence synthesis; JournalArticle and Conference are "
+            "publication forms; Dataset is a dataset record, not a paper that "
+            "introduces, proposes, uses, or evaluates a dataset or benchmark; "
+            "CaseReport, ClinicalTrial, and Study are empirical study forms; "
+            "Editorial, LettersAndComments, and News are editorial or commentary "
+            "forms; Book and BookSection are book publications. For an explicit "
+            "request to exclude surveys/reviews, use Review; add MetaAnalysis only "
+            "when the query also excludes meta-analyses or broad evidence syntheses. "
+            "Do not prefer JournalArticle or Conference unless the query explicitly "
+            "requests that publication form. For an ordinary topical or method search, "
+            "use [] and set paper_type_alignment to off. A type rule must describe "
+            "the retrieved papers themselves. Do not create a Review rule merely "
+            "because the query discusses a system that writes, summarizes, analyzes, "
+            "or generates surveys/reviews.\n"
+        )
+        paper_type_rule_scope = (
+            "Generate rules only when the query explicitly constrains the returned "
+            "publication form represented by the S2 catalog (for example, exclude "
+            "Review, prefer ClinicalTrial when clinical trials are requested, or "
+            "prefer BookSection when book sections are requested). A subject-matter "
+            "mention of a dataset, benchmark, survey-writing system, theory, method, "
+            "study, or result is not a publication-type request. In particular, "
+            "never use Dataset for a query asking for papers that introduce, propose, "
+            "use, test, or evaluate datasets or benchmarks; use Dataset only when "
+            "the requested returned records are datasets themselves. "
+        )
         return (
             "You are a scholarly reranking policy generator.\n\n"
             "Generate one fixed reranking policy for the original research-paper query. "
@@ -539,21 +544,22 @@ class RerankSkill:
             "synthesis. Otherwise set all four graph dimensions to off.\n\n"
             "Choose levels only from: very_high, high, medium, low, off, negative. "
             "query_similarity and subquery_similarity cannot be negative or both off.\n\n"
-            f"Allowed paper types: {', '.join(PAPER_TYPES)}.\n"
-            "Use these exact canonical names. In particular, write survey_review, "
-            "never survey or review.\n"
-            "paper_type_rules MUST be a JSON array. Generate rules only when the query "
-            "explicitly requests, prefers, avoids, or excludes a paper genre/type "
-            "(for example survey, tutorial, benchmark, theory, empirical study, or "
-            "application case study). For an ordinary topical or method search, use [] "
-            "and set paper_type_alignment to off; do not infer a primary_method rule "
-            "merely because the query asks for methods. Each array item uses the plural "
+            + paper_type_guidance
+            + "paper_type_rules MUST be a JSON array. "
+            + paper_type_rule_scope
+            + "Each array item uses the plural "
             "key types and has "
-            "exactly types, action, logic, plus the action-specific field. "
-            "Paper type actions: require, prefer, avoid, exclude. Logic: any, all. "
-            "prefer/avoid items require strength from very_high, high, medium, low; "
-            "require/exclude items may use threshold as a number in [0,1] and MUST "
-            "NOT use strength. Never use a rules wrapper or a singular type key.\n\n"
+            "the base keys types, action, and logic. Paper type actions: prefer, "
+            "avoid, exclude. Logic: any, all. prefer/avoid items additionally require "
+            "strength from very_high, high, medium, low; exclude items MUST contain "
+            "only the three base keys and use direct native S2 tag membership. Positive "
+            "constraints expressed with words such as require, must, or only MUST be "
+            "represented as prefer, normally with very_high strength, because an absent "
+            "S2 tag is unknown and cannot justify a hard drop. Set paper_type_alignment "
+            "to a non-off level exactly when at least one prefer/avoid rule is present; "
+            "hard exclude rules do not need that soft weight. Decide semantic and graph weight_levels from "
+            "the retrieval intent independently of the paper-type catalog. Never use "
+            "a rules wrapper or a singular type key.\n\n"
             "Return one valid JSON object only, with exactly these top-level keys: "
             "policy_version, query_intent, weight_levels, paper_type_rules, confidence. "
             f"policy_version must be {POLICY_VERSION}. weight_levels must contain every "
@@ -796,22 +802,45 @@ class RerankSkill:
             adjustments=(),
         )
 
+    def _project_paper_type_record(
+        self, record: Optional[Mapping[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        if record is None:
+            return None
+        projected = dict(record)
+        if str(projected.get("evidence_source") or "") != S2_EVIDENCE_SOURCE:
+            return None
+        publication_types = []
+        for value in projected.get("publication_types") or []:
+            normalized = normalize_s2_publication_type(value)
+            if normalized in S2_PUBLICATION_TYPES and normalized not in publication_types:
+                publication_types.append(normalized)
+        projected.update(
+            {
+                "type_probs": {type_name: 1.0 for type_name in publication_types},
+                "publication_types": publication_types,
+                "supported_types": list(S2_PUBLICATION_TYPES),
+                # S2 publicationTypes are positive-only metadata. Absence is
+                # unknown and therefore receives neither a reward nor a drop.
+                "negative_evidence_types": [],
+            }
+        )
+        return projected
+
     def _type_record_for_candidate(self, candidate: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
         paper_id = normalize_paper_id(candidate.get("paper_arxiv_id"))
-        provided_probs = candidate.get("paper_type_probs")
-        provided_confidence = (
-            candidate.get("paper_type_classifier_confidence")
-            if candidate.get("paper_type_classifier_confidence") is not None
-            else candidate.get("paper_type_confidence")
-        )
-        if isinstance(provided_probs, Mapping) and (
-            provided_probs or float(provided_confidence or 0.0) > 0.0
+        selected_record: Optional[Dict[str, Any]] = None
+        if (
+            str(candidate.get("paper_type_evidence_source") or "")
+            == S2_EVIDENCE_SOURCE
         ):
             provided_record = {
                 "paper_arxiv_id": paper_id,
-                "type_probs": dict(provided_probs),
+                "type_probs": dict(candidate.get("paper_type_probs") or {}),
                 "confidence": float(
-                    provided_confidence or 0.0
+                    candidate.get("paper_type_classifier_confidence")
+                    if candidate.get("paper_type_classifier_confidence") is not None
+                    else candidate.get("paper_type_confidence") or 0.0
                 ),
                 "evidence_source": candidate.get("paper_type_evidence_source"),
                 "publication_types": candidate.get(
@@ -828,43 +857,23 @@ class RerankSkill:
             ):
                 if candidate.get(candidate_key) is not None:
                     provided_record[record_key] = candidate.get(candidate_key)
-            expected_source = (
-                QWEN_EVIDENCE_SOURCE
-                if self.paper_type_backend == "qwen"
-                else S2_EVIDENCE_SOURCE
-            )
-            if self.paper_type_backend is None or (
-                str(provided_record.get("evidence_source") or "").lower()
-                == expected_source
-            ):
-                return provided_record
+            selected_record = provided_record
         cached = self.paper_type_cache.get(paper_id)
-        expected_source = (
-            QWEN_EVIDENCE_SOURCE
-            if self.paper_type_backend == "qwen"
-            else S2_EVIDENCE_SOURCE
-        )
-        if cached and (
-            self.paper_type_backend is None
-            or str(cached.get("evidence_source") or "").lower()
-            == expected_source
+        if (
+            selected_record is None
+            and cached
+            and str(cached.get("evidence_source") or "") == S2_EVIDENCE_SOURCE
         ):
-            return dict(cached)
-        if self.paper_type_backend != "qwen" and isinstance(
+            selected_record = dict(cached)
+        if selected_record is None and isinstance(
             candidate.get("s2_publication_types"), (list, tuple, set)
         ):
-            return s2_publication_types_to_record(
+            selected_record = s2_publication_types_to_record(
                 paper_id,
                 candidate.get("s2_publication_types"),
                 resolved=True,
             )
-        if self.paper_type_backend is None and isinstance(provided_probs, Mapping):
-            return {
-                "paper_arxiv_id": paper_id,
-                "type_probs": dict(provided_probs),
-                "confidence": 0.0,
-            }
-        return None
+        return self._project_paper_type_record(selected_record)
 
     @staticmethod
     def _feature_values(candidate: Mapping[str, Any]) -> Dict[str, float]:
@@ -908,6 +917,7 @@ class RerankSkill:
                 raise ValueError("candidate is missing paper_arxiv_id")
             row["paper_arxiv_id"] = paper_id
             row["paper_type_backend"] = self.paper_type_backend
+            row["paper_type_namespace"] = self.paper_type_namespace
             if policy.used_fallback:
                 contributions = {
                     "query_similarity": LEGACY_FEATURE_WEIGHTS["query_score_normalized"]
@@ -919,7 +929,6 @@ class RerankSkill:
                     "path_count": LEGACY_FEATURE_WEIGHTS["path_count_normalized"]
                     * float(row.get("path_count_normalized") or 0.0),
                     "paper_type_alignment": 0.0,
-                    "paper_type_soft_penalty": 0.0,
                 }
                 type_result = {
                     "paper_type_probs": {},
@@ -929,8 +938,8 @@ class RerankSkill:
                     "paper_type_supported_types": [],
                     "paper_type_negative_evidence_types": [],
                     "paper_type_known_for_hard_filter": False,
+                    "paper_type_known_for_exclude_filter": False,
                     "paper_type_alignment": 0.0,
-                    "paper_type_soft_penalty": 0.0,
                     "paper_type_filter_action": None,
                     "paper_type_filter_reason": None,
                     "paper_type_rule_matches": [],
@@ -941,14 +950,6 @@ class RerankSkill:
                 type_result = evaluate_paper_type_rules(
                     self._type_record_for_candidate(row),
                     rule_dicts,
-                    exclude_hard_filter_min_confidence=(
-                        self.exclude_hard_filter_min_confidence
-                    ),
-                    require_hard_filter_min_confidence=(
-                        self.require_hard_filter_min_confidence
-                    ),
-                    exclude_threshold=self.exclude_threshold,
-                    require_threshold=self.require_threshold,
                 )
                 contributions = {
                     name: float(policy.feature_weights.get(name, 0.0)) * value
@@ -957,10 +958,6 @@ class RerankSkill:
                 contributions["paper_type_alignment"] = (
                     float(policy.feature_weights.get("paper_type_alignment", 0.0))
                     * float(type_result["paper_type_alignment"])
-                )
-                contributions["paper_type_soft_penalty"] = (
-                    abs(float(policy.feature_weights.get("paper_type_alignment", 0.0)))
-                    * float(type_result["paper_type_soft_penalty"])
                 )
                 row.update(feature_values)
             score = sum(contributions.values())
@@ -1022,4 +1019,7 @@ class RerankSkill:
             "model": self.model,
             "catalog_version": self.catalog_version,
             "prompt_version": self.prompt_version,
+            "paper_type_namespace": self.paper_type_namespace,
+            "paper_type_prompt_version": self.paper_type_prompt_version,
+            "allowed_paper_types": list(self.allowed_paper_types),
         }

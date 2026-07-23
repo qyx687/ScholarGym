@@ -91,13 +91,13 @@ GRAPH_COMPACT_FIELDS = (
     "intent_result",
     "paper_type_probs",
     "paper_type_backend",
+    "paper_type_namespace",
     "paper_type_classifier_confidence",
     "paper_type_evidence_source",
     "paper_type_publication_types",
     "paper_type_supported_types",
     "paper_type_negative_evidence_types",
     "paper_type_alignment",
-    "paper_type_soft_penalty",
     "paper_type_filter_action",
     "paper_type_filter_reason",
     "hard_filtered",
@@ -541,6 +541,11 @@ class OnePassPostprocessor:
             policy, compiled_policy = self.per_subquery.configure_query(original_query)
         paper_type_provenance = {
             "paper_type_backend": getattr(resolver, "backend", None),
+            "paper_type_namespace": getattr(
+                self.per_subquery.rerank_skill,
+                "paper_type_namespace",
+                None,
+            ),
             "paper_type_evidence_source": getattr(
                 resolver, "evidence_source", None
             ),

@@ -120,15 +120,11 @@ event 共用该 policy。policy 可以按 query 选择/关闭 citation intent、
 语义相似度和 paper-type alignment，并可用负权重表达排除倾向。动态模式只改变
 `per_subquery` graph arm；`deep_merged` 继续作为固定 text-only control。
 
-候选类型证据用明确开关选择：
-
-~~~bash
---paper_type_backend s2    # 保守的 S2 publicationTypes 映射
---paper_type_backend qwen  # title+abstract 的九类 Qwen 分类
-~~~
-
-这与 policy LLM 是两个职责：即使候选类型使用 S2，动态组仍需 policy LLM 阅读
-原始 query 并生成权重/类型规则。
+候选论文类型固定读取 Semantic Scholar 原生 `publicationTypes`，不再提供 Qwen/S2
+backend 或 canonical/native namespace 切换。policy LLM 仍负责阅读原始 query、
+生成维度权重和类型规则；它不判断候选论文类型。策略直接使用 `Review`、
+`Conference` 等 13 个 S2 原生标签，不经过功能类型映射。S2 缺失标签按 unknown
+而不是 negative 处理。
 
 ## 3. 特征定义
 
@@ -259,29 +255,16 @@ python code/eval.py \
 deep_merged 依赖 graph pool 提供预算，所以启用时必须启用
 --run_per_subquery_postprocess。
 
-动态 S2 类型组在上面的数据/检索参数不变时替换为：
+动态组在上面的数据/检索参数不变时替换为：
 
 ~~~bash
 --dynamic_rerank \
 --rerank_policy_cache cache/dynamic_rerank/onepass_query_policies_pasa_v1.jsonl \
---paper_type_backend s2 \
 --paper_type_cache cache/dynamic_rerank/onepass_paper_types_s2_pasa_v1.jsonl
 ~~~
 
-动态 Qwen 类型组复用同一个 policy cache，只替换候选类型 backend 和独立 cache：
-
-~~~bash
---dynamic_rerank \
---rerank_policy_cache cache/dynamic_rerank/onepass_query_policies_pasa_v1.jsonl \
---paper_type_backend qwen \
---paper_type_qwen_model qwen3-30b-a3b-instruct-2507 \
---paper_type_qwen_batch_size 16 \
---paper_type_cache cache/dynamic_rerank/onepass_paper_types_qwen_pasa_v1.jsonl
-~~~
-
-不要让 S2 与 Qwen 组共用候选类型 cache；loader 会按 provenance 拒绝另一
-backend 的记录。Qwen cache 还绑定 `--paper_type_qwen_model`：更换模型后旧记录
-不会被复用。Qwen miss/失败按 unknown 处理，绝不隐式回退到候选自带的 S2 类型。
+`--paper_type_cache` 只接受 `evidence_source=semantic_scholar` 的记录；旧 Qwen 或
+canonical 类型缓存会被拒绝，避免跨实验语义污染。
 
 ## 8. Dense 运行示例
 
@@ -403,12 +386,9 @@ rerank Top-K 和 shadow selection，candidate/selection 指标会明确保存为
 --dynamic_rerank / --no-dynamic_rerank
 --rerank_policy_model MODEL
 --rerank_policy_cache PATH
---paper_type_backend s2|qwen
 --paper_type_cache PATH
+--paper_type_rate_limit_rps FLOAT
 --paper_type_offline_cache_only / --no-paper_type_offline_cache_only
---paper_type_qwen_model MODEL
---paper_type_qwen_is_local / --no-paper_type_qwen_is_local
---paper_type_qwen_batch_size N
 --graph_method citations|references|citations_references
 --graph_expansion_limit N
 --graph_cache_dir PATH
