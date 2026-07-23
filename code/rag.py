@@ -6,9 +6,7 @@ and perform similarity-based citation retrieval.
 """
 
 import json
-import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 from typing import List, Dict, Tuple, Optional, Set
 from tqdm import tqdm
@@ -39,12 +37,11 @@ class CitationRAGSystem:
             device: Device to run the model on ('cuda' or 'cpu')
         """
         self.device = device
+        self.embedding_model_path = embedding_model_path
         self.embedding_provider = embedding_provider
-        self.embedding_model = SentenceTransformer(
-            embedding_model_path, 
-            trust_remote_code=True,
-            device=device
-        ) if search_method != 'bm25' and embedding_provider is None else None
+        # The production vector path is Qdrant + OllamaEmbeddings.  Do not also
+        # load the legacy HuggingFace/FAISS model into RAM.
+        self.embedding_model = None
         self.qdrant_url = qdrant_url or config.QDRANT_URL
         self.qdrant_collection = qdrant_collection
         self.search_method = search_method
@@ -465,7 +462,13 @@ class CitationRAGSystem:
         Build FAISS vector library from paper titles and abstracts.
         """
         if self.embedding_model is None:
-            raise ValueError("Embedding model not loaded. Initialize with a vector-based search method.")
+            from sentence_transformers import SentenceTransformer
+            self.embedding_model = SentenceTransformer(
+                self.embedding_model_path,
+                trust_remote_code=True,
+                device=self.device,
+            )
+        import faiss
 
         logger.info("[🔨]Building FAISS index from titles and abstracts...")
         
@@ -533,11 +536,17 @@ class CitationRAGSystem:
         if self.embedding_provider is not None:
             embeddings = self.embedding_provider
         else:
-            embedding_model_name = "qwen3-embedding:0.6b"
+            embedding_model_name = getattr(config, "OLLAMA_EMBEDDING_MODEL", "qwen3-embedding:0.6b")
             print(f"Loading Embeddings: {embedding_model_name}...")
             embeddings = OllamaEmbeddings(model=embedding_model_name, base_url=config.OLLAMA_URL)
+        self.embedding_provider = embeddings
 
-        client = QdrantClient(url=self.qdrant_url)
+        client = QdrantClient(url=self.qdrant_url, timeout=120, )
+        if not client.collection_exists(self.qdrant_collection):
+            raise ValueError(
+                f"Qdrant collection {self.qdrant_collection!r} does not exist at {self.qdrant_url}; "
+                "build or restore the baseline Ollama index first"
+            )
         
         self.qdrant_vector_store = QdrantVectorStore(
             client=client,
@@ -551,6 +560,7 @@ class CitationRAGSystem:
         """
         logger.info(f"Loading FAISS index from {index_path}")
         
+        import faiss
         self.faiss_index = faiss.read_index(f"{index_path}.bin")
         
         with open(f"{index_path}_metadata.pkl", 'rb') as f:
@@ -577,7 +587,13 @@ class CitationRAGSystem:
         if self.faiss_index is None:
             raise ValueError("FAISS index not loaded. Please load or build the index first.")
         if self.embedding_model is None:
-            raise ValueError("Embedding model not loaded. Initialize with a vector-based search method.")
+            from sentence_transformers import SentenceTransformer
+            self.embedding_model = SentenceTransformer(
+                self.embedding_model_path,
+                trust_remote_code=True,
+                device=self.device,
+            )
+        import faiss
         
         # 编码查询向量
         query_embedding = self.embedding_model.encode([query], convert_to_numpy=True).astype('float32')
@@ -726,23 +742,26 @@ def display_search_results(method_name: str, results: List[Tuple[str, float, Dic
 
 def main():
     """
-    Main function for building or loading vector and BM25 libraries.
+    Legacy standalone smoke-test entry point.
+
+    Production experiments use ``eval.py``. Keep this entry point aligned with
+    the two supported baseline backends: BM25, or the fixed Ollama + Qdrant
+    dense index.
     """
     import argparse
     
-    parser = argparse.ArgumentParser(description='Citation RAG System with Vector and BM25 Search')
-    parser.add_argument('--cited_data_dir', type=str, default=config.CITED_DATA_DIR)
+    parser = argparse.ArgumentParser(description='Citation RAG System with baseline Vector or BM25 Search')
+    parser.add_argument('--cited_data_dir', type=str, default=getattr(config, 'CITED_DATA_DIR', 'data/cited_data'))
     parser.add_argument('--paper_db', type=str, default=config.PAPER_DB_PATH)
     parser.add_argument('--force_merge_citations', action='store_true')
-    parser.add_argument('--embedding_model', type=str, default=config.EMBEDDING_MODEL_PATH)
-    parser.add_argument('--faiss_path', type=str, default=config.FAISS_PATH_PREFIX, help='Path prefix to save/load FAISS index')
+    parser.add_argument('--faiss_path', type=str, default=config.FAISS_PATH_PREFIX, help='Legacy unused path kept for loader compatibility')
     parser.add_argument('--bm25_path', type=str, default=config.BM25_PATH, help='Path to save/load BM25 index')
-    parser.add_argument('--qdrant_path', type=str, default=config.QDRANT_PATH, help='Path to save/load Qdrant index')
+    parser.add_argument('--qdrant_url', type=str, default=config.QDRANT_URL)
+    parser.add_argument('--qdrant_collection', type=str, default='paper_knowledge_base')
     parser.add_argument('--rebuild', action='store_true', help='Force rebuild of all indices')
-    parser.add_argument('--rebuild_faiss', action='store_true', help='Force rebuild of FAISS index only')
+    parser.add_argument('--rebuild_faiss', action='store_true', help='Legacy alias for --rebuild; dense rebuilding is unsupported here')
     parser.add_argument('--rebuild_bm25', action='store_true', help='Force rebuild of BM25 index only')
-    parser.add_argument('--search_method', type=str, default=config.DEFAULT_SEARCH_METHOD, choices=['vector', 'bm25', 'both', 'hybrid'])
-    parser.add_argument('--device', type=str, default=config.DEVICE, help='Device to use (cuda or cpu)')
+    parser.add_argument('--search_method', type=str, default=config.DEFAULT_SEARCH_METHOD, choices=['vector', 'bm25'])
     
     args = parser.parse_args()
     
@@ -752,7 +771,11 @@ def main():
     else:
         logger.info(f"[✅]Using existing consolidated citation file: {args.paper_db}")
 
-    rag_system = CitationRAGSystem(embedding_model_path=args.embedding_model, device=args.device, search_method=args.search_method)
+    rag_system = CitationRAGSystem(
+        search_method=args.search_method,
+        qdrant_url=args.qdrant_url,
+        qdrant_collection=args.qdrant_collection,
+    )
     
     rag_system.load_or_build_indices(
         paper_db_path=args.paper_db,
@@ -777,9 +800,5 @@ def main():
             bm25_results = rag_system.search_citations_bm25(test_query, top_k=3)
             display_search_results("bm25", bm25_results)
         
-        if 'hybrid' in available_methods:
-            hybrid_results = rag_system.search_citations_hybrid(test_query, top_k=3)
-            display_search_results("hybrid", hybrid_results)
-
 if __name__ == "__main__":
     main()

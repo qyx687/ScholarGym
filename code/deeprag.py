@@ -315,6 +315,9 @@ class DeepResearchWorkflow:
                     'results_per_query': results_per_query or config.MAX_RESULTS_PER_QUERY,
                     'selector_top_k': len(new_papers),
                     'planner_checklist': checklist,
+                    'retrieval_exclusion_arxiv_ids': list(
+                        planner_input_state.get('retrieval_exclusion_arxiv_ids') or []
+                    ),
                     'retrieval_backend': 'embedding' if getattr(self.rag_system, 'search_method', '') == 'vector' else getattr(self.rag_system, 'search_method', 'bm25'),
                     'seed_papers': [
                         {

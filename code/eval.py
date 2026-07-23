@@ -8,6 +8,7 @@ from tqdm import tqdm
 import numpy as np
 import datetime
 import hashlib
+from langchain_ollama import OllamaEmbeddings
 
 from logger import get_logger
 from rag import CitationRAGSystem
@@ -15,8 +16,32 @@ import config
 from deeprag import DeepResearchWorkflow
 from simplerag import SimpleWorkflow
 from utils import extract_ground_truth_arxiv_ids, CheckpointManager, calculate_retrieval_metrics, AgentTraceRecorder
-from graph_methods import ArtifactWriter, EmbeddingProvider, PerSubqueryProcessor, S2GraphClient, load_paper_db
+from deep_retrieval import DeepRetrievalProcessor
+from graph_methods import (
+    ArtifactWriter,
+    BoundedEmbeddingProvider,
+    DEFAULT_FEATURE_WEIGHTS,
+    INTENT_WEIGHTS,
+    PAPER_EMBEDDING_SERIALIZATION_ID,
+    PerSubqueryProcessor,
+    QUERY_SCOPED_EMBEDDING_CACHE_POLICY,
+    QueryScopedEmbeddingCache,
+    RERANK_FORMULA_ID,
+    S2GraphClient,
+    load_paper_db,
+)
 from onepass_postprocess import OnePassPostprocessor, aggregate_postprocess_metrics
+from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
+from online_paper_type import S2PublicationTypeResolver
+from rerank_skill import (
+    DEFAULT_MAX_NEGATIVE_MASS,
+    DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_NEGATIVE_WEIGHT,
+    DEFAULT_SEMANTIC_MIN_MASS,
+    PAPER_TYPE_BACKEND,
+    S2_NATIVE_PAPER_TYPE_NAMESPACE,
+    RerankSkill,
+)
 
 logger = get_logger(__name__, log_file='./log/eval.log')
 
@@ -30,6 +55,92 @@ def package_source_sha256(filenames):
         with open(path, 'rb') as handle:
             digest.update(handle.read())
     return digest.hexdigest()
+
+
+def file_identity(path: str, *, include_sha256: bool = False) -> Dict:
+    resolved = os.path.realpath(path)
+    identity: Dict = {"path": resolved, "exists": os.path.isfile(resolved)}
+    if not identity["exists"]:
+        return identity
+    stat = os.stat(resolved)
+    identity.update({"size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+    if include_sha256:
+        digest = hashlib.sha256()
+        with open(resolved, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        identity["sha256"] = digest.hexdigest()
+    return identity
+
+
+def signature_sha256(payload: Dict) -> str:
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_resume_signature(
+    manifest_path: str,
+    detailed_results_path: str,
+    expected_signature: str,
+    *,
+    expected_payload: Dict = None,
+    allow_compatible_code_change: bool = False,
+) -> Dict:
+    artifacts_dir = os.path.dirname(manifest_path)
+    has_checkpoint = os.path.isfile(detailed_results_path) and os.path.getsize(detailed_results_path) > 0
+    has_artifact_rows = any(
+        filename.endswith(".jsonl") and os.path.getsize(os.path.join(root, filename)) > 0
+        for root, _, filenames in os.walk(artifacts_dir)
+        if ".staging" not in root.split(os.sep)
+        for filename in filenames
+    )
+    if not (has_checkpoint or has_artifact_rows):
+        return {"mode": "new"}
+    if not os.path.isfile(manifest_path):
+        raise ValueError(
+            "Cannot safely resume: checkpoint/artifact rows exist but the run "
+            f"manifest is missing: {manifest_path}. Use a new --run_label (or an empty output directory)."
+        )
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot safely resume: existing run manifest is unreadable: {manifest_path}"
+        ) from exc
+    actual_signature = existing.get("run_signature_sha256")
+    if actual_signature == expected_signature:
+        return {"mode": "exact", "previous_run_signature_sha256": actual_signature}
+    if allow_compatible_code_change and expected_payload is not None:
+        actual_payload = existing.get("run_signature")
+        if isinstance(actual_payload, dict):
+            actual_semantics = dict(actual_payload)
+            expected_semantics = dict(expected_payload)
+            # This opt-in is intended for result-preserving implementation
+            # upgrades (such as bounded parallel execution). All recorded
+            # data/method settings must remain byte-for-byte equivalent.
+            compatible_upgrade_keys = {
+                "package_source_sha256",
+                "postprocess_event_workers",
+                "postprocess_selector_concurrency",
+                "postprocess_embedding_concurrency",
+                "postprocess_embedding_cache_policy",
+            }
+            for key in compatible_upgrade_keys:
+                actual_semantics.pop(key, None)
+                expected_semantics.pop(key, None)
+            if actual_semantics == expected_semantics:
+                return {
+                    "mode": "compatible_code_change",
+                    "previous_run_signature_sha256": actual_signature,
+                }
+    raise ValueError(
+        "Refusing to resume into an output directory created by a different "
+        "code/data/method configuration. Use a new --run_label, or use "
+        "--allow_resume_compatible_code_change only for an audited result-preserving code upgrade."
+    )
 
 def load_config_from_path(config_path: str):
     """
@@ -116,8 +227,18 @@ class CitationEvaluator:
         gt_labels = query_data['gt_label']
         gt_arxiv_ids = extract_ground_truth_arxiv_ids(query_data['cited_paper'], gt_labels)
 
-        if not gt_arxiv_ids:
+        postprocessor = self.deep_research_workflow.onepass_postprocessor
+        materialize_without_ground_truth = (
+            postprocessor is not None
+            and postprocessor.postprocess_stage == 'materialize'
+        )
+        if not gt_arxiv_ids and not materialize_without_ground_truth:
             return None
+        if not gt_arxiv_ids:
+            logger.warning(
+                f"[⚠️] Query {idx} has no positive arXiv ground truth; "
+                "Stage A will materialize its pools but exclude it from pool-recall aggregates"
+            )
 
         workflow_results = self.deep_research_workflow.run(
             query_data, 
@@ -134,7 +255,15 @@ class CitationEvaluator:
         
         iteration_results = []
         # Use 'select' stage to compute per-iteration metrics
-        select_steps = [item for item in workflow_results['history'] if item.get('stage') == 'select']
+        select_steps = (
+            [
+                item
+                for item in workflow_results['history']
+                if item.get('stage') == 'select'
+            ]
+            if gt_arxiv_ids
+            else []
+        )
 
         # Track cumulative retrieval and selection across iterations
         all_retrieved_arxiv_ids = set()
@@ -242,6 +371,7 @@ class CitationEvaluator:
             'idx': idx,
             'query': query,
             'ground_truth_arxiv_ids': list(gt_arxiv_ids),
+            'ground_truth_metrics_available': bool(gt_arxiv_ids),
             'iteration_results': iteration_results,
             'final_report': workflow_results.get('final_report', ''),
             'final_selected_papers': final_selected_papers,
@@ -602,41 +732,91 @@ def main():
     parser.add_argument('--config', type=str, default=None, help='Path to config.py file (if specified, overrides default config)')
     parser.add_argument('--paper_db', type=str, default=None, help='Path to paper database JSON file')
     parser.add_argument('--benchmark_jsonl', type=str, default=None, help='Path to benchmark JSONL file')
-    parser.add_argument('--embedding_model', type=str, default=None, help='Path to embedding model')
     parser.add_argument('--llm_model', type=str, default=None, help='LLM model for query generation')
-    parser.add_argument('--faiss_path', type=str, default=None, help='Path prefix for FAISS index files')
     parser.add_argument('--bm25_path', type=str, default=None, help='Path for BM25 index file')
     parser.add_argument('--output_dir', type=str, default=None, help='Base directory to save evaluation results')
     parser.add_argument('--run_label', type=str, default='', help='Optional output-directory label')
     parser.add_argument('--limit', type=int, default=None, help='Process only the first N benchmark queries')
-    parser.add_argument('--rebuild_index', action='store_true', help='Force rebuild of indices')
+    parser.add_argument('--rebuild_index', action='store_true', help='Rebuild the BM25 index; dense Qdrant indices are built separately')
     parser.add_argument('--top_k', type=int, nargs='+', default=None, help='Top-k values for evaluation')
-    parser.add_argument('--device', type=str, default=None, help='Device for embedding model')
     parser.add_argument('--is_local', action='store_true', default=None, help='Use local LLM API')
     parser.add_argument('--prompt_type', type=str, default=None, choices=['complex', 'simple'], help='Type of prompt to use ("complex" or "simple")')
-    parser.add_argument('--search_method', type=str, default=None, choices=['vector', 'bm25', 'hybrid'], help='Search method to use ("vector", "bm25", or "hybrid")')
+    parser.add_argument('--search_method', type=str, default=None, choices=['vector', 'bm25'], help='Matched retrieval/rerank method')
     parser.add_argument('--workflow', type=str, default=None, choices=['simple', 'deep_research'], help='Evaluation workflow to use')
     parser.add_argument('--max_iterations', type=int, default=None, help='Maximum number of iterations for deep research workflow')
     parser.add_argument('--results_per_query', type=int, default=None, help='Results per query for deep research workflow')
     parser.add_argument('--browser_mode', type=str, default=None, choices=['PRE_ENRICH', 'REFRESH', 'INCREMENTAL', 'NONE'], help='Browser mode for deep research workflow')
     parser.add_argument('--save_level', choices=['minimal', 'full'], default='minimal')
+    parser.add_argument(
+        '--postprocess_stage',
+        choices=['full', 'materialize'],
+        default='full',
+        help=(
+            'full applies the selected static/dynamic rerank and shadow Selectors; '
+            'materialize is Stage A and writes candidate pools/component features only'
+        ),
+    )
     parser.add_argument('--run_per_subquery_postprocess', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--run_global_postprocess', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--run_deep_merged_postprocess', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--graph_method', choices=['citations', 'references', 'citations_references'], default='citations_references')
     parser.add_argument('--graph_expansion_limit', type=int, default=100)
     parser.add_argument('--graph_cache_dir', default='cache/s2_graph_oracle')
     parser.add_argument('--graph_rate_limit_rps', type=float, default=4.0)
     parser.add_argument('--graph_offline_cache_only', action='store_true')
-    parser.add_argument('--global_alpha', type=float, default=0.5)
-    parser.add_argument('--embedding_backend', choices=['ollama', 'api'], default='ollama')
-    parser.add_argument('--embedding_service_model', default='qwen3-embedding:0.6b')
-    parser.add_argument('--embedding_base_url', default=None)
-    parser.add_argument('--embedding_api_key_env', default='EMBEDDING_API_KEY')
-    parser.add_argument('--embedding_batch_size', type=int, default=64)
+    parser.add_argument(
+        '--dynamic_rerank',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            'Generate one query-conditioned policy for all OnePass graph events; '
+            'disabled by default to preserve the static baseline'
+        ),
+    )
+    parser.add_argument('--rerank_policy_model', default=None)
+    parser.add_argument(
+        '--rerank_policy_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        '--rerank_policy_cache',
+        default='cache/dynamic_rerank/onepass_query_policies.jsonl',
+    )
+    parser.add_argument('--rerank_retry_cached_fallbacks', action='store_true')
+    parser.add_argument('--rerank_min_confidence', type=float, default=DEFAULT_MIN_CONFIDENCE)
+    parser.add_argument(
+        '--rerank_semantic_min_mass',
+        type=float,
+        default=DEFAULT_SEMANTIC_MIN_MASS,
+    )
+    parser.add_argument('--rerank_negative_weight', type=float, default=DEFAULT_NEGATIVE_WEIGHT)
+    parser.add_argument(
+        '--rerank_max_negative_mass',
+        type=float,
+        default=DEFAULT_MAX_NEGATIVE_MASS,
+    )
+    parser.add_argument(
+        '--paper_type_cache',
+        default=None,
+        help='Append-only native S2 publicationTypes cache',
+    )
+    parser.add_argument('--paper_type_rate_limit_rps', type=float, default=1.0)
+    parser.add_argument(
+        '--paper_type_offline_cache_only',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--embedding_base_url', default=None, help='Ollama URL for baseline dense retrieval/reranking')
     parser.add_argument('--qdrant_url', default=None)
     parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
+    parser.add_argument('--postprocess_event_workers', type=int, default=None, help='Bounded workers for independent graph/deep rerank events')
+    parser.add_argument('--postprocess_selector_concurrency', type=int, default=None, help='Maximum concurrent shadow Selector API calls')
+    parser.add_argument('--postprocess_embedding_concurrency', type=int, default=None, help='Maximum concurrent postprocess Ollama embedding calls')
+    parser.add_argument('--allow_resume_compatible_code_change', action='store_true', help='Resume an audited result-preserving implementation upgrade when all recorded semantic settings match')
 
     args = parser.parse_args()
+    if args.dynamic_rerank and args.postprocess_stage != 'full':
+        parser.error('--dynamic_rerank requires --postprocess_stage full')
     
     # Load config from custom path if specified
     cfg = config
@@ -648,20 +828,43 @@ def main():
     # Use command-line args if provided, otherwise fall back to loaded config (cfg)
     paper_db = args.paper_db or cfg.PAPER_DB_PATH
     benchmark_jsonl = args.benchmark_jsonl or cfg.BENCHMARK_PATH
-    embedding_model = args.embedding_model or cfg.EMBEDDING_MODEL_PATH
     llm_model = args.llm_model or cfg.LLM_MODEL_NAME
-    faiss_path = args.faiss_path or cfg.FAISS_PATH_PREFIX
+    faiss_path = getattr(cfg, 'FAISS_PATH_PREFIX', '')
     bm25_path = args.bm25_path or cfg.BM25_PATH
     output_dir = args.output_dir or cfg.EVAL_BASE_DIR
     top_k = args.top_k or cfg.EVAL_TOP_K_VALUES
-    device = args.device or cfg.DEVICE
     is_local = args.is_local if args.is_local is not None else cfg.IS_LOCAL_LLM  # bool needs explicit None check
     prompt_type = args.prompt_type or cfg.EVAL_PROMPT_TYPE
     search_method = args.search_method or cfg.EVAL_SEARCH_METHOD
+    if search_method not in {'vector', 'bm25'}:
+        raise ValueError('This package supports matched bm25 or vector modes only')
+    if search_method == 'vector' and args.rebuild_index:
+        raise ValueError('Use code/build_vector_db_configurable.py to build a dense Qdrant index')
     workflow = args.workflow or cfg.EVAL_WORKFLOW
     max_iterations = args.max_iterations or cfg.EVAL_MAX_ITERATIONS
     results_per_query = args.results_per_query or cfg.MAX_RESULTS_PER_QUERY
     browser_mode = args.browser_mode or cfg.BROWSER_MODE
+    postprocess_event_workers = (
+        args.postprocess_event_workers
+        if args.postprocess_event_workers is not None
+        else int(getattr(cfg, 'POSTPROCESS_EVENT_WORKERS', 4))
+    )
+    postprocess_selector_concurrency = (
+        args.postprocess_selector_concurrency
+        if args.postprocess_selector_concurrency is not None
+        else int(getattr(cfg, 'POSTPROCESS_SELECTOR_CONCURRENCY', 4))
+    )
+    postprocess_embedding_concurrency = (
+        args.postprocess_embedding_concurrency
+        if args.postprocess_embedding_concurrency is not None
+        else int(getattr(cfg, 'POSTPROCESS_EMBEDDING_CONCURRENCY', 1))
+    )
+    if min(
+        postprocess_event_workers,
+        postprocess_selector_concurrency,
+        postprocess_embedding_concurrency,
+    ) < 1:
+        raise ValueError('Postprocess concurrency values must all be >= 1')
 
     # The workflow modules import the canonical config module, so mirror the
     # resolved custom-config/CLI values before constructing agents.
@@ -676,9 +879,17 @@ def main():
     config.PLANNER_ABLATION = getattr(cfg, 'PLANNER_ABLATION', False)
     config.SAVE_AGENT_TRACES = False
     config.DEBUG = False
-    if (args.run_per_subquery_postprocess or args.run_global_postprocess) and browser_mode != 'NONE':
+    any_shadow = (
+        args.run_per_subquery_postprocess
+        or args.run_deep_merged_postprocess
+    )
+    if args.run_deep_merged_postprocess and not args.run_per_subquery_postprocess:
+        raise ValueError('Deep shadows require --run_per_subquery_postprocess because graph local-pool sizes define their budgets')
+    if args.dynamic_rerank and not args.run_per_subquery_postprocess:
+        raise ValueError('--dynamic_rerank requires --run_per_subquery_postprocess')
+    if any_shadow and browser_mode != 'NONE':
         raise ValueError('One-pass replay postprocessors currently require --browser_mode NONE')
-    if (args.run_per_subquery_postprocess or args.run_global_postprocess) and getattr(cfg, 'ENABLE_SUMMARIZATION', False):
+    if any_shadow and getattr(cfg, 'ENABLE_SUMMARIZATION', False):
         raise ValueError('One-pass replay requires ENABLE_SUMMARIZATION=False so only the candidate list changes')
 
     # Use loaded config (cfg) for flags, not global config
@@ -687,12 +898,217 @@ def main():
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
     label_suffix = f"_{args.run_label}" if args.run_label else ''
-    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{label_suffix}")
+    stage_suffix = '_stage-materialize' if args.postprocess_stage == 'materialize' else ''
+    rerank_suffix = (
+        '_dynamic-rerank-v1_type-s2-native'
+        if args.dynamic_rerank
+        else '_static-rerank'
+    )
+    current_output_dir = os.path.join(output_dir, f"{model_name}_{prompt_type}_{search_method}_{workflow}_topk-{top_k}_maxq-{results_per_query}_{reasoning_flag}_{structured_flag}_{browser_mode}{ablation_flag}{stage_suffix}{rerank_suffix}{label_suffix}")
     os.makedirs(current_output_dir, exist_ok=True)
+
+    source_config = args.config if args.config else config.__file__
+    canonical_embedding_model = getattr(
+        config, 'OLLAMA_EMBEDDING_MODEL', 'qwen3-embedding:0.6b'
+    )
+    configured_embedding_model = getattr(
+        cfg, 'OLLAMA_EMBEDDING_MODEL', canonical_embedding_model
+    )
+    if search_method == 'vector' and configured_embedding_model != canonical_embedding_model:
+        raise ValueError(
+            f"Dense mode is fixed to baseline model {canonical_embedding_model!r}; "
+            f"custom config requested {configured_embedding_model!r}"
+        )
+    embedding_model_name = canonical_embedding_model if search_method == 'vector' else None
+    embedding_base_url = (
+        args.embedding_base_url or getattr(cfg, 'OLLAMA_URL', 'http://localhost:11434')
+        if search_method == 'vector'
+        else None
+    )
+    qdrant_url = (
+        args.qdrant_url or getattr(cfg, 'QDRANT_URL', None)
+        if search_method == 'vector'
+        else None
+    )
+    rerank_policy_model = (
+        args.rerank_policy_model
+        or os.environ.get('SCHOLARGYM_MODEL')
+        or llm_model
+    )
+    rerank_policy_is_local = (
+        args.rerank_policy_is_local
+        if args.rerank_policy_is_local is not None
+        else is_local
+    )
+    paper_type_offline = (
+        args.paper_type_offline_cache_only
+        if args.paper_type_offline_cache_only is not None
+        else args.graph_offline_cache_only
+    )
+    paper_type_cache = args.paper_type_cache or (
+        'cache/dynamic_rerank/onepass_paper_types_s2_native.jsonl'
+    )
+    package_source_files = [
+        'api.py', 'config.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
+        'graph_methods.py', 'metrics.py', 'deep_retrieval.py',
+        'online_paper_type.py', 'onepass_postprocess.py', 'paper_type.py',
+        'prompt.py', 'rag.py', 'rerank_skill.py', 'simplerag.py',
+        'structures.py', 'utils.py',
+        os.path.join('agent', 'browser.py'),
+        os.path.join('agent', 'planner.py'),
+        os.path.join('agent', 'selector.py'),
+        os.path.join('agent', 'summarizer.py'),
+        os.path.join('mcp', 'retrieval_mcp.py'),
+    ]
+    package_hash = package_source_sha256(package_source_files)
+    run_signature_payload = {
+        'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
+        'artifact_schema_version': '1.4',
+        'package_source_sha256': package_hash,
+        'config': file_identity(source_config, include_sha256=True),
+        'benchmark': file_identity(benchmark_jsonl, include_sha256=True),
+        'paper_db': file_identity(paper_db),
+        'bm25_index': (
+            {'path': os.path.realpath(bm25_path), 'rebuild_each_start': True}
+            if search_method == 'bm25' and args.rebuild_index
+            else (file_identity(bm25_path) if search_method == 'bm25' else None)
+        ),
+        'llm_model': llm_model,
+        'is_local_llm': is_local,
+        'llm_gen_params': cfg.LLM_GEN_PARAMS,
+        'prompt_type': prompt_type,
+        'workflow': workflow,
+        'top_k': top_k,
+        'max_iterations': max_iterations,
+        'results_per_query': results_per_query,
+        'browser_mode': browser_mode,
+        'planner_ablation': getattr(cfg, 'PLANNER_ABLATION', False),
+        'enable_reasoning': cfg.ENABLE_REASONING,
+        'enable_structured_output': cfg.ENABLE_STRUCTURED_OUTPUT,
+        'search_method': search_method,
+        'embedding_model': embedding_model_name,
+        'paper_embedding_serialization_id': (
+            PAPER_EMBEDDING_SERIALIZATION_ID
+            if search_method == 'vector'
+            else None
+        ),
+        'embedding_base_url': embedding_base_url,
+        'qdrant_url': qdrant_url,
+        'qdrant_collection': args.qdrant_collection if search_method == 'vector' else None,
+        'save_level': args.save_level,
+        'postprocess_stage': args.postprocess_stage,
+        'zero_ground_truth_policy': (
+            'materialize_pools_but_exclude_from_pool_recall_aggregates'
+            if args.postprocess_stage == 'materialize'
+            else 'skip_query_before_workflow'
+        ),
+        'run_per_subquery_postprocess': args.run_per_subquery_postprocess,
+        'run_deep_merged_postprocess': args.run_deep_merged_postprocess,
+        'graph_method': args.graph_method,
+        'graph_expansion_limit': args.graph_expansion_limit,
+        'graph_rate_limit_rps': args.graph_rate_limit_rps,
+        'graph_cache_dir': os.path.realpath(args.graph_cache_dir),
+        'graph_offline_cache_only': args.graph_offline_cache_only,
+        'dynamic_rerank_requested': args.dynamic_rerank,
+        'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+        'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+        'rerank_policy_cache': (
+            os.path.realpath(args.rerank_policy_cache)
+            if args.dynamic_rerank
+            else None
+        ),
+        'rerank_retry_cached_fallbacks': (
+            args.rerank_retry_cached_fallbacks if args.dynamic_rerank else None
+        ),
+        'rerank_min_confidence': (
+            args.rerank_min_confidence if args.dynamic_rerank else None
+        ),
+        'rerank_semantic_min_mass': (
+            args.rerank_semantic_min_mass if args.dynamic_rerank else None
+        ),
+        'rerank_negative_weight': (
+            args.rerank_negative_weight if args.dynamic_rerank else None
+        ),
+        'rerank_max_negative_mass': (
+            args.rerank_max_negative_mass if args.dynamic_rerank else None
+        ),
+        'paper_type_backend': (
+            PAPER_TYPE_BACKEND if args.dynamic_rerank else None
+        ),
+        'paper_type_namespace': (
+            S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+        ),
+        'paper_type_cache': (
+            os.path.realpath(paper_type_cache) if args.dynamic_rerank else None
+        ),
+        'paper_type_offline_cache_only': (
+            paper_type_offline if args.dynamic_rerank else None
+        ),
+        'paper_type_rate_limit_rps': (
+            args.paper_type_rate_limit_rps
+            if args.dynamic_rerank
+            else None
+        ),
+        'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+        'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
+        'feature_weights_applied': (
+            dict(DEFAULT_FEATURE_WEIGHTS)
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
+            else None
+        ),
+        'rerank_formula_id': (
+            (
+                POLICY_VERSION
+                if args.dynamic_rerank
+                else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
+        ),
+        'materialized_feature_names': {
+            'graph': [
+                'query_score_raw', 'query_score_normalized', 'query_component_rank',
+                'subquery_score_raw', 'subquery_score_normalized', 'subquery_component_rank',
+                'intent_labels', 'intent_score', 'path_count', 'path_count_normalized',
+            ],
+            'deep': [
+                'deep_retrieval_score_raw', 'deep_retrieval_rank_global_date_valid',
+                'deep_retrieval_rank_after_exclusion', 'deep_retrieval_rank_in_local_pool',
+                'query_score_raw', 'query_score_normalized', 'query_component_rank',
+                'subquery_score_raw', 'subquery_score_normalized', 'subquery_component_rank',
+            ],
+        },
+        'intent_weights': dict(INTENT_WEIGHTS),
+        'local_rerank_embedding_batch_size': getattr(config, 'LOCAL_RERANK_EMBEDDING_BATCH_SIZE', 64),
+        'deep_vector_max_fetch_k': getattr(config, 'DEEP_VECTOR_MAX_FETCH_K', 20000),
+        'postprocess_event_workers': postprocess_event_workers,
+        'postprocess_selector_concurrency': postprocess_selector_concurrency,
+        'postprocess_embedding_concurrency': postprocess_embedding_concurrency,
+        'postprocess_embedding_cache_policy': (
+            QUERY_SCOPED_EMBEDDING_CACHE_POLICY
+            if search_method == 'vector'
+            else None
+        ),
+        'limit': args.limit,
+    }
+    run_signature = signature_sha256(run_signature_payload)
+    detailed_results_file = os.path.join(current_output_dir, 'detailed_results.jsonl')
+    manifest_path = os.path.join(current_output_dir, 'onepass_artifacts', 'run_manifest.json')
+    resume_validation = validate_resume_signature(
+        manifest_path,
+        detailed_results_file,
+        run_signature,
+        expected_payload=run_signature_payload,
+        allow_compatible_code_change=args.allow_resume_compatible_code_change,
+    )
+    if resume_validation.get("mode") == "compatible_code_change":
+        logger.warning(
+            "[⚠️] Resuming after an explicitly allowed compatible package-code "
+            "upgrade; all recorded data/model/method settings matched"
+        )
 
     # Save config file for reproduction
     try:
-        source_config = args.config if args.config else config.__file__
         if source_config:
             target_config_path = os.path.join(current_output_dir, "config.py")
             shutil.copy(source_config, target_config_path)
@@ -705,25 +1121,25 @@ def main():
 
     logger.info("[🚀]Initializing RAG system...")
     embedding_provider = None
-    if search_method in {'vector', 'hybrid'}:
-        embedding_base_url = args.embedding_base_url or (
-            getattr(cfg, 'OLLAMA_URL', 'http://localhost:11434')
-            if args.embedding_backend == 'ollama'
-            else 'https://openrouter.ai/api/v1'
-        )
-        embedding_provider = EmbeddingProvider(
-            backend=args.embedding_backend,
-            model=args.embedding_service_model,
+    if search_method == 'vector':
+        embedding_provider = OllamaEmbeddings(
+            model=embedding_model_name,
             base_url=embedding_base_url,
-            api_key=os.environ.get(args.embedding_api_key_env, ''),
-            batch_size=args.embedding_batch_size,
         )
+    postprocess_embedding_provider = (
+        QueryScopedEmbeddingCache(
+            BoundedEmbeddingProvider(
+                embedding_provider,
+                max_concurrency=postprocess_embedding_concurrency,
+            )
+        )
+        if embedding_provider is not None
+        else None
+    )
     rag_system = CitationRAGSystem(
-        embedding_model_path=embedding_model,
-        device=device,
         search_method=search_method,
         embedding_provider=embedding_provider,
-        qdrant_url=args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
+        qdrant_url=qdrant_url,
         qdrant_collection=args.qdrant_collection,
     )
     
@@ -759,15 +1175,40 @@ def main():
         offline=args.graph_offline_cache_only,
     )
     scoring_backend = 'embedding' if search_method == 'vector' else 'bm25'
-    if search_method == 'hybrid':
-        raise ValueError('Graph rerank currently supports matched bm25 or vector modes, not hybrid')
+    rerank_skill = None
+    paper_type_resolver = None
+    if args.dynamic_rerank:
+        paper_type_resolver = S2PublicationTypeResolver(
+            paper_type_cache,
+            requests_per_second=args.paper_type_rate_limit_rps,
+            offline=paper_type_offline,
+        )
+        rerank_skill = RerankSkill(
+            rerank_policy_model,
+            is_local=rerank_policy_is_local,
+            policy_cache_path=args.rerank_policy_cache,
+            retry_cached_fallbacks=args.rerank_retry_cached_fallbacks,
+            paper_type_cache=paper_type_resolver.snapshot_cache(),
+            min_confidence=args.rerank_min_confidence,
+            semantic_min_mass=args.rerank_semantic_min_mass,
+            negative_weight=args.rerank_negative_weight,
+            max_negative_mass=args.rerank_max_negative_mass,
+        )
     per_subquery_processor = PerSubqueryProcessor(
         paper_db_index,
         s2_client,
         scoring_backend=scoring_backend,
-        embedding_provider=embedding_provider,
+        embedding_provider=postprocess_embedding_provider,
         expansion_method=args.graph_method,
         expansion_limit=args.graph_expansion_limit,
+        rerank_skill=rerank_skill,
+        paper_type_resolver=paper_type_resolver,
+    )
+    deep_retrieval_processor = DeepRetrievalProcessor(
+        rag_system,
+        paper_db_index,
+        scoring_backend=scoring_backend,
+        embedding_provider=postprocess_embedding_provider,
     )
     onepass_postprocessor = OnePassPostprocessor(
         selector=None,
@@ -775,27 +1216,52 @@ def main():
         writer=artifact_writer,
         s2_client=s2_client,
         per_subquery_processor=per_subquery_processor,
+        deep_retrieval_processor=deep_retrieval_processor,
         scoring_backend=scoring_backend,
-        embedding_provider=embedding_provider,
+        embedding_provider=postprocess_embedding_provider,
         run_per_subquery=args.run_per_subquery_postprocess,
-        run_global=args.run_global_postprocess,
+        run_deep_merged=args.run_deep_merged_postprocess,
+        postprocess_stage=args.postprocess_stage,
         run_id=os.path.basename(current_output_dir),
-        global_alpha=args.global_alpha,
+        event_workers=postprocess_event_workers,
+        selector_concurrency=postprocess_selector_concurrency,
     )
     artifact_writer.write_json('run_manifest.json', {
         'upstream_repository': 'https://github.com/shenhao-stu/ScholarGym.git',
         'baseline_commit_mirror': 'https://github.com/qyx687/ScholarGym.git@baseline-repro',
         'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
-        'artifact_schema_version': '1.1',
+        'artifact_schema_version': '1.4',
         'artifact_write_mode': 'query_staging_then_flat_jsonl_commit',
         'artifact_checkpoint_source': 'detailed_results.jsonl',
-        'package_source_sha256': package_source_sha256([
-            'api.py', 'deeprag.py', 'eval.py', 'graph_methods.py', 'metrics.py',
-            'onepass_postprocess.py', 'rag.py', 'utils.py',
-            os.path.join('agent', 'selector.py'),
-            os.path.join('mcp', 'retrieval_mcp.py'),
-        ]),
+        'package_source_sha256': package_hash,
+        'run_signature_sha256': run_signature,
+        'run_signature': run_signature_payload,
+        'resume_validation': resume_validation,
         'save_level': args.save_level,
+        'postprocess_stage': args.postprocess_stage,
+        'stage_a_only': args.postprocess_stage == 'materialize',
+        'stage_a_query_commit_policy': (
+            'all_enabled_materializers_must_complete'
+            if args.postprocess_stage == 'materialize'
+            else None
+        ),
+        'zero_ground_truth_policy': (
+            'materialize_pools_but_exclude_from_pool_recall_aggregates'
+            if args.postprocess_stage == 'materialize'
+            else 'skip_query_before_workflow'
+        ),
+        'legacy_rerank_applied': (
+            args.postprocess_stage == 'full' and not args.dynamic_rerank
+        ),
+        'dynamic_rerank_requested': args.dynamic_rerank,
+        'rerank_formula_id': (
+            (
+                POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
+        ),
+        'shadow_selector_applied': args.postprocess_stage == 'full',
         'config_path': args.config,
         'paper_db_path': paper_db,
         'benchmark_jsonl_path': benchmark_jsonl,
@@ -806,24 +1272,99 @@ def main():
         'browser_mode': browser_mode,
         'search_method': search_method,
         'scoring_backend': scoring_backend,
-        'embedding_backend': args.embedding_backend if embedding_provider else None,
-        'embedding_model': args.embedding_service_model if embedding_provider else None,
-        'embedding_base_url': embedding_provider.base_url if embedding_provider else None,
-        'qdrant_url': args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
+        'embedding_backend': 'ollama' if embedding_provider else None,
+        'embedding_implementation': 'langchain_ollama.OllamaEmbeddings' if embedding_provider else None,
+        'embedding_model': embedding_model_name,
+        'paper_embedding_serialization_id': (
+            PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+        ),
+        'embedding_base_url': embedding_base_url,
+        'local_rerank_embedding_batch_size': getattr(config, 'LOCAL_RERANK_EMBEDDING_BATCH_SIZE', 64),
+        'postprocess_event_workers': postprocess_event_workers,
+        'postprocess_selector_concurrency': postprocess_selector_concurrency,
+        'postprocess_embedding_concurrency': postprocess_embedding_concurrency,
+        'postprocess_embedding_cache_policy': (
+            QUERY_SCOPED_EMBEDDING_CACHE_POLICY
+            if embedding_provider
+            else None
+        ),
+        'deep_vector_max_fetch_k': getattr(config, 'DEEP_VECTOR_MAX_FETCH_K', 20000),
+        'qdrant_url': qdrant_url,
         'qdrant_collection': args.qdrant_collection,
         'graph_method': args.graph_method,
         'graph_cache_dir': args.graph_cache_dir,
         'graph_expansion_limit': args.graph_expansion_limit,
         'graph_rate_limit_rps': args.graph_rate_limit_rps,
         'graph_offline_cache_only': args.graph_offline_cache_only,
+        'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
+        'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
+        'rerank_policy_cache': (
+            args.rerank_policy_cache if args.dynamic_rerank else None
+        ),
+        'rerank_min_confidence': (
+            args.rerank_min_confidence if args.dynamic_rerank else None
+        ),
+        'rerank_semantic_min_mass': (
+            args.rerank_semantic_min_mass if args.dynamic_rerank else None
+        ),
+        'rerank_negative_weight': (
+            args.rerank_negative_weight if args.dynamic_rerank else None
+        ),
+        'rerank_max_negative_mass': (
+            args.rerank_max_negative_mass if args.dynamic_rerank else None
+        ),
+        'paper_type_backend': (
+            PAPER_TYPE_BACKEND if args.dynamic_rerank else None
+        ),
+        'paper_type_namespace': (
+            S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+        ),
+        'paper_type_evidence_source': getattr(
+            paper_type_resolver, 'evidence_source', None
+        ),
+        'paper_type_classifier_version': getattr(
+            paper_type_resolver, 'classifier_version', None
+        ),
+        'paper_type_supported_types': list(
+            sorted(getattr(rerank_skill, 'paper_type_supported_types', ()) or ())
+        ),
+        'paper_type_cache': paper_type_cache if args.dynamic_rerank else None,
+        'paper_type_offline_cache_only': (
+            paper_type_offline if args.dynamic_rerank else None
+        ),
+        'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
+        'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
         'date_policy': 'seeds_trust_retriever_expanded_require_db_date_lte_cutoff',
+        'deep_date_policy': (
+            'retrieved_papers_require_nonmissing_date_lte_subquery_cutoff'
+            if args.run_deep_merged_postprocess
+            else None
+        ),
         'run_per_subquery_postprocess': args.run_per_subquery_postprocess,
-        'run_global_postprocess': args.run_global_postprocess,
-        'global_alpha': args.global_alpha,
+        'run_deep_merged_postprocess': args.run_deep_merged_postprocess,
+        'deep_merged_budget': (
+            'sum of matching graph local-pool sizes for stable subquery_id'
+            if args.run_deep_merged_postprocess
+            else None
+        ),
+        'deep_rerank_graph_features': (
+            {'intent_score': 0.0, 'path_count_normalized': 0.0}
+            if (
+                args.postprocess_stage == 'full'
+                and args.run_deep_merged_postprocess
+            )
+            else None
+        ),
         'results_per_query': results_per_query,
         'run_label': args.run_label,
         'limit': args.limit,
-        'feature_weights': per_subquery_processor.weights,
+        'feature_weights_applied': (
+            per_subquery_processor.weights
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
+            else None
+        ),
+        'materialized_feature_names': run_signature_payload['materialized_feature_names'],
+        'intent_weights': dict(INTENT_WEIGHTS),
         'prompts_saved': False,
         'paper_identity_in_artifacts': 'arxiv_id_only',
     })
@@ -842,7 +1383,6 @@ def main():
     if args.limit is not None:
         benchmark_data = benchmark_data[:max(0, args.limit)]
     
-    detailed_results_file = os.path.join(current_output_dir, 'detailed_results.jsonl')
     summary_file = os.path.join(output_dir, 'evaluation_summary.jsonl')
     
     logger.info("[📈]Starting evaluation...")
@@ -856,18 +1396,78 @@ def main():
         enable_resume=True
     )
     results['method_config'] = {
-        'PACKAGE_METHOD': 'onepass_baseline_with_shadow_postprocessors',
+        'PACKAGE_METHOD': (
+            'onepass_stage_a_pool_feature_materialization'
+            if args.postprocess_stage == 'materialize'
+            else (
+                (
+                    'onepass_query_conditioned_graph_rerank_with_deep_merged_control'
+                    if args.run_deep_merged_postprocess
+                    else 'onepass_query_conditioned_graph_rerank'
+                )
+                if args.dynamic_rerank
+                else (
+                    'onepass_static_graph_rerank_with_deep_merged_control'
+                    if args.run_deep_merged_postprocess
+                    else 'onepass_static_graph_rerank'
+                )
+            )
+        ),
+        'POSTPROCESS_STAGE': args.postprocess_stage,
         'ARTIFACT_WRITE_MODE': 'query_staging_then_flat_jsonl_commit',
         'SAVE_LEVEL': args.save_level,
         'RUN_PER_SUBQUERY_POSTPROCESS': args.run_per_subquery_postprocess,
-        'RUN_GLOBAL_POSTPROCESS': args.run_global_postprocess,
+        'RUN_DEEP_MERGED_POSTPROCESS': args.run_deep_merged_postprocess,
+        'DYNAMIC_RERANK': args.dynamic_rerank,
+        'PAPER_TYPE_BACKEND': (
+            PAPER_TYPE_BACKEND if args.dynamic_rerank else None
+        ),
+        'PAPER_TYPE_NAMESPACE': (
+            S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+        ),
+        'PAPER_TYPE_CACHE': paper_type_cache if args.dynamic_rerank else None,
+        'RERANK_POLICY_CACHE': (
+            args.rerank_policy_cache if args.dynamic_rerank else None
+        ),
         'GRAPH_METHOD': args.graph_method,
         'GRAPH_EXPANSION_LIMIT': args.graph_expansion_limit,
         'GRAPH_RATE_LIMIT_RPS': args.graph_rate_limit_rps,
-        'GLOBAL_ALPHA': args.global_alpha,
-        'RERANK_FEATURE_WEIGHTS': per_subquery_processor.weights,
-        'EMBEDDING_BACKEND': args.embedding_backend if embedding_provider else None,
-        'EMBEDDING_MODEL': args.embedding_service_model if embedding_provider else None,
+        'RERANK_FORMULA_ID': (
+            (
+                POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID
+            )
+            if args.postprocess_stage == 'full'
+            else None
+        ),
+        'DEEP_RERANK_FEATURE_WEIGHTS': (
+            deep_retrieval_processor.weights
+            if (
+                args.postprocess_stage == 'full'
+                and args.run_deep_merged_postprocess
+            )
+            else None
+        ),
+        'RERANK_FEATURE_WEIGHTS': (
+            per_subquery_processor.weights
+            if args.postprocess_stage == 'full' and not args.dynamic_rerank
+            else None
+        ),
+        'MATERIALIZED_FEATURE_NAMES': run_signature_payload['materialized_feature_names'],
+        'EMBEDDING_BACKEND': 'ollama' if embedding_provider else None,
+        'EMBEDDING_MODEL': embedding_model_name,
+        'PAPER_EMBEDDING_SERIALIZATION_ID': (
+            PAPER_EMBEDDING_SERIALIZATION_ID if embedding_provider else None
+        ),
+        'LOCAL_RERANK_EMBEDDING_BATCH_SIZE': getattr(config, 'LOCAL_RERANK_EMBEDDING_BATCH_SIZE', 64),
+        'DEEP_VECTOR_MAX_FETCH_K': getattr(config, 'DEEP_VECTOR_MAX_FETCH_K', 20000),
+        'POSTPROCESS_EVENT_WORKERS': postprocess_event_workers,
+        'POSTPROCESS_SELECTOR_CONCURRENCY': postprocess_selector_concurrency,
+        'POSTPROCESS_EMBEDDING_CONCURRENCY': postprocess_embedding_concurrency,
+        'POSTPROCESS_EMBEDDING_CACHE_POLICY': (
+            QUERY_SCOPED_EMBEDDING_CACHE_POLICY
+            if embedding_provider
+            else None
+        ),
         'QDRANT_COLLECTION': args.qdrant_collection if embedding_provider else None,
         'RUN_LABEL': args.run_label,
     }
