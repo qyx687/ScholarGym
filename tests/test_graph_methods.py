@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "code"))
 from graph_methods import (
     CandidateIndex,
     DEFAULT_FEATURE_WEIGHTS,
+    EmbeddingProvider,
     RERANK_FORMULA_ID,
     PerSubqueryProcessor,
 )
@@ -57,6 +58,30 @@ class RecordingEmbeddingProvider:
     def embed(self, texts):
         self.calls.append(list(texts))
         return np.asarray([[1.0, 0.0] for _ in texts], dtype=np.float32)
+
+
+def test_embedding_provider_can_release_persisted_request_cache(monkeypatch):
+    provider = EmbeddingProvider(
+        backend="ollama",
+        model="fake",
+        base_url="http://127.0.0.1:1",
+        batch_size=64,
+    )
+    calls = []
+
+    def fake_request(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    monkeypatch.setattr(provider, "_request", fake_request)
+    provider.embed(["concept a", "concept b"])
+
+    assert provider.clear_memory_cache() == 2
+    provider.embed(["concept a"])
+    assert calls == [["concept a", "concept b"], ["concept a"]]
+    stats = provider.snapshot_stats()
+    assert stats["memory_cache_clear_calls"] == 1
+    assert stats["memory_cache_entries_cleared"] == 2
 
 
 def test_dense_candidate_text_matches_baseline_qdrant_serialization_exactly():

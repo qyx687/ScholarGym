@@ -27,6 +27,26 @@ from graph_methods import (
 from dimension_catalog import CATALOG_VERSION, POLICY_VERSION, PROMPT_VERSION
 from online_paper_type import S2PublicationTypeResolver
 from online_per_subquery import OnlinePerSubqueryManager
+from semrank import (
+    SEMRANK_FORMULA_ID,
+    SEMRANK_IMPLEMENTATION_VERSION,
+    SEMRANK_METHOD,
+    SEMRANK_METHOD_DISPLAY_NAME,
+    SEMRANK_PAPER_PROMPT_VERSION,
+    SEMRANK_QUERY_PROMPT_VERSION,
+    SEMRANK_TOPIC_PIPELINE_VERSION,
+    CachedConceptEncoder,
+    EmbeddingProviderConceptEncoder,
+    OfficialSemRankTopicClassifier,
+    PaperConceptService,
+    QueryProfileBuilder,
+    ScholarGymDateValidRetriever,
+    SemRankCache,
+    SemRankConfig,
+    SemRankLLMClient,
+    SemRankQSQReranker,
+    Specter2MeanPoolEncoder,
+)
 from rerank_skill import (
     DEFAULT_MAX_NEGATIVE_MASS,
     DEFAULT_MIN_CONFIDENCE,
@@ -49,6 +69,37 @@ def package_source_sha256(filenames):
         with open(path, 'rb') as handle:
             digest.update(handle.read())
     return digest.hexdigest()
+
+
+SEMRANK_PACKAGE_FILES = (
+    'api.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
+    'graph_methods.py', 'metrics.py', 'online_paper_type.py',
+    'online_per_subquery.py', 'paper_type.py', 'rag.py',
+    'rerank_skill.py', 'utils.py',
+    os.path.join('semrank', '__init__.py'),
+    os.path.join('semrank', 'cache.py'),
+    os.path.join('semrank', 'classifier.py'),
+    os.path.join('semrank', 'encoder.py'),
+    os.path.join('semrank', 'models.py'),
+    os.path.join('semrank', 'paper_concepts.py'),
+    os.path.join('semrank', 'prompts.py'),
+    os.path.join('semrank', 'query_profile.py'),
+    os.path.join('semrank', 'reranker.py'),
+    os.path.join('semrank', 'retrieval.py'),
+    os.path.join('agent', 'selector.py'),
+    os.path.join('mcp', 'retrieval_mcp.py'),
+)
+
+
+def file_sha256_if_present(path):
+    if not path or not os.path.isfile(path):
+        return None
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
 
 def load_config_from_path(config_path: str):
     """
@@ -467,7 +518,12 @@ class CitationEvaluator:
                             results[f'precision@{k}'].append(precision_k)
                         
             except Exception as e:
-                logger.warning(f"[💢]Failed to evaluate query {query_data.get('query', 'N/A')[:30]}: {e}")
+                logger.warning(
+                    "[💢]Failed to evaluate query %s: %s",
+                    query_data.get("query", "N/A")[:30],
+                    e,
+                    exc_info=True,
+                )
                 continue
             
         if workflow == 'deep_research':
@@ -639,6 +695,15 @@ def main():
     parser.add_argument('--graph_rate_limit_rps', type=float, default=4.0)
     parser.add_argument('--graph_offline_cache_only', action='store_true')
     parser.add_argument(
+        '--graph_rerank_method',
+        choices=['static', 'dynamic_v2', SEMRANK_METHOD],
+        default=None,
+        help=(
+            'Reranker applied only after the shared graph candidate pool is '
+            'built. When omitted, legacy --dynamic_rerank behavior remains.'
+        ),
+    )
+    parser.add_argument(
         '--dynamic_rerank',
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -685,6 +750,128 @@ def main():
     parser.add_argument('--embedding_batch_size', type=int, default=64)
     parser.add_argument('--qdrant_url', default=None)
     parser.add_argument('--qdrant_collection', default='paper_knowledge_base')
+    parser.add_argument(
+        '--qdrant_timeout_seconds',
+        type=float,
+        default=None,
+        help=(
+            'Qdrant HTTP request timeout. This is an operational retry/wait '
+            'budget and does not change retrieval or rerank scoring.'
+        ),
+    )
+    parser.add_argument('--semrank_initial_top_m', type=int, default=1000)
+    parser.add_argument('--semrank_feedback_top_n', type=int, default=100)
+    parser.add_argument('--semrank_prompt_top_papers', type=int, default=50)
+    parser.add_argument('--semrank_candidate_topic_k', type=int, default=50)
+    parser.add_argument('--semrank_candidate_phrase_k', type=int, default=50)
+    parser.add_argument('--semrank_classifier_topic_k', type=int, default=100)
+    parser.add_argument(
+        '--semrank_paper_concept_mode',
+        choices=['full', 'classifier_only'],
+        default='full',
+        help=(
+            'full uses paper-level LLM topic filtering/keyphrases; '
+            'classifier_only uses all classifier candidate topics and makes '
+            'zero paper-level LLM calls'
+        ),
+    )
+    parser.add_argument('--semrank_base_query_weight', type=float, default=0.4)
+    parser.add_argument('--semrank_base_subquery_weight', type=float, default=0.6)
+    parser.add_argument(
+        '--semrank_concept_encoder_backend',
+        choices=['ollama', 'api', 'specter2'],
+        default='ollama',
+    )
+    parser.add_argument(
+        '--semrank_concept_encoder',
+        default='qwen3-embedding:0.6b',
+    )
+    parser.add_argument(
+        '--semrank_concept_encoder_base_url',
+        default='http://127.0.0.1:11434',
+    )
+    parser.add_argument(
+        '--semrank_concept_encoder_revision',
+        default='',
+    )
+    parser.add_argument(
+        '--semrank_concept_encoder_device',
+        default='cuda:0',
+    )
+    parser.add_argument(
+        '--semrank_concept_encoder_batch_size',
+        type=int,
+        default=64,
+    )
+    parser.add_argument('--semrank_llm_model', default=None)
+    parser.add_argument(
+        '--semrank_llm_is_local',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument('--semrank_llm_workers', type=int, default=8)
+    parser.add_argument(
+        '--semrank_topic_classifier_checkpoint',
+        default=(
+            '../third_party/SemRank/classifier/'
+            'topic_classifier_specter2.pt'
+        ),
+    )
+    parser.add_argument(
+        '--semrank_topic_labels_path',
+        default='../third_party/SemRank/classifier/labels.txt',
+    )
+    parser.add_argument(
+        '--semrank_topic_classifier_encoder',
+        default='allenai/specter2_base',
+    )
+    parser.add_argument(
+        '--semrank_topic_classifier_encoder_revision',
+        default='3447645e1def9117997203454fa4495937bfbd83',
+    )
+    parser.add_argument(
+        '--semrank_topic_classifier_device',
+        default='cuda:0',
+    )
+    parser.add_argument(
+        '--semrank_topic_classifier_batch_size',
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        '--semrank_cache_dir',
+        default='cache/semrank',
+    )
+    parser.add_argument(
+        '--semrank_allow_lazy_paper_concepts',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        '--semrank_cache_only',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--semrank_rebuild_query_profile',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--semrank_rebuild_paper_concepts',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        '--semrank_retry_failed_query_profiles',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        '--semrank_retry_failed_paper_concepts',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     args = parser.parse_args()
 
@@ -712,6 +899,140 @@ def main():
     max_iterations = args.max_iterations or cfg.EVAL_MAX_ITERATIONS
     results_per_query = args.results_per_query or cfg.MAX_RESULTS_PER_QUERY
     browser_mode = args.browser_mode or cfg.BROWSER_MODE
+    graph_rerank_method = args.graph_rerank_method or (
+        'dynamic_v2' if args.dynamic_rerank else 'static'
+    )
+    semrank_llm_model = (
+        args.semrank_llm_model
+        or os.environ.get('SCHOLARGYM_MODEL')
+        or llm_model
+    )
+    semrank_llm_is_local = (
+        args.semrank_llm_is_local
+        if args.semrank_llm_is_local is not None
+        else is_local
+    )
+    semrank_cache_path = os.path.join(
+        args.semrank_cache_dir,
+        'semrank.sqlite3',
+    )
+    semrank_config = None
+    semrank_cli_identity = None
+    semrank_output_signature = None
+    semrank_package_source_sha256 = None
+    if graph_rerank_method == SEMRANK_METHOD:
+        if not args.enable_per_subquery_graph:
+            raise ValueError(
+                'semrank_qsq requires --enable_per_subquery_graph'
+            )
+        if search_method != 'vector':
+            raise ValueError(
+                'semrank_qsq requires --search_method vector; it does not '
+                'use BM25/sparse scoring'
+            )
+        semrank_config = SemRankConfig(
+            initial_top_m=args.semrank_initial_top_m,
+            feedback_top_n=args.semrank_feedback_top_n,
+            prompt_top_papers=args.semrank_prompt_top_papers,
+            candidate_topic_k=args.semrank_candidate_topic_k,
+            candidate_phrase_k=args.semrank_candidate_phrase_k,
+            classifier_topic_k=args.semrank_classifier_topic_k,
+            paper_concept_mode=args.semrank_paper_concept_mode,
+            base_query_weight=args.semrank_base_query_weight,
+            base_subquery_weight=args.semrank_base_subquery_weight,
+            concept_encoder_backend=(
+                args.semrank_concept_encoder_backend
+            ),
+            concept_encoder=args.semrank_concept_encoder,
+            concept_encoder_base_url=(
+                args.semrank_concept_encoder_base_url
+            ),
+            concept_encoder_revision=(
+                args.semrank_concept_encoder_revision
+            ),
+            concept_encoder_batch_size=(
+                args.semrank_concept_encoder_batch_size
+            ),
+            concept_encoder_device=args.semrank_concept_encoder_device,
+            llm_model=semrank_llm_model,
+            llm_is_local=semrank_llm_is_local,
+            llm_enable_thinking=False,
+            llm_temperature=0.0,
+            llm_top_p=1.0,
+            llm_workers=args.semrank_llm_workers,
+            topic_classifier_checkpoint=os.path.abspath(
+                args.semrank_topic_classifier_checkpoint
+            ),
+            topic_labels_path=os.path.abspath(
+                args.semrank_topic_labels_path
+            ),
+            topic_classifier_encoder=(
+                args.semrank_topic_classifier_encoder
+            ),
+            topic_classifier_encoder_revision=(
+                args.semrank_topic_classifier_encoder_revision
+            ),
+            topic_classifier_device=(
+                args.semrank_topic_classifier_device
+            ),
+            topic_classifier_batch_size=(
+                args.semrank_topic_classifier_batch_size
+            ),
+            cache_path=os.path.abspath(semrank_cache_path),
+            allow_lazy_paper_concepts=(
+                args.semrank_allow_lazy_paper_concepts
+            ),
+            cache_only=args.semrank_cache_only,
+            rebuild_query_profile=args.semrank_rebuild_query_profile,
+            rebuild_paper_concepts=args.semrank_rebuild_paper_concepts,
+            retry_failed_query_profiles=(
+                args.semrank_retry_failed_query_profiles
+            ),
+            retry_failed_paper_concepts=(
+                args.semrank_retry_failed_paper_concepts
+            ),
+        )
+        semrank_package_source_sha256 = package_source_sha256(
+            SEMRANK_PACKAGE_FILES
+        )
+        semrank_cli_identity = {
+            **semrank_config.identity(),
+            'package_source_sha256': semrank_package_source_sha256,
+            'config_file_sha256': file_sha256_if_present(
+                args.config or getattr(config, '__file__', None)
+            ),
+            'topic_classifier_checkpoint_sha256': file_sha256_if_present(
+                semrank_config.topic_classifier_checkpoint
+            ),
+            'topic_labels_sha256': file_sha256_if_present(
+                semrank_config.topic_labels_path
+            ),
+            'paper_db_path': os.path.abspath(paper_db),
+            'benchmark_jsonl_path': os.path.abspath(benchmark_jsonl),
+            'qdrant_url': (
+                args.qdrant_url or getattr(cfg, 'QDRANT_URL', None)
+            ),
+            'qdrant_collection': args.qdrant_collection,
+            'qdrant_timeout_seconds': args.qdrant_timeout_seconds,
+            'retrieval_embedding_model': args.embedding_service_model,
+            'graph_method': args.graph_method,
+            'graph_expansion_limit': args.graph_expansion_limit,
+            'max_iterations': max_iterations,
+            'results_per_query': results_per_query,
+            'browser_mode': browser_mode,
+            'top_k': list(top_k),
+            'limit': args.limit,
+            'run_label': args.run_label,
+            'save_level': args.save_level,
+        }
+        semrank_output_signature = hashlib.sha256(
+            json.dumps(
+                semrank_cli_identity,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=str,
+            ).encode('utf-8')
+        ).hexdigest()
 
     # The workflow modules import the canonical config module, so mirror the
     # resolved custom-config/CLI values before constructing agents.
@@ -732,7 +1053,18 @@ def main():
     structured_flag = 'structured' if cfg.ENABLE_STRUCTURED_OUTPUT else 'non-structured'
     ablation_flag = '_ablation' if getattr(cfg, 'PLANNER_ABLATION', False) else ''
     model_name = llm_model.split('/')[-1] if '/' in llm_model else llm_model
-    if args.enable_per_subquery_graph and args.dynamic_rerank:
+    if (
+        args.enable_per_subquery_graph
+        and graph_rerank_method == SEMRANK_METHOD
+    ):
+        method_suffix = (
+            '_per_subquery_online_semrank_qsq'
+            f'_sig-{semrank_output_signature[:12]}'
+        )
+    elif (
+        args.enable_per_subquery_graph
+        and graph_rerank_method == 'dynamic_v2'
+    ):
         method_suffix = '_per_subquery_online_dynamic_rerank_v1_type-s2-native'
     elif args.enable_per_subquery_graph:
         method_suffix = '_per_subquery_online_q030_sq040_intent015_path015'
@@ -777,6 +1109,7 @@ def main():
         embedding_provider=embedding_provider,
         qdrant_url=args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
         qdrant_collection=args.qdrant_collection,
+        qdrant_timeout_seconds=args.qdrant_timeout_seconds,
     )
     
     rag_system.load_or_build_indices(
@@ -835,7 +1168,11 @@ def main():
         )
         rerank_skill = None
         paper_type_resolver = None
-        if args.dynamic_rerank:
+        semrank_reranker = None
+        semrank_initial_retriever = None
+        semrank_cache = None
+        semrank_llm = None
+        if graph_rerank_method == 'dynamic_v2':
             paper_type_resolver = S2PublicationTypeResolver(
                 paper_type_cache,
                 requests_per_second=args.paper_type_rate_limit_rps,
@@ -852,6 +1189,104 @@ def main():
                 negative_weight=args.rerank_negative_weight,
                 max_negative_mass=args.rerank_max_negative_mass,
             )
+        elif graph_rerank_method == SEMRANK_METHOD:
+            assert semrank_config is not None
+            semrank_cache = SemRankCache(semrank_config.cache_path)
+            semrank_classifier = OfficialSemRankTopicClassifier(
+                semrank_config.topic_classifier_checkpoint,
+                semrank_config.topic_labels_path,
+                encoder_name=semrank_config.topic_classifier_encoder,
+                encoder_revision=(
+                    semrank_config.topic_classifier_encoder_revision
+                ),
+                device=semrank_config.topic_classifier_device,
+                batch_size=semrank_config.topic_classifier_batch_size,
+            )
+            if semrank_config.concept_encoder_backend == 'specter2':
+                semrank_encoder_backend = Specter2MeanPoolEncoder(
+                    semrank_config.concept_encoder,
+                    revision=semrank_config.concept_encoder_revision,
+                    device=semrank_config.concept_encoder_device,
+                    batch_size=(
+                        semrank_config.concept_encoder_batch_size
+                    ),
+                    max_length=(
+                        semrank_config.concept_encoder_max_length
+                    ),
+                )
+            else:
+                if embedding_provider is None:
+                    raise ValueError(
+                        'SemRank service concept encoding requires the dense '
+                        'embedding provider'
+                    )
+                expected_provider = {
+                    'backend': semrank_config.concept_encoder_backend,
+                    'model': semrank_config.concept_encoder,
+                    'base_url': (
+                        semrank_config.concept_encoder_base_url.rstrip('/')
+                    ),
+                }
+                actual_provider = {
+                    'backend': str(embedding_provider.backend),
+                    'model': str(embedding_provider.model),
+                    'base_url': str(
+                        embedding_provider.base_url
+                    ).rstrip('/'),
+                }
+                if actual_provider != expected_provider:
+                    raise ValueError(
+                        'SemRank concept encoder must reuse the exact dense '
+                        'embedding provider; expected '
+                        f'{expected_provider}, got {actual_provider}'
+                    )
+                semrank_encoder_backend = (
+                    EmbeddingProviderConceptEncoder(embedding_provider)
+                )
+            semrank_encoder = CachedConceptEncoder(
+                semrank_encoder_backend,
+                semrank_cache,
+            )
+            semrank_llm = SemRankLLMClient(
+                semrank_config.llm_model,
+                is_local=semrank_config.llm_is_local,
+                enable_thinking=semrank_config.llm_enable_thinking,
+                temperature=semrank_config.llm_temperature,
+                top_p=semrank_config.llm_top_p,
+                max_tokens=semrank_config.llm_max_tokens,
+                workers=semrank_config.llm_workers,
+            )
+            semrank_paper_concepts = PaperConceptService(
+                semrank_config,
+                semrank_cache,
+                semrank_classifier,
+                semrank_llm,
+                semrank_encoder,
+            )
+            semrank_query_profiles = QueryProfileBuilder(
+                semrank_config,
+                semrank_cache,
+                semrank_paper_concepts,
+                semrank_llm,
+                semrank_encoder,
+            )
+            semrank_reranker = SemRankQSQReranker(
+                semrank_config,
+                semrank_query_profiles,
+                semrank_paper_concepts,
+                semrank_encoder,
+            )
+            semrank_initial_retriever = ScholarGymDateValidRetriever(
+                rag_system,
+                qdrant_url=(
+                    args.qdrant_url
+                    or getattr(cfg, 'QDRANT_URL', None)
+                    or ''
+                ),
+                qdrant_collection=args.qdrant_collection,
+                embedding_model=args.embedding_service_model,
+                paper_db=paper_db_index,
+            )
         processor = PerSubqueryProcessor(
             paper_db_index,
             s2_client,
@@ -861,22 +1296,102 @@ def main():
             expansion_limit=args.graph_expansion_limit,
             rerank_skill=rerank_skill,
             paper_type_resolver=paper_type_resolver,
+            rerank_method=graph_rerank_method,
+            semrank_reranker=semrank_reranker,
         )
-        online_manager = OnlinePerSubqueryManager(processor, artifact_writer, os.path.basename(current_output_dir))
+        online_manager = OnlinePerSubqueryManager(
+            processor,
+            artifact_writer,
+            os.path.basename(current_output_dir),
+            semrank_initial_retriever=semrank_initial_retriever,
+        )
+        is_dynamic_v2 = graph_rerank_method == 'dynamic_v2'
+        run_identity = {
+            'graph_rerank_method': graph_rerank_method,
+            'paper_db_path': os.path.abspath(paper_db),
+            'benchmark_jsonl_path': os.path.abspath(benchmark_jsonl),
+            'search_method': search_method,
+            'llm_model': llm_model,
+            'prompt_type': prompt_type,
+            'embedding_backend': args.embedding_backend,
+            'embedding_model': args.embedding_service_model,
+            'embedding_base_url': (
+                embedding_provider.base_url if embedding_provider else None
+            ),
+            'paper_embedding_serialization_id': (
+                PAPER_EMBEDDING_SERIALIZATION_ID
+            ),
+            'qdrant_url': (
+                args.qdrant_url or getattr(cfg, 'QDRANT_URL', None)
+            ),
+            'qdrant_collection': args.qdrant_collection,
+            'qdrant_timeout_seconds': args.qdrant_timeout_seconds,
+            'graph_method': args.graph_method,
+            'graph_expansion_limit': args.graph_expansion_limit,
+            'graph_offline_cache_only': args.graph_offline_cache_only,
+            'max_iterations': max_iterations,
+            'results_per_query': results_per_query,
+            'browser_mode': browser_mode,
+            'top_k': list(top_k),
+            'limit': args.limit,
+            'run_label': args.run_label,
+            'save_level': args.save_level,
+            'semrank': (
+                {
+                    **(semrank_cli_identity or {}),
+                    'classifier_id': (
+                        semrank_reranker.paper_concepts.classifier.classifier_id
+                        if semrank_reranker is not None
+                        else None
+                    ),
+                    'label_space_id': (
+                        semrank_reranker.paper_concepts.classifier.label_space_id
+                        if semrank_reranker is not None
+                        else None
+                    ),
+                    'auxiliary_retriever_identity': (
+                        semrank_initial_retriever.retriever_identity
+                        if semrank_initial_retriever is not None
+                        else None
+                    ),
+                }
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+        }
+        resume_signature = hashlib.sha256(
+            json.dumps(
+                run_identity,
+                sort_keys=True,
+                separators=(',', ':'),
+                default=str,
+            ).encode('utf-8')
+        ).hexdigest()
+        existing_manifest_path = os.path.join(
+            artifacts_dir, 'run_manifest.json'
+        )
+        if os.path.exists(existing_manifest_path):
+            with open(existing_manifest_path, encoding='utf-8') as handle:
+                existing_manifest = json.load(handle)
+            existing_signature = existing_manifest.get('resume_signature')
+            if (
+                existing_signature is not None
+                and existing_signature != resume_signature
+            ):
+                raise ValueError(
+                    'Refusing to resume an output directory with an '
+                    'incompatible rerank/configuration signature'
+                )
         artifact_writer.write_json('run_manifest.json', {
             'upstream_repository': 'https://github.com/shenhao-stu/ScholarGym.git',
             'baseline_commit_mirror': 'https://github.com/qyx687/ScholarGym.git@baseline-repro',
             'upstream_commit': 'f426fd15e3ff28ee11ddeafc253dffd73ef88500',
             'artifact_schema_version': '1.0',
             'rank_metric_schema_version': RANK_METRIC_SCHEMA_VERSION,
-            'package_source_sha256': package_source_sha256([
-                'api.py', 'deeprag.py', 'dimension_catalog.py', 'eval.py',
-                'graph_methods.py', 'metrics.py', 'online_paper_type.py',
-                'online_per_subquery.py', 'paper_type.py', 'rag.py',
-                'rerank_skill.py', 'utils.py',
-                os.path.join('agent', 'selector.py'),
-                os.path.join('mcp', 'retrieval_mcp.py'),
-            ]),
+            'package_source_sha256': (
+                semrank_package_source_sha256
+                or package_source_sha256(SEMRANK_PACKAGE_FILES)
+            ),
             'save_level': args.save_level,
             'config_path': args.config,
             'paper_db_path': paper_db,
@@ -886,7 +1401,17 @@ def main():
             'prompt_type': prompt_type,
             'max_iterations': max_iterations,
             'browser_mode': browser_mode,
-            'method': 'online_per_subquery',
+            'method': (
+                SEMRANK_METHOD
+                if graph_rerank_method == SEMRANK_METHOD
+                else 'online_per_subquery'
+            ),
+            'graph_rerank_method': graph_rerank_method,
+            'method_display_name': (
+                SEMRANK_METHOD_DISPLAY_NAME
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
             'search_method': search_method,
             'scoring_backend': scoring_backend,
             'embedding_backend': args.embedding_backend if embedding_provider else None,
@@ -897,22 +1422,23 @@ def main():
             'embedding_base_url': embedding_provider.base_url if embedding_provider else None,
             'qdrant_url': args.qdrant_url or getattr(cfg, 'QDRANT_URL', None),
             'qdrant_collection': args.qdrant_collection,
+            'qdrant_timeout_seconds': args.qdrant_timeout_seconds,
             'graph_method': args.graph_method,
             'graph_cache_dir': args.graph_cache_dir,
             'graph_expansion_limit': args.graph_expansion_limit,
             'graph_rate_limit_rps': args.graph_rate_limit_rps,
             'graph_offline_cache_only': args.graph_offline_cache_only,
-            'dynamic_rerank_requested': args.dynamic_rerank,
-            'rerank_policy_model': rerank_policy_model if args.dynamic_rerank else None,
-            'rerank_policy_is_local': rerank_policy_is_local if args.dynamic_rerank else None,
-            'rerank_policy_cache': args.rerank_policy_cache if args.dynamic_rerank else None,
-            'rerank_min_confidence': args.rerank_min_confidence if args.dynamic_rerank else None,
-            'rerank_semantic_min_mass': args.rerank_semantic_min_mass if args.dynamic_rerank else None,
-            'rerank_negative_weight': args.rerank_negative_weight if args.dynamic_rerank else None,
-            'rerank_max_negative_mass': args.rerank_max_negative_mass if args.dynamic_rerank else None,
-            'paper_type_backend': PAPER_TYPE_BACKEND if args.dynamic_rerank else None,
+            'dynamic_rerank_requested': is_dynamic_v2,
+            'rerank_policy_model': rerank_policy_model if is_dynamic_v2 else None,
+            'rerank_policy_is_local': rerank_policy_is_local if is_dynamic_v2 else None,
+            'rerank_policy_cache': args.rerank_policy_cache if is_dynamic_v2 else None,
+            'rerank_min_confidence': args.rerank_min_confidence if is_dynamic_v2 else None,
+            'rerank_semantic_min_mass': args.rerank_semantic_min_mass if is_dynamic_v2 else None,
+            'rerank_negative_weight': args.rerank_negative_weight if is_dynamic_v2 else None,
+            'rerank_max_negative_mass': args.rerank_max_negative_mass if is_dynamic_v2 else None,
+            'paper_type_backend': PAPER_TYPE_BACKEND if is_dynamic_v2 else None,
             'paper_type_namespace': (
-                S2_NATIVE_PAPER_TYPE_NAMESPACE if args.dynamic_rerank else None
+                S2_NATIVE_PAPER_TYPE_NAMESPACE if is_dynamic_v2 else None
             ),
             'paper_type_source': (
                 paper_type_resolver.evidence_source if paper_type_resolver else None
@@ -928,22 +1454,140 @@ def main():
                 if paper_type_resolver
                 else None
             ),
-            'paper_type_cache': paper_type_cache if args.dynamic_rerank else None,
-            'paper_type_offline_cache_only': paper_type_offline if args.dynamic_rerank else None,
+            'paper_type_cache': paper_type_cache if is_dynamic_v2 else None,
+            'paper_type_offline_cache_only': paper_type_offline if is_dynamic_v2 else None,
             'paper_type_rate_limit_rps': (
                 args.paper_type_rate_limit_rps
-                if args.dynamic_rerank
+                if is_dynamic_v2
                 else None
             ),
-            'rerank_catalog_version': CATALOG_VERSION if args.dynamic_rerank else None,
-            'rerank_prompt_version': PROMPT_VERSION if args.dynamic_rerank else None,
+            'rerank_catalog_version': CATALOG_VERSION if is_dynamic_v2 else None,
+            'rerank_prompt_version': PROMPT_VERSION if is_dynamic_v2 else None,
             'date_policy': 'seeds_trust_retriever_expanded_require_db_date_lte_cutoff',
             'results_per_query': results_per_query,
             'run_label': args.run_label,
             'limit': args.limit,
-            'rerank_formula_id': POLICY_VERSION if args.dynamic_rerank else RERANK_FORMULA_ID,
-            'feature_weights': None if args.dynamic_rerank else processor.weights,
+            'rerank_formula_id': (
+                SEMRANK_FORMULA_ID
+                if graph_rerank_method == SEMRANK_METHOD
+                else (POLICY_VERSION if is_dynamic_v2 else RERANK_FORMULA_ID)
+            ),
+            'feature_weights': (
+                {
+                    'query_score_normalized': 0.4,
+                    'subquery_score_normalized': 0.6,
+                    'concept_score_z': 1.0,
+                }
+                if graph_rerank_method == SEMRANK_METHOD
+                else (None if is_dynamic_v2 else processor.weights)
+            ),
             'query_policy_artifact': 'online_artifacts/query_rerank_policies.jsonl',
+            'semrank_query_profile_artifact': (
+                'online_artifacts/semrank_query_profiles.jsonl'
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'semrank_paper_profile_artifact': (
+                'online_artifacts/semrank_paper_concepts.jsonl'
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'semrank_event_profile_artifact': (
+                'online_artifacts/semrank_event_profiles.jsonl'
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'method_family': (
+                'SemRank'
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'method_variant': (
+                (
+                    'QSQ-classifier-only'
+                    if (
+                        semrank_config is not None
+                        and semrank_config.paper_concept_mode
+                        == 'classifier_only'
+                    )
+                    else 'QSQ-full'
+                )
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'adaptation': (
+                'shared_graph_pool_query_cached_concepts_qsq_base'
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'adaptation_description': (
+                (
+                    'SemRank classifier-only ablation adapted to shared '
+                    'graph-augmented candidates: paper concepts are the '
+                    'classifier candidate topics, paper-level LLM filtering '
+                    'and keyphrase extraction are disabled, and one '
+                    'query-level LLM profile is cached per original query.'
+                    if (
+                        semrank_config is not None
+                        and semrank_config.paper_concept_mode
+                        == 'classifier_only'
+                    )
+                    else (
+                        'SemRank-core adapted to shared graph-augmented '
+                        'candidates, with one cached original-query concept '
+                        'profile and fixed query/subquery semantic base '
+                        'scoring.'
+                    )
+                )
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'semrank_config': (
+                semrank_config.identity()
+                if semrank_config is not None
+                else None
+            ),
+            'semrank_classifier_id': (
+                semrank_reranker.paper_concepts.classifier.classifier_id
+                if semrank_reranker is not None
+                else None
+            ),
+            'semrank_label_space_id': (
+                semrank_reranker.paper_concepts.classifier.label_space_id
+                if semrank_reranker is not None
+                else None
+            ),
+            'semrank_topic_pipeline_version': (
+                semrank_reranker.paper_concepts.pipeline_version
+                if semrank_reranker is not None
+                else None
+            ),
+            'semrank_paper_prompt_version': (
+                semrank_reranker.paper_concepts.paper_prompt_version
+                if semrank_reranker is not None
+                else None
+            ),
+            'semrank_query_prompt_version': (
+                SEMRANK_QUERY_PROMPT_VERSION
+                if graph_rerank_method == SEMRANK_METHOD
+                else None
+            ),
+            'semrank_auxiliary_retriever_identity': (
+                semrank_initial_retriever.identity_record
+                if semrank_initial_retriever is not None
+                else None
+            ),
+            'semrank_auxiliary_results_enter_agent': False,
+            'semrank_uses_graph_scoring_features': False,
+            'semrank_uses_paper_type_signals': False,
+            'semrank_uses_ground_truth': False,
+            'resume_identity': run_identity,
+            'resume_signature': resume_signature,
+            'output_directory_signature': (
+                semrank_output_signature[:12]
+                if semrank_output_signature is not None
+                else resume_signature[:12]
+            ),
             'closed_loop_effect': 'dynamic_topk_to_selector_to_memory_to_next_planner_iteration',
             'prompts_saved': False,
             'paper_identity_in_artifacts': 'arxiv_id_only',
@@ -978,9 +1622,23 @@ def main():
     )
     results['method_config'] = {
         'PACKAGE_METHOD': (
-            'online_per_subquery_dynamic_rerank'
-            if args.enable_per_subquery_graph and args.dynamic_rerank
-            else ('online_per_subquery_graph_rerank' if args.enable_per_subquery_graph else 'baseline')
+            'online_per_subquery_semrank_qsq'
+            if (
+                args.enable_per_subquery_graph
+                and graph_rerank_method == SEMRANK_METHOD
+            )
+            else (
+                'online_per_subquery_dynamic_rerank'
+                if (
+                    args.enable_per_subquery_graph
+                    and graph_rerank_method == 'dynamic_v2'
+                )
+                else (
+                    'online_per_subquery_graph_rerank'
+                    if args.enable_per_subquery_graph
+                    else 'baseline'
+                )
+            )
         ),
         'RANK_METRIC_SCHEMA_VERSION': RANK_METRIC_SCHEMA_VERSION,
         'SAVE_LEVEL': args.save_level,
@@ -988,19 +1646,79 @@ def main():
         'GRAPH_METHOD': args.graph_method,
         'GRAPH_EXPANSION_LIMIT': args.graph_expansion_limit,
         'GRAPH_RATE_LIMIT_RPS': args.graph_rate_limit_rps,
-        'DYNAMIC_RERANK': args.dynamic_rerank if args.enable_per_subquery_graph else False,
+        'GRAPH_RERANK_METHOD': (
+            graph_rerank_method if args.enable_per_subquery_graph else None
+        ),
+        'DYNAMIC_RERANK': (
+            graph_rerank_method == 'dynamic_v2'
+            if args.enable_per_subquery_graph
+            else False
+        ),
         'RERANK_FORMULA_ID': (
-            POLICY_VERSION if args.enable_per_subquery_graph and args.dynamic_rerank
-            else (RERANK_FORMULA_ID if args.enable_per_subquery_graph else None)
+            SEMRANK_FORMULA_ID
+            if (
+                args.enable_per_subquery_graph
+                and graph_rerank_method == SEMRANK_METHOD
+            )
+            else (
+                POLICY_VERSION
+                if (
+                    args.enable_per_subquery_graph
+                    and graph_rerank_method == 'dynamic_v2'
+                )
+                else (
+                    RERANK_FORMULA_ID
+                    if args.enable_per_subquery_graph
+                    else None
+                )
+            )
         ),
         'RERANK_FEATURE_WEIGHTS': (
-            None if args.enable_per_subquery_graph and args.dynamic_rerank
-            else (processor.weights if args.enable_per_subquery_graph else None)
+            {
+                'query_score_normalized': 0.4,
+                'subquery_score_normalized': 0.6,
+                'concept_score_z': 1.0,
+            }
+            if (
+                args.enable_per_subquery_graph
+                and graph_rerank_method == SEMRANK_METHOD
+            )
+            else (
+                None
+                if (
+                    args.enable_per_subquery_graph
+                    and graph_rerank_method == 'dynamic_v2'
+                )
+                else (
+                    processor.weights
+                    if args.enable_per_subquery_graph
+                    else None
+                )
+            )
         ),
         'RERANK_POLICY_MODEL': (
             rerank_policy_model
-            if args.enable_per_subquery_graph and args.dynamic_rerank
+            if (
+                args.enable_per_subquery_graph
+                and graph_rerank_method == 'dynamic_v2'
+            )
             else None
+        ),
+        'SEMRANK_IMPLEMENTATION_VERSION': (
+            SEMRANK_IMPLEMENTATION_VERSION
+            if (
+                args.enable_per_subquery_graph
+                and graph_rerank_method == SEMRANK_METHOD
+            )
+            else None
+        ),
+        'SEMRANK_CACHE_PATH': (
+            semrank_config.cache_path
+            if semrank_config is not None
+            else None
+        ),
+        'RESUME_SIGNATURE': (
+            resume_signature if args.enable_per_subquery_graph else None
         ),
         'EMBEDDING_BACKEND': args.embedding_backend if embedding_provider else None,
         'EMBEDDING_MODEL': args.embedding_service_model if embedding_provider else None,
@@ -1020,6 +1738,10 @@ def main():
     logger.info(f"[✅] Evaluation completed! Results in: {current_output_dir}")
 
     logger.info(f"[📊] Summary record saved to: {summary_file}")
+    if args.enable_per_subquery_graph and semrank_llm is not None:
+        semrank_llm.close()
+    if args.enable_per_subquery_graph and semrank_cache is not None:
+        semrank_cache.close()
 
 
 if __name__ == "__main__":

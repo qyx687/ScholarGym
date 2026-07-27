@@ -169,6 +169,7 @@ class DeepResearchWorkflow:
                 query.get('query', ''),
                 query_id=str(query_id),
                 benchmark_idx=idx,
+                before_date=query.get('date', ''),
             )
 
         # Memory across the entire workflow
@@ -239,9 +240,17 @@ class DeepResearchWorkflow:
                         'is_complete': is_complete,
                         'rerank_policy_id': self.online_per_subquery_manager.query_policy_id,
                         'dynamic_rerank_enabled': self.online_per_subquery_manager.dynamic_rerank_enabled,
+                        'semrank_enabled': self.online_per_subquery_manager.semrank_enabled,
                         'receives_prior_dynamic_selector_memory': (
                             iter_idx > 1
                             and self.online_per_subquery_manager.dynamic_rerank_enabled
+                        ),
+                        'receives_prior_reranked_selector_memory': (
+                            iter_idx > 1
+                            and (
+                                self.online_per_subquery_manager.dynamic_rerank_enabled
+                                or self.online_per_subquery_manager.semrank_enabled
+                            )
                         ),
                     },
                     full_only=True,
