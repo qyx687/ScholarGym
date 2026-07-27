@@ -203,6 +203,8 @@ bash scripts/run_semrank_pasa.sh cache-only
 /home/quan/miniconda3/envs/scholargym-official/bin/python \
   scripts/analyze_semrank_qsq.py \
   --semrank_run /path/to/semrank/run \
+  --benchmark_jsonl \
+    ../third_party/ScholarGym/data/scholargym_pasa_realscholar.jsonl \
   --comparison static=/path/to/static/run \
   --comparison ours=/path/to/s2-native-v4/run \
   --output_dir comparisons/semrank_qsq

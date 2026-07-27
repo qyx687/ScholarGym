@@ -32,6 +32,45 @@ def test_binary_metrics_report_both_paper_cutoffs():
     assert metrics["ndcg@20"] == 1.0 / MODULE.math.log2(12)
 
 
+def test_rerank_metrics_average_events_inside_each_query(tmp_path):
+    path = tmp_path / "paper_rows.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "benchmark_idx": 0,
+                "retrieval_event_id": "q0:e1",
+                "paper_arxiv_id": "p1",
+                "rerank_rank": 1,
+            },
+            {
+                "benchmark_idx": 0,
+                "retrieval_event_id": "q0:e2",
+                "paper_arxiv_id": "x",
+                "rerank_rank": 1,
+            },
+            {
+                "benchmark_idx": 1,
+                "retrieval_event_id": "q1:e1",
+                "paper_arxiv_id": "p3",
+                "rerank_rank": 1,
+            },
+        ],
+    )
+
+    metrics = MODULE.rerank_metrics(
+        path,
+        {
+            0: frozenset({"p1", "p2"}),
+            1: frozenset({"p3"}),
+        },
+    )
+
+    assert metrics["recall@5"] == 0.625
+    assert metrics["query_count"] == 2
+    assert metrics["retrieval_event_count"] == 3
+
+
 def test_analysis_metrics_and_scientific_audit(tmp_path):
     artifacts = tmp_path / "online_artifacts"
     artifacts.mkdir()
@@ -39,6 +78,7 @@ def test_analysis_metrics_and_scientific_audit(tmp_path):
         artifacts / "query_results.jsonl",
         [
             {
+                "benchmark_idx": 0,
                 "query_id": "q1",
                 "gt_count": 2,
                 "candidate_count": 2,
@@ -81,6 +121,7 @@ def test_analysis_metrics_and_scientific_audit(tmp_path):
     )
     paper_rows = [
         {
+            "benchmark_idx": 0,
             "query_id": "q1",
             "retrieval_event_id": "e1",
             "paper_arxiv_id": "p1",
@@ -106,6 +147,7 @@ def test_analysis_metrics_and_scientific_audit(tmp_path):
             "selector_selected": True,
         },
         {
+            "benchmark_idx": 0,
             "query_id": "q1",
             "retrieval_event_id": "e1",
             "paper_arxiv_id": "p2",
@@ -161,8 +203,11 @@ def test_analysis_metrics_and_scientific_audit(tmp_path):
     e2e = MODULE.end_to_end(queries)
     assert e2e["selection_recall"] == 0.5
     assert e2e["gt_conversion"] == 1.0
-    rerank = MODULE.rerank_metrics(artifacts / "paper_rows.jsonl")
-    assert rerank["recall@5"] == 1.0
+    rerank = MODULE.rerank_metrics(
+        artifacts / "paper_rows.jsonl",
+        {0: frozenset({"p1", "p3"})},
+    )
+    assert rerank["recall@5"] == 0.5
     assert rerank["retrieval_event_count"] == 1
     assert MODULE.graph_unique_survival(
         artifacts / "paper_rows.jsonl"

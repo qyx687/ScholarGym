@@ -23,15 +23,28 @@ experiment and is excluded from the main paper table.
 All values are percentages. These are one complete 50-query run per track,
 not mean ± standard deviation across seeds.
 
-| Track | R@10 | R@20 | nDCG@10 | nDCG@20 | MAP@10 | MAP@20 | Sel. R | Sel. P | Sel. F1 | GT Conv. |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Controlled / OnePass | -- | -- | -- | -- | -- | -- | 29.91 | 17.02 | 21.69 | 78.80 |
-| Native / Online | 15.04 | 26.07 | 12.12 | 15.69 | 7.29 | 8.46 | 33.75 | 18.83 | 24.17 | 84.25 |
+### K = 10
 
-Controlled ranking metrics remain pending because the existing OnePass summary
-uses a query-level de-duplicated-union ranking schema, whereas the Native
-summary uses event-macro rerank metrics. They must not be placed in the same
-columns until one evaluator is applied to both tracks.
+| Track | R@10 | nDCG@10 | MAP@10 | Sel. R | Sel. P | Sel. F1 | GT Conv. |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Controlled / OnePass | 4.73 | 8.99 | 4.69 | 29.91 | 17.02 | 21.69 | 78.80 |
+| Native / Online | 4.36 | 8.18 | 4.12 | 33.75 | 18.83 | 24.17 | 84.25 |
+
+### K = 20
+
+| Track | R@20 | nDCG@20 | MAP@20 | Sel. R | Sel. P | Sel. F1 | GT Conv. |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Controlled / OnePass | 4.73 | 6.82 | 3.05 | 29.91 | 17.02 | 21.69 | 78.80 |
+| Native / Online | 7.42 | 8.32 | 3.45 | 33.75 | 18.83 | 24.17 | 84.25 |
+
+Ranking metrics are computed independently per retrieval event against the
+complete GT set of its original query. Events are averaged with equal weight
+inside each original query, then the 50 query means are averaged equally.
+AP@K uses `min(|GT(query)|, K)` as its denominator.
+
+The saved Controlled rankings have at most 10 entries, so their K=20 values
+treat unavailable positions 11--20 as non-hits. Native rankings all contain at
+least 20 entries.
 
 ## Audit status
 

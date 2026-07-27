@@ -8,10 +8,14 @@ import csv
 import hashlib
 import json
 import math
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Sequence
+
+
+ARXIV_VERSION_RE = re.compile(r"v\d+$", re.IGNORECASE)
 
 
 def artifact_dir(value: str | Path) -> Path:
@@ -53,6 +57,42 @@ def safe_div(numerator: float, denominator: float) -> float:
 
 def f1(precision: float, recall: float) -> float:
     return safe_div(2.0 * precision * recall, precision + recall)
+
+
+def normalize_arxiv_id(value: Any) -> str:
+    paper_id = str(value or "").strip()
+    if not paper_id:
+        return ""
+    paper_id = paper_id.replace("https://arxiv.org/abs/", "")
+    paper_id = paper_id.replace("http://arxiv.org/abs/", "")
+    paper_id = paper_id.removeprefix("arXiv:").removeprefix("arxiv:")
+    paper_id = paper_id.split("?", 1)[0].split("#", 1)[0].strip("/")
+    return ARXIV_VERSION_RE.sub("", paper_id)
+
+
+def benchmark_relevance(path: Path) -> Dict[int, frozenset[str]]:
+    output: Dict[int, frozenset[str]] = {}
+    for benchmark_idx, row in enumerate(iter_jsonl(path)):
+        if row.get("valid") is False:
+            continue
+        cited = row.get("cited_paper") or []
+        labels = row.get("gt_label") or []
+        if len(cited) != len(labels):
+            raise ValueError(
+                f"benchmark row {benchmark_idx} has mismatched cited/label lengths"
+            )
+        relevant = frozenset(
+            normalize_arxiv_id(paper.get("arxiv_id"))
+            for paper, label in zip(cited, labels)
+            if label and isinstance(paper, Mapping)
+        )
+        relevant = frozenset(paper_id for paper_id in relevant if paper_id)
+        if not relevant:
+            raise ValueError(f"benchmark row {benchmark_idx} has no GT papers")
+        output[benchmark_idx] = relevant
+    if not output:
+        raise ValueError(f"no valid benchmark queries found in {path}")
+    return output
 
 
 def end_to_end(rows: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
@@ -145,58 +185,104 @@ def binary_metrics(ranking: Sequence[str], relevant: set[str]) -> Dict[str, floa
 
 def finish_event_metrics(
     rows: Sequence[Mapping[str, Any]],
+    relevant: set[str] | frozenset[str],
 ) -> Dict[str, float] | None:
-    if not rows:
+    ranked_rows = [
+        row
+        for row in rows
+        if row.get("rerank_rank") is not None
+    ]
+    if not ranked_rows:
         return None
     ranking = [
-        str(row.get("paper_arxiv_id") or "")
+        normalize_arxiv_id(row.get("paper_arxiv_id"))
         for row in sorted(
-            rows,
+            ranked_rows,
             key=lambda row: (
                 int(row.get("rerank_rank") or 10**12),
                 str(row.get("paper_arxiv_id") or ""),
             ),
         )
     ]
-    relevant = {
-        str(row.get("paper_arxiv_id") or "")
-        for row in rows
-        if row.get("is_ground_truth")
-    }
-    return binary_metrics(ranking, relevant)
+    return binary_metrics(ranking, set(relevant))
 
 
-def rerank_metrics(path: Path) -> Dict[str, Any]:
-    events: Dict[str, Dict[str, float]] = {}
+def rerank_metrics(
+    path: Path,
+    relevance_by_query: Mapping[int, frozenset[str]],
+) -> Dict[str, Any]:
+    events: Dict[tuple[int, str], Dict[str, float]] = {}
     current_event = ""
+    current_query = -1
     event_rows: List[Dict[str, Any]] = []
+
+    def finish() -> None:
+        if not event_rows:
+            return
+        if current_query not in relevance_by_query:
+            raise ValueError(
+                f"unknown benchmark_idx {current_query} in {path}"
+            )
+        value = finish_event_metrics(
+            event_rows,
+            relevance_by_query[current_query],
+        )
+        if value is not None:
+            events[(current_query, current_event)] = value
+
     for row in iter_jsonl(path):
         event_id = str(row.get("retrieval_event_id") or "")
+        try:
+            benchmark_idx = int(row.get("benchmark_idx"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"missing benchmark_idx in {path}") from exc
         starts_repeated_event = bool(
             event_rows
             and event_id == current_event
             and int(row.get("rerank_rank") or 0) == 1
         )
         if current_event and (
-            event_id != current_event or starts_repeated_event
+            event_id != current_event
+            or benchmark_idx != current_query
+            or starts_repeated_event
         ):
-            value = finish_event_metrics(event_rows)
-            if value is not None:
-                events[current_event] = value
+            finish()
             event_rows = []
         current_event = event_id
+        current_query = benchmark_idx
         event_rows.append(row)
-    value = finish_event_metrics(event_rows)
-    if value is not None:
-        events[current_event] = value
-    metrics = list(events.values())
-    if not metrics:
+    finish()
+    if not events:
         return {"retrieval_event_count": 0}
-    return {
-        "retrieval_event_count": len(metrics),
-        **{
-            key: mean(item[key] for item in metrics)
+    by_query: Dict[int, List[Dict[str, float]]] = defaultdict(list)
+    for (benchmark_idx, _), metric in events.items():
+        by_query[benchmark_idx].append(metric)
+    missing_queries = sorted(set(relevance_by_query) - set(by_query))
+    if missing_queries:
+        raise ValueError(
+            f"rerank artifact has no events for benchmark queries: "
+            f"{missing_queries}"
+        )
+    query_metrics = {
+        benchmark_idx: {
+            key: mean(metric[key] for metric in metrics)
             for key in metrics[0]
+        }
+        for benchmark_idx, metrics in by_query.items()
+    }
+    return {
+        "metric_schema": "event_then_query_then_benchmark_macro_v1",
+        "relevance": "complete original-query GT",
+        "query_count": len(query_metrics),
+        "retrieval_event_count": len(events),
+        "events_per_query": {
+            "min": min(len(metrics) for metrics in by_query.values()),
+            "max": max(len(metrics) for metrics in by_query.values()),
+            "mean": mean(len(metrics) for metrics in by_query.values()),
+        },
+        **{
+            key: mean(metric[key] for metric in query_metrics.values())
+            for key in next(iter(query_metrics.values()))
         },
     }
 
@@ -781,6 +867,7 @@ def write_csv(path: Path, values: Sequence[Mapping[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--semrank_run", required=True)
+    parser.add_argument("--benchmark_jsonl", required=True, type=Path)
     parser.add_argument(
         "--comparison",
         action="append",
@@ -798,6 +885,9 @@ def main() -> None:
         name, run = value.split("=", 1)
         comparisons[name.strip()] = artifact_dir(run)
     methods = {"semrank": semrank, **comparisons}
+    relevance_by_query = benchmark_relevance(
+        args.benchmark_jsonl.expanduser().resolve()
+    )
     query_data = {
         name: latest_by_query(path / "query_results.jsonl")
         for name, path in methods.items()
@@ -811,7 +901,10 @@ def main() -> None:
             name: {
                 "artifact_dir": str(path),
                 "end_to_end": end_to_end(query_data[name]),
-                "rerank": rerank_metrics(path / "paper_rows.jsonl"),
+                "rerank": rerank_metrics(
+                    path / "paper_rows.jsonl",
+                    relevance_by_query,
+                ),
                 "graph_unique_gt": graph_unique_survival(
                     path / "paper_rows.jsonl"
                 ),
