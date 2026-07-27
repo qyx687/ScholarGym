@@ -1,0 +1,118 @@
+{
+  "schema_version": "pasa_realscholar_main_results_v1",
+  "benchmark_query_count": 50,
+  "cutoffs": [10, 20],
+  "single_run_checkpoint": true,
+  "semrank": {
+    "mode": "classifier_only",
+    "initial_top_m": 1000,
+    "feedback_top_n": 100,
+    "paper_level_llm_calls": 0,
+    "concept_encoder": "qwen3-embedding:0.6b",
+    "top107_in_main_table": false
+  },
+  "rows": [
+    {
+      "track": "Controlled",
+      "method": "Semantic",
+      "ranking": null,
+      "selection_recall": 0.37663170589530565,
+      "selection_precision": 0.14783283570350877,
+      "selection_f1": 0.2123252524512663,
+      "gt_conversion": 0.8191126279863481
+    },
+    {
+      "track": "Controlled",
+      "method": "Static-Fusion",
+      "ranking": null,
+      "selection_recall": 0.30677732770135907,
+      "selection_precision": 0.17021152133981635,
+      "selection_f1": 0.21894447119917532,
+      "gt_conversion": 0.7898832684824902
+    },
+    {
+      "track": "Controlled",
+      "method": "QuDAR-Rerank",
+      "ranking": null,
+      "selection_recall": 0.34759804850743753,
+      "selection_precision": 0.1743698325989952,
+      "selection_f1": 0.23223886267293284,
+      "gt_conversion": 0.7801418439716312
+    },
+    {
+      "track": "Controlled",
+      "method": "LLM-Semantic-Rerank",
+      "ranking": null,
+      "selection_recall": 0.2990615775898847,
+      "selection_precision": 0.17015629915700106,
+      "selection_f1": 0.2169022698604454,
+      "gt_conversion": 0.788
+    },
+    {
+      "track": "Controlled",
+      "method": "Ours",
+      "ranking": null,
+      "selection_recall": 0.33857484869121585,
+      "selection_precision": 0.17346168151098595,
+      "selection_f1": 0.22939676803181883,
+      "gt_conversion": 0.7900355871886121
+    },
+    {
+      "track": "Controlled",
+      "method": "Oracle-Policy",
+      "ranking": null,
+      "selection_recall": null,
+      "selection_precision": null,
+      "selection_f1": null,
+      "gt_conversion": null
+    },
+    {
+      "track": "Native",
+      "method": "QuDAR",
+      "ranking": {
+        "recall_at_10": 0.16047788004307512,
+        "recall_at_20": 0.28096988817748103,
+        "ndcg_at_10": 0.1310062239793354,
+        "ndcg_at_20": 0.1697773406450188,
+        "map_at_10": 0.08394799631536674,
+        "map_at_20": 0.0966890408211008
+      },
+      "selection_recall": 0.380173153397687,
+      "selection_precision": 0.16827590317315902,
+      "selection_f1": 0.23329051252336272,
+      "gt_conversion": 0.8491803278688524
+    },
+    {
+      "track": "Native",
+      "method": "LLM-guided retrieval",
+      "ranking": {
+        "recall_at_10": 0.1503973164707857,
+        "recall_at_20": 0.2607212074876852,
+        "ndcg_at_10": 0.12120777077315323,
+        "ndcg_at_20": 0.15693732751331174,
+        "map_at_10": 0.072879474332429,
+        "map_at_20": 0.08464699895945937
+      },
+      "selection_recall": 0.33746540222567334,
+      "selection_precision": 0.18828960929608776,
+      "selection_f1": 0.24171421039660088,
+      "gt_conversion": 0.8424657534246576
+    },
+    {
+      "track": "Native",
+      "method": "Ours",
+      "ranking": {
+        "recall_at_10": 0.17789112855077355,
+        "recall_at_20": 0.2902504116283465,
+        "ndcg_at_10": 0.13856551836436207,
+        "ndcg_at_20": 0.1773837006707067,
+        "map_at_10": 0.08759944947657533,
+        "map_at_20": 0.10179848499874888
+      },
+      "selection_recall": 0.39165209556647596,
+      "selection_precision": 0.17203759778310965,
+      "selection_f1": 0.2390637490197671,
+      "gt_conversion": 0.8360128617363344
+    }
+  ]
+}
