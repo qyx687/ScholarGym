@@ -30,7 +30,16 @@ class CitationRAGSystem:
     Handles vector library construction and similarity-based paper retrieval.
     """
     
-    def __init__(self, embedding_model_path: str = config.EMBEDDING_MODEL_PATH, device: str = config.DEVICE, search_method: str = config.DEFAULT_SEARCH_METHOD, embedding_provider=None, qdrant_url: str = None, qdrant_collection: str = "paper_knowledge_base"):
+    def __init__(
+        self,
+        embedding_model_path: str = config.EMBEDDING_MODEL_PATH,
+        device: str = config.DEVICE,
+        search_method: str = config.DEFAULT_SEARCH_METHOD,
+        embedding_provider=None,
+        qdrant_url: str = None,
+        qdrant_collection: str = "paper_knowledge_base",
+        qdrant_timeout_seconds: float = None,
+    ):
         """
         Initialize the citation RAG system with embedding model.
         
@@ -47,6 +56,16 @@ class CitationRAGSystem:
         ) if search_method != 'bm25' and embedding_provider is None else None
         self.qdrant_url = qdrant_url or config.QDRANT_URL
         self.qdrant_collection = qdrant_collection
+        self.qdrant_timeout_seconds = (
+            float(qdrant_timeout_seconds)
+            if qdrant_timeout_seconds is not None
+            else None
+        )
+        if (
+            self.qdrant_timeout_seconds is not None
+            and self.qdrant_timeout_seconds <= 0
+        ):
+            raise ValueError("qdrant_timeout_seconds must be positive")
         self.search_method = search_method
         self.faiss_index = None
         self.bm25_index = None
@@ -273,6 +292,81 @@ class CitationRAGSystem:
         paginated_results = filtered_results[offset : offset + top_k]
 
         return paginated_results, rank_dict
+
+    def search_citations_vector_date_valid(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        before_date: str,
+    ) -> List[Tuple[str, float, Dict]]:
+        """Return enough strictly date-valid rows for SemRank C(q).
+
+        The ordinary online retriever intentionally fetches a bounded window
+        for page-level Agent retrieval.  SemRank's auxiliary original-query
+        retrieval instead needs Top-M *after* date filtering.  This method
+        progressively over-fetches from the same Qdrant ranking until Top-M
+        valid unique papers are available or the vector store is exhausted.
+        Its output is never added to the online candidate pool.
+        """
+
+        if (
+            not hasattr(self, "qdrant_vector_store")
+            or self.qdrant_vector_store is None
+        ):
+            raise ValueError("Vector store not loaded.")
+        target = max(0, int(top_k))
+        if target == 0:
+            return []
+        cutoff = str(before_date or "")[:7]
+        if not re.fullmatch(r"\d{4}-\d{2}", cutoff):
+            raise ValueError(
+                "SemRank auxiliary retrieval requires a YYYY-MM "
+                "publication cutoff"
+            )
+
+        corpus_size = max(
+            int(getattr(config, "TOTAL_PAPER_NUM", target)),
+            target,
+        )
+        fetch_k = min(corpus_size, max(target * 2, 2000))
+        previous_raw_count = -1
+        while True:
+            raw_results = (
+                self.qdrant_vector_store.similarity_search_with_score(
+                    query=query,
+                    k=fetch_k,
+                )
+            )
+            valid: List[Tuple[str, float, Dict]] = []
+            seen = set()
+            for doc, score in raw_results:
+                metadata = dict(doc.metadata or {})
+                paper_id = metadata.get("arxiv_id") or metadata.get("id")
+                paper_date = str(metadata.get("date") or "")
+                paper_month = paper_date[:7]
+                if (
+                    not paper_id
+                    or not re.fullmatch(r"\d{4}-\d{2}", paper_month)
+                    or paper_month > cutoff
+                    or paper_id in seen
+                ):
+                    continue
+                seen.add(paper_id)
+                valid.append((str(paper_id), float(score), metadata))
+                if len(valid) >= target:
+                    return valid
+
+            raw_count = len(raw_results)
+            if fetch_k >= corpus_size:
+                return valid
+            if raw_count <= previous_raw_count:
+                raise RuntimeError(
+                    "Qdrant auxiliary retrieval stopped growing before "
+                    "SemRank obtained Top-M date-valid papers"
+                )
+            previous_raw_count = raw_count
+            fetch_k = min(corpus_size, max(fetch_k + 1, fetch_k * 2))
 
     def search_citations_bm25(
         self,
@@ -537,7 +631,10 @@ class CitationRAGSystem:
             print(f"Loading Embeddings: {embedding_model_name}...")
             embeddings = OllamaEmbeddings(model=embedding_model_name, base_url=config.OLLAMA_URL)
 
-        client = QdrantClient(url=self.qdrant_url)
+        client_kwargs = {"url": self.qdrant_url}
+        if self.qdrant_timeout_seconds is not None:
+            client_kwargs["timeout"] = self.qdrant_timeout_seconds
+        client = QdrantClient(**client_kwargs)
         
         self.qdrant_vector_store = QdrantVectorStore(
             client=client,

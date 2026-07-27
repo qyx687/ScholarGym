@@ -26,6 +26,7 @@ from rank_bm25 import BM25Okapi
 
 from online_paper_type import PaperTypeResolver
 from rerank_skill import CompiledPolicy, RerankPolicy, RerankSkill
+from semrank import SEMRANK_METHOD, SemRankQSQReranker
 from structures import Paper, SubQuery
 
 try:
@@ -155,7 +156,22 @@ class EmbeddingProvider(LangChainEmbeddings):
         self.batch_size = max(1, int(batch_size))
         self.timeout = timeout
         self._cache: Dict[str, np.ndarray] = {}
+        self._stats: Dict[str, int] = defaultdict(int)
         self._lock = threading.Lock()
+
+    def snapshot_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._stats)
+
+    def clear_memory_cache(self) -> int:
+        """Release request-local vectors after a persistent caller stores them."""
+
+        with self._lock:
+            cleared = len(self._cache)
+            self._cache.clear()
+            self._stats["memory_cache_clear_calls"] += 1
+            self._stats["memory_cache_entries_cleared"] += cleared
+        return cleared
 
     def _key(self, text: str) -> str:
         payload = f"{self.backend}\0{self.model}\0{text}".encode("utf-8")
@@ -172,6 +188,9 @@ class EmbeddingProvider(LangChainEmbeddings):
                 if key not in self._cache:
                     missing_keys.append(key)
                     missing_texts.append(text)
+                    self._stats["cache_misses"] += 1
+                else:
+                    self._stats["cache_hits"] += 1
         for start in range(0, len(missing_texts), self.batch_size):
             batch = missing_texts[start : start + self.batch_size]
             vectors = None
@@ -200,6 +219,9 @@ class EmbeddingProvider(LangChainEmbeddings):
         return self.embed([text])[0].tolist()
 
     def _request(self, texts: Sequence[str]) -> List[List[float]]:
+        with self._lock:
+            self._stats["api_calls"] += 1
+            self._stats["encoded_texts"] += len(texts)
         if self.backend == "ollama":
             url = self.base_url
             if not url.endswith("/api/embed"):
@@ -507,6 +529,8 @@ class PerSubqueryProcessor:
         expansion_limit: int = 100,
         rerank_skill: Optional[RerankSkill] = None,
         paper_type_resolver: Optional[PaperTypeResolver] = None,
+        rerank_method: Optional[str] = None,
+        semrank_reranker: Optional[SemRankQSQReranker] = None,
     ) -> None:
         self.paper_db = dict(paper_db)
         self.s2 = s2_client
@@ -517,9 +541,31 @@ class PerSubqueryProcessor:
         self.weights = dict(DEFAULT_FEATURE_WEIGHTS)
         self.rerank_skill = rerank_skill
         self.paper_type_resolver = paper_type_resolver
+        self.rerank_method = rerank_method or (
+            "dynamic_v2" if rerank_skill is not None else "static"
+        )
+        self.semrank_reranker = semrank_reranker
         self.active_policy: Optional[RerankPolicy] = None
         self.active_compiled_policy: Optional[CompiledPolicy] = None
         self.active_original_query = ""
+        if self.rerank_method not in {"static", "dynamic_v2", SEMRANK_METHOD}:
+            raise ValueError(
+                f"unsupported graph rerank method: {self.rerank_method}"
+            )
+        if self.rerank_method == SEMRANK_METHOD:
+            if semrank_reranker is None:
+                raise ValueError(
+                    "semrank_qsq requires a SemRankQSQReranker"
+                )
+            if rerank_skill is not None or paper_type_resolver is not None:
+                raise ValueError(
+                    "semrank_qsq cannot use dynamic policy or paper-type "
+                    "signals"
+                )
+        elif semrank_reranker is not None:
+            raise ValueError(
+                "SemRank reranker supplied for a non-SemRank method"
+            )
         if self.rerank_skill is not None and self.paper_type_resolver is not None:
             resolver_backend = str(self.paper_type_resolver.backend).lower()
             if resolver_backend != "s2":
@@ -683,6 +729,7 @@ class PerSubqueryProcessor:
                 }
             )
         compiled_policy = self.active_compiled_policy
+        semrank_event_profile = None
         if self.rerank_skill is not None and compiled_policy is not None:
             type_records: Dict[str, Dict[str, Any]] = {}
             if (
@@ -717,6 +764,15 @@ class PerSubqueryProcessor:
             rows = self.rerank_skill.score_candidates(rows, compiled_policy)
             for row in rows:
                 row["feature_weights"] = dict(compiled_policy.feature_weights)
+        elif self.rerank_method == SEMRANK_METHOD:
+            assert self.semrank_reranker is not None
+            rows, semrank_event_profile = self.semrank_reranker.rerank(
+                rows,
+                self.paper_db,
+                retrieval_event_id=str(
+                    event.get("retrieval_event_id") or ""
+                ),
+            )
         filter_stats.update(
             {
                 "dynamic_rerank_enabled": bool(
@@ -753,6 +809,18 @@ class PerSubqueryProcessor:
                     self.paper_type_resolver.classifier_version
                     if self.paper_type_resolver is not None
                     else None
+                ),
+                "graph_rerank_method": self.rerank_method,
+                "semrank_enabled": self.rerank_method == SEMRANK_METHOD,
+                "semrank_query_profile_id": (
+                    semrank_event_profile.query_profile_id
+                    if semrank_event_profile is not None
+                    else None
+                ),
+                "semrank_fallback_used": (
+                    semrank_event_profile.fallback_used
+                    if semrank_event_profile is not None
+                    else False
                 ),
             }
         )
@@ -807,10 +875,21 @@ class PerSubqueryProcessor:
             "rank_dict": rank_dict,
             "filter_stats": filter_stats,
             "rerank_policy_id": (
-                compiled_policy.policy_id if compiled_policy is not None else None
+                compiled_policy.policy_id
+                if compiled_policy is not None
+                else (
+                    semrank_event_profile.query_profile_id
+                    if semrank_event_profile is not None
+                    else None
+                )
             ),
             "compiled_rerank_policy": (
                 compiled_policy.to_dict() if compiled_policy is not None else None
+            ),
+            "semrank_event_profile": (
+                semrank_event_profile.to_dict()
+                if semrank_event_profile is not None
+                else None
             ),
         }
 
