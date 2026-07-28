@@ -8,7 +8,7 @@ across repeated runs, so no significance marker is reported.
 
 | Track | Method | R@10 | nDCG@10 | MAP@10 | Sel. R | Sel. P | Sel. F1 | GT Conv. |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| Controlled | Semantic | 4.18 | 6.47 | 3.07 | 37.66 | 14.78 | 21.23 | 81.91 |
+| Controlled | Semantic | 5.56 | 8.79 | 4.26 | 34.44 | 19.07 | 24.54 | 76.12 |
 | Controlled | Static-Fusion | 5.04 | 9.12 | 4.78 | 30.68 | 17.02 | 21.89 | 78.99 |
 | Controlled | QuDAR-Rerank | 5.65 | 9.61 | 4.94 | 34.76 | 17.44 | 23.22 | 78.01 |
 | Controlled | LLM-Semantic-Rerank | 4.73 | 8.99 | 4.69 | 29.91 | 17.02 | 21.69 | 78.80 |
@@ -16,13 +16,13 @@ across repeated runs, so no significance marker is reported.
 | Controlled | Oracle-Policy | -- | -- | -- | -- | -- | -- | -- |
 | Native | QuDAR | 4.84 | 8.63 | 4.53 | 38.02 | 16.83 | 23.33 | 84.92 |
 | Native | LLM-guided retrieval | 4.36 | 8.18 | 4.12 | 33.75 | 18.83 | 24.17 | 84.25 |
-| Native | Ours | 5.57 | 8.97 | 4.62 | 39.17 | 17.20 | 23.91 | 83.60 |
+| Native | Ours | 5.23 | 8.63 | 4.41 | 39.61 | 17.09 | 23.88 | 87.42 |
 
 ## K = 20
 
 | Track | Method | R@20 | nDCG@20 | MAP@20 | Sel. R | Sel. P | Sel. F1 | GT Conv. |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
-| Controlled | Semantic | 4.18 | 5.10 | 2.14 | 37.66 | 14.78 | 21.23 | 81.91 |
+| Controlled | Semantic | 8.84 | 9.23 | 3.78 | 34.44 | 19.07 | 24.54 | 76.12 |
 | Controlled | Static-Fusion | 5.04 | 7.01 | 3.13 | 30.68 | 17.02 | 21.89 | 78.99 |
 | Controlled | QuDAR-Rerank | 5.65 | 7.47 | 3.32 | 34.76 | 17.44 | 23.22 | 78.01 |
 | Controlled | LLM-Semantic-Rerank | 4.73 | 6.82 | 3.05 | 29.91 | 17.02 | 21.69 | 78.80 |
@@ -30,14 +30,16 @@ across repeated runs, so no significance marker is reported.
 | Controlled | Oracle-Policy | -- | -- | -- | -- | -- | -- | -- |
 | Native | QuDAR | 8.26 | 8.99 | 3.91 | 38.02 | 16.83 | 23.33 | 84.92 |
 | Native | LLM-guided retrieval | 7.42 | 8.32 | 3.45 | 33.75 | 18.83 | 24.17 | 84.25 |
-| Native | Ours | 8.81 | 9.42 | 4.12 | 39.17 | 17.20 | 23.91 | 83.60 |
+| Native | Ours | 8.53 | 8.96 | 3.87 | 39.61 | 17.09 | 23.88 | 87.42 |
 
 ## Method mapping
 
 - `Controlled` is OnePass: the original ScholarGym query/subquery trajectory
   is frozen, and reranking is post-processing that never writes back to
   Planner or memory.
-- `Semantic` is deep semantic retrieval with the baseline static ranking.
+- `Semantic` is the OnePass `deep_event_offset_matched` deep semantic
+  retrieval arm, with no graph expansion. Each retrieval event uses the
+  graph-local-pool-sized deep-retrieval budget and its static semantic order.
 - `Static-Fusion` is citation/reference graph expansion plus static fusion.
 - `QuDAR-Rerank` is graph expansion plus QuDAR-Confidence-QSQ.
 - `LLM-Semantic-Rerank` is graph expansion plus SemRank classifier-only with
@@ -65,20 +67,24 @@ All ranking metrics now use one evaluator and the following fixed aggregation:
 AP@K uses `min(number of complete-query GT, K)` as its denominator, and MAP@K
 is the final macro average of AP@K.
 
-Native artifacts have at least 20 ranked candidates for every event.
-Controlled artifacts preserve the actual Selector input depth: 90.43% of
-events have 10 candidates, the remainder have 5--9, and no event has 20.
-Controlled K=20 therefore treats unavailable ranks 11--20 as non-hits. Its
-R@20 equals R@10, while nDCG@20 and MAP@20 use the K=20 ideal/denominator.
-These are valid metrics of the saved truncated lists, but a fair exported
-Top-20 comparison requires rerunning every Controlled arm at output depth 20.
+Native artifacts and Controlled `Semantic` have at least 20 ranked candidates
+for every event. The four Controlled graph-postprocess arms preserve the
+actual Selector input depth: 90.43% of events have 10 candidates, the
+remainder have 5--9, and no event has 20. For those four rows, K=20 therefore
+treats unavailable ranks 11--20 as non-hits: R@20 equals R@10, while nDCG@20
+and MAP@20 use the K=20 ideal/denominator. These are valid metrics of the
+saved truncated lists, but a fair exported Top-20 comparison among all
+Controlled graph arms requires rerunning those four arms at output depth 20.
 
 Selection recall, precision, and F1 are macro averages over the 50 original
 queries. GT conversion is `Selected GT / Retrieved GT`.
 
 ## Result provenance
 
-- Controlled baseline, Static-Fusion, and QuDAR:
+- Controlled Semantic:
+  `eval_results_onepass_dense_pasa_realscholar_full/.../onepass_artifacts/deep_event`
+  (`method=deep_event_offset_matched`, `rank_field=rerank_rank`).
+- Controlled Static-Fusion and QuDAR:
   `comparisons/external_rerank_onepass_pasa_semrank_top107_v1/report/main_table.json`
   (the non-SemRank rows are independent of the Top-107 sensitivity setting).
 - Controlled SemRank Top-1000:
@@ -91,7 +97,8 @@ queries. GT conversion is `Selected GT / Retrieved GT`.
 - Native QuDAR:
   `../ScholarGym_PerSubquery_Online_QuDAR/comparisons/qudar_full_analysis/summary.json`.
 - Native Ours:
-  `../ScholarGym_PerSubquery_Online/eval_results_online_s2_native_v4_20260727`.
+  `../ScholarGym_PerSubquery_Online/eval_results_online_dynamic_pasa_s2_native_v4/...pasa_dynamic_rerank_s2_native_v4_run1`
+  (the earlier of the two S2-native runs).
 
 Exact machine-readable values are in
 `docs/pasa_realscholar_main_results.json`. The evaluator's complete audit and

@@ -1,5 +1,5 @@
 {
-  "schema_version": "pasa_realscholar_main_results_v2",
+  "schema_version": "pasa_realscholar_main_results_v3",
   "benchmark_query_count": 50,
   "cutoffs": [10, 20],
   "single_run_checkpoint": true,
@@ -13,11 +13,20 @@
     ],
     "ap_denominator": "min(number_of_complete_query_gt, K)",
     "controlled_saved_ranking_depth": {
-      "min": 5,
-      "max": 10,
-      "mean": 9.698553948832036,
-      "coverage_at_10": 0.9043381535038932,
-      "coverage_at_20": 0.0
+      "semantic_deep_event": {
+        "min": 79,
+        "max": 629,
+        "mean": 295.16796440489435,
+        "coverage_at_10": 1.0,
+        "coverage_at_20": 1.0
+      },
+      "graph_postprocess": {
+        "min": 5,
+        "max": 10,
+        "mean": 9.698553948832036,
+        "coverage_at_10": 0.9043381535038932,
+        "coverage_at_20": 0.0
+      }
     }
   },
   "semrank": {
@@ -28,22 +37,42 @@
     "concept_encoder": "qwen3-embedding:0.6b",
     "top107_in_main_table": false
   },
+  "source_corrections": {
+    "controlled_semantic": {
+      "method": "deep_event_offset_matched",
+      "ranking_artifact": "eval_results_onepass_dense_pasa_realscholar_full/.../onepass_artifacts/deep_event/paper_rows.jsonl",
+      "selection_artifact": "eval_results_onepass_dense_pasa_realscholar_full/.../onepass_artifacts/deep_event/query_results.jsonl",
+      "rank_field": "rerank_rank",
+      "query_count": 50,
+      "retrieved_gt_count": 289,
+      "selected_gt_count": 220
+    },
+    "native_ours": {
+      "run_choice": "earlier of two S2-native runs",
+      "ranking_artifact": "../ScholarGym_PerSubquery_Online/eval_results_online_dynamic_pasa_s2_native_v4/...pasa_dynamic_rerank_s2_native_v4_run1/online_artifacts/paper_rows.jsonl",
+      "selection_artifact": "../ScholarGym_PerSubquery_Online/eval_results_online_dynamic_pasa_s2_native_v4/...pasa_dynamic_rerank_s2_native_v4_run1/online_artifacts/query_results.jsonl",
+      "rank_field": "rerank_rank",
+      "query_count": 50,
+      "retrieved_gt_count": 310,
+      "selected_gt_count": 271
+    }
+  },
   "rows": [
     {
       "track": "Controlled",
       "method": "Semantic",
       "ranking": {
-        "recall_at_10": 0.041804357146743326,
-        "recall_at_20": 0.041804357146743326,
-        "ndcg_at_10": 0.06472573859562612,
-        "ndcg_at_20": 0.05100790390074193,
-        "map_at_10": 0.030747033129647938,
-        "map_at_20": 0.021390141990504794
+        "recall_at_10": 0.055597184055970444,
+        "recall_at_20": 0.08842766113407287,
+        "ndcg_at_10": 0.08791648562782173,
+        "ndcg_at_20": 0.09231804830546031,
+        "map_at_10": 0.04263560002719218,
+        "map_at_20": 0.03780530598777623
       },
-      "selection_recall": 0.37663170589530565,
-      "selection_precision": 0.14783283570350877,
-      "selection_f1": 0.2123252524512663,
-      "gt_conversion": 0.8191126279863481
+      "selection_recall": 0.34439900707684457,
+      "selection_precision": 0.19066821770403147,
+      "selection_f1": 0.24544932605532693,
+      "gt_conversion": 0.7612456747404844
     },
     {
       "track": "Controlled",
@@ -154,17 +183,17 @@
       "track": "Native",
       "method": "Ours",
       "ranking": {
-        "recall_at_10": 0.05571835126855206,
-        "recall_at_20": 0.08809553719273333,
-        "ndcg_at_10": 0.08965276447810087,
-        "ndcg_at_20": 0.09422349235294979,
-        "map_at_10": 0.04618992339414648,
-        "map_at_20": 0.04120489848868219
+        "recall_at_10": 0.05232011640924329,
+        "recall_at_20": 0.08525411435811965,
+        "ndcg_at_10": 0.08628333074386073,
+        "ndcg_at_20": 0.08960143057062825,
+        "map_at_10": 0.04414580287654865,
+        "map_at_20": 0.03868896887798564
       },
-      "selection_recall": 0.39165209556647596,
-      "selection_precision": 0.17203759778310965,
-      "selection_f1": 0.2390637490197671,
-      "gt_conversion": 0.8360128617363344
+      "selection_recall": 0.39609172038619306,
+      "selection_precision": 0.17089659127818821,
+      "selection_f1": 0.23877291102812709,
+      "gt_conversion": 0.8741935483870967
     }
   ]
 }

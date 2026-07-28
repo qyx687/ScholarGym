@@ -69,7 +69,46 @@ def test_saved_ranking_depth_limit_is_explicit():
 
     for name, method in event_summary["methods"].items():
         coverage = method["ranking_depth"]["coverage_at_cutoff"]["20"]
-        if name.startswith("Controlled/"):
+        if name == "Controlled/Semantic":
+            assert coverage == 1.0
+        elif name.startswith("Controlled/"):
             assert coverage == 0.0
         else:
             assert coverage == 1.0
+
+
+def test_corrected_semantic_and_native_ours_sources_are_pinned():
+    main = json.loads(
+        (ROOT / "docs" / "pasa_realscholar_main_results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    event_summary = json.loads(
+        (
+            ROOT
+            / "docs"
+            / "pasa_realscholar_event_query_macro_top1000"
+            / "summary.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    semantic = event_summary["sources"]["Controlled/Semantic"]
+    assert semantic["path"].endswith(
+        "/onepass_artifacts/deep_event/paper_rows.jsonl"
+    )
+    assert semantic["rank_field"] == "rerank_rank"
+
+    native_ours = event_summary["sources"]["Native/Ours"]
+    assert "/eval_results_online_dynamic_pasa_s2_native_v4/" in native_ours[
+        "path"
+    ]
+    assert "pasa_dynamic_rerank_s2_native_v4_run1" in native_ours["path"]
+    assert "eval_results_online_s2_native_v4_20260727" not in native_ours[
+        "path"
+    ]
+
+    source_audit = main["source_corrections"]
+    assert source_audit["controlled_semantic"]["retrieved_gt_count"] == 289
+    assert source_audit["controlled_semantic"]["selected_gt_count"] == 220
+    assert source_audit["native_ours"]["retrieved_gt_count"] == 310
+    assert source_audit["native_ours"]["selected_gt_count"] == 271
