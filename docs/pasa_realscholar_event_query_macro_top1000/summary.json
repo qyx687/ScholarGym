@@ -1,0 +1,301 @@
+{
+  "aggregation": [
+    "metric per retrieval event",
+    "equal-weight mean over events within original query",
+    "equal-weight mean over all valid original queries"
+  ],
+  "ap_denominator": "min(number_of_complete_query_gt, K)",
+  "benchmark": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/third_party/ScholarGym/data/scholargym_pasa_realscholar.jsonl",
+  "benchmark_gt_count": 739,
+  "benchmark_query_count": 50,
+  "cutoffs": [
+    10,
+    20
+  ],
+  "methods": {
+    "Controlled/LLM-Semantic-Rerank": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 17.98,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.04691585183901802,
+          "ndcg": 0.08989247105569526,
+          "recall": 0.04734139169946387
+        },
+        "20": {
+          "map": 0.030457130120761074,
+          "ndcg": 0.06817897679828377,
+          "recall": 0.04734139169946387
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 0.9043381535038932,
+          "20": 0.0
+        },
+        "max": 10,
+        "mean": 9.698553948832036,
+        "min": 5
+      },
+      "retrieval_event_count": 899
+    },
+    "Controlled/Ours": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 17.98,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.05091912088222331,
+          "ndcg": 0.0966038876067277,
+          "recall": 0.058361856159979124
+        },
+        "20": {
+          "map": 0.035231457150063775,
+          "ndcg": 0.07591663311749015,
+          "recall": 0.058361856159979124
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 0.9043381535038932,
+          "20": 0.0
+        },
+        "max": 10,
+        "mean": 9.698553948832036,
+        "min": 5
+      },
+      "retrieval_event_count": 899
+    },
+    "Controlled/QuDAR-Rerank": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 17.98,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.04936384608264031,
+          "ndcg": 0.09609518126909025,
+          "recall": 0.05649927035406097
+        },
+        "20": {
+          "map": 0.03324380185108683,
+          "ndcg": 0.07472404148233695,
+          "recall": 0.05649927035406097
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 0.9043381535038932,
+          "20": 0.0
+        },
+        "max": 10,
+        "mean": 9.698553948832036,
+        "min": 5
+      },
+      "retrieval_event_count": 899
+    },
+    "Controlled/Semantic": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 17.98,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.04263560002719218,
+          "ndcg": 0.08791648562782173,
+          "recall": 0.055597184055970444
+        },
+        "20": {
+          "map": 0.03780530598777623,
+          "ndcg": 0.09231804830546031,
+          "recall": 0.08842766113407287
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 1.0,
+          "20": 1.0
+        },
+        "max": 629,
+        "mean": 295.16796440489435,
+        "min": 79
+      },
+      "retrieval_event_count": 899
+    },
+    "Controlled/Static-Fusion": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 17.98,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.047751432220920646,
+          "ndcg": 0.09123898362881563,
+          "recall": 0.0503757859010285
+        },
+        "20": {
+          "map": 0.031349888176152245,
+          "ndcg": 0.07006980901881146,
+          "recall": 0.0503757859010285
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 0.9043381535038932,
+          "20": 0.0
+        },
+        "max": 10,
+        "mean": 9.698553948832036,
+        "min": 5
+      },
+      "retrieval_event_count": 899
+    },
+    "Native/LLM-guided-retrieval": {
+      "events_per_query": {
+        "max": 22,
+        "mean": 18.26,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.041171103385601024,
+          "ndcg": 0.08176859178038572,
+          "recall": 0.04359874339484624
+        },
+        "20": {
+          "map": 0.03454283299901266,
+          "ndcg": 0.08322703134518027,
+          "recall": 0.07422869379088341
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 1.0,
+          "20": 1.0
+        },
+        "max": 634,
+        "mean": 296.06133625410735,
+        "min": 31
+      },
+      "retrieval_event_count": 913
+    },
+    "Native/Ours": {
+      "events_per_query": {
+        "max": 24,
+        "mean": 18.4,
+        "min": 14
+      },
+      "metrics": {
+        "10": {
+          "map": 0.04414580287654865,
+          "ndcg": 0.08628333074386073,
+          "recall": 0.05232011640924329
+        },
+        "20": {
+          "map": 0.03868896887798564,
+          "ndcg": 0.08960143057062825,
+          "recall": 0.08525411435811965
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 1.0,
+          "20": 1.0
+        },
+        "max": 707,
+        "mean": 300.34565217391304,
+        "min": 51
+      },
+      "retrieval_event_count": 920
+    },
+    "Native/QuDAR": {
+      "events_per_query": {
+        "max": 24,
+        "mean": 18.1,
+        "min": 13
+      },
+      "metrics": {
+        "10": {
+          "map": 0.04531956723080095,
+          "ndcg": 0.08630021630174262,
+          "recall": 0.0484216661993369
+        },
+        "20": {
+          "map": 0.039077168626899667,
+          "ndcg": 0.0898915307232519,
+          "recall": 0.08260004754295094
+        }
+      },
+      "query_count": 50,
+      "ranking_depth": {
+        "coverage_at_cutoff": {
+          "10": 1.0,
+          "20": 1.0
+        },
+        "max": 648,
+        "mean": 297.91381215469613,
+        "min": 36
+      },
+      "retrieval_event_count": 905
+    }
+  },
+  "relevance": "complete GT set of the original query",
+  "schema_version": "event_query_macro_ranking_v1",
+  "sources": {
+    "Controlled/LLM-Semantic-Rerank": {
+      "format": "nested_ranked_candidates",
+      "method_filter": "dynamic_policy",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_OnePass_Postprocess/comparisons/external_rerank_onepass_pasa_v1/semrank_classifier_only_vs_static_minmax_ranked_candidates.jsonl"
+    },
+    "Controlled/Ours": {
+      "format": "nested_ranked_candidates",
+      "method_filter": "dynamic_policy",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_OnePass_Postprocess/eval_dynamic_rerank/s2_native/pasa_s2_native_v4_sem090_fresh_policy_20260727_173351/ranked_candidates.jsonl"
+    },
+    "Controlled/QuDAR-Rerank": {
+      "format": "nested_ranked_candidates",
+      "method_filter": "dynamic_policy",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_OnePass_Postprocess/comparisons/external_rerank_onepass_pasa_v1/qudar_vs_static_ranked_candidates.jsonl"
+    },
+    "Controlled/Semantic": {
+      "format": "flat_paper_rows",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_OnePass_Postprocess/eval_results_onepass_dense_pasa_realscholar_full/qwen3-30b-a3b-instruct-2507_complex_vector_deep_research_topk-[5, 10, 20]_maxq-10_instruct_non-structured_NONE_pasa_realscholar_dense_rtx3060_full_run1/onepass_artifacts/deep_event/paper_rows.jsonl",
+      "rank_field": "rerank_rank"
+    },
+    "Controlled/Static-Fusion": {
+      "format": "nested_ranked_candidates",
+      "method_filter": "legacy_static",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_OnePass_Postprocess/eval_dynamic_rerank/s2_native/pasa_s2_native_v4_sem090_fresh_policy_20260727_173351/ranked_candidates.jsonl"
+    },
+    "Native/LLM-guided-retrieval": {
+      "format": "flat_paper_rows",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_PerSubquery_Online_SemRank/eval_results_semrank_classifier_only_pasa_realscholar/qwen3-30b-a3b-instruct-2507_complex_vector_deep_research_topk-[5, 10, 20]_maxq-10_instruct_non-structured_NONE_per_subquery_online_semrank_qsq_sig-048176e801a7_semrank_qsq_classifier_only_qwen3_pasa_full_run1/online_artifacts/paper_rows.jsonl",
+      "rank_field": "rerank_rank"
+    },
+    "Native/Ours": {
+      "format": "flat_paper_rows",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_PerSubquery_Online/eval_results_online_dynamic_pasa_s2_native_v4/qwen3-30b-a3b-instruct-2507_complex_vector_deep_research_topk-[5, 10, 20]_maxq-10_instruct_non-structured_NONE_per_subquery_online_dynamic_rerank_v1_type-s2-native_pasa_dynamic_rerank_s2_native_v4_run1/online_artifacts/paper_rows.jsonl",
+      "rank_field": "rerank_rank"
+    },
+    "Native/QuDAR": {
+      "format": "flat_paper_rows",
+      "path": "/home/quan/projects/hybrid_frame/hybrid-paper-graph-search/ScholarGym_PerSubquery_Online_QuDAR/eval_results_qudar_pasa_realscholar/qwen3-30b-a3b-instruct-2507_complex_vector_deep_research_topk-[5, 10, 20]_maxq-10_instruct_non-structured_NONE_per_subquery_online_qudar_confidence_qsq_tau-2_qudar_confidence_qsq_pasa_full_run1/online_artifacts/paper_rows.jsonl",
+      "rank_field": "rerank_rank"
+    }
+  }
+}
